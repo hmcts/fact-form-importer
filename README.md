@@ -21,19 +21,32 @@ will be added in later tasks.
 
 ## Development
 
-Create a virtual environment and install the package with development tools:
+Run the bootstrap script once from the repo root:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip3 install --upgrade pip setuptools wheel
-pip3 install -e ".[dev]"
+sh scripts/bootstrap.sh
 ```
 
-Copy `.env.example` to `.env` for local development values. Do not commit
-secrets. `.env.example` is a template only: keep values empty or use obvious
-placeholders. The test suite checks that `.env.example` does not contain real
-values.
+This creates `.venv`, installs the package with development dependencies, and
+installs the local pre-push hook that runs unit tests before pushing.
+
+Activate the virtual environment when working in the repo:
+
+```bash
+source .venv/bin/activate
+```
+
+## Local Configuration
+
+Copy `.env.example` to `.env` and populate the local values:
+
+```bash
+cp .env.example .env
+```
+
+Do not commit `.env` or real secrets. `.env.example` is a template only: keep
+values empty or use obvious placeholders. The test suite checks that
+`.env.example` does not contain real values.
 
 Place local source spreadsheets in `input/`. A suggested filename is:
 
