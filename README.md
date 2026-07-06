@@ -31,7 +31,9 @@ pip3 install -e ".[dev]"
 ```
 
 Copy `.env.example` to `.env` for local development values. Do not commit
-secrets.
+secrets. `.env.example` is a template only: keep values empty or use obvious
+placeholders. The test suite checks that `.env.example` does not contain real
+values.
 
 Place local source spreadsheets in `input/`. A suggested filename is:
 
