@@ -1,0 +1,1 @@
+"""Submitter approval output placeholders."""

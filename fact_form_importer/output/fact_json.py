@@ -1,0 +1,1 @@
+"""FaCT JSON output placeholders."""

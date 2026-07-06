@@ -1,0 +1,1 @@
+"""Column mapping placeholders."""
