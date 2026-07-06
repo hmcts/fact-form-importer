@@ -1,5 +1,271 @@
 {
   "version": 1,
-  "description": "Placeholder mapping for Microsoft Forms export columns.",
-  "columns": {}
+  "description": "Microsoft Forms export column mapping for FaCT court submissions.",
+  "metadata": [
+    {"field": "forms_id", "column": "A", "expected_header": "ID"},
+    {"field": "start_time", "column": "B", "expected_header": "Start time"},
+    {"field": "completion_time", "column": "C", "expected_header": "Completion time"},
+    {"field": "submitter_email", "column": "D", "expected_header": "Email"},
+    {"field": "submitter_name", "column": "E", "expected_header": "Name"},
+    {"field": "last_modified_time", "column": "F", "expected_header": "Last modified time"}
+  ],
+  "scalars": [
+    {"field": "court_slug_raw", "column": "G", "expected_header": "Enter the court slug"},
+    {"field": "accessible_parking", "column": "H", "expected_header": "Is there accessible parking?"},
+    {"field": "accessible_parking_phone", "column": "I", "expected_header": "Enter the telephone number for booking accessible parking"},
+    {"field": "accessible_toilet_description", "column": "J", "expected_header": "Where is the accessible toilet?"},
+    {"field": "accessible_entrance", "column": "K", "expected_header": "Is there an accessible entrance?"},
+    {"field": "accessible_entrance_support_phone", "column": "L", "expected_header": "Enter telephone number for organising support at court for accessible entrance?"},
+    {"field": "hearing_enhancement_equipment", "column": "M", "expected_header": "What hearing enhancement equipment is available?"},
+    {"field": "lift_available", "column": "N", "expected_header": "Is there a lift?"},
+    {"field": "lift_door_width", "column": "O", "expected_header": "If there is a lift, what is the door width?"},
+    {"field": "lift_weight_limit", "column": "P", "expected_header": "If there is a lift, what is the weight limit?"},
+    {"field": "quiet_room_available", "column": "Q", "expected_header": "Is there a quiet room?"},
+    {"field": "parking_available", "column": "R", "expected_header": "Is there parking?"},
+    {"field": "food_and_drink", "column": "S", "expected_header": "What food and drink options are available?"},
+    {"field": "separate_waiting_areas", "column": "T", "expected_header": "Are separate waiting areas available?"},
+    {"field": "child_waiting_area", "column": "U", "expected_header": "Is there a separate waiting area for children?"},
+    {"field": "quiet_room_available_2", "column": "V", "expected_header": "Is there a quiet room?"},
+    {"field": "baby_changing", "column": "W", "expected_header": "Are there baby changing facilities?"},
+    {"field": "wifi_available", "column": "X", "expected_header": "Is Wifi available?"},
+    {"field": "translation_phone", "column": "Y", "expected_header": "Enter a phone number used for organising translation and interpretation services."},
+    {"field": "translation_email", "column": "Z", "expected_header": "Enter an email address used for organising translation and interpretation services."}
+  ],
+  "address_groups": [
+    {
+      "index": 1,
+      "columns": [
+        {"field": "address_type", "column": "AA", "expected_header": "Select what applies for this address"},
+        {"field": "line_1", "column": "AB", "expected_header": "Address line 1"},
+        {"field": "line_2", "column": "AC", "expected_header": "Address line 2"},
+        {"field": "town_or_city", "column": "AD", "expected_header": "Town or city"},
+        {"field": "county", "column": "AE", "expected_header": "County"},
+        {"field": "postcode", "column": "AF", "expected_header": "Postcode"},
+        {"field": "areas_of_law", "column": "AG", "expected_header": "Does this address only apply to a specific area of law?"},
+        {"field": "court_types", "column": "AH", "expected_header": "Does this address only apply to a specific type of court?"},
+        {"field": "add_another", "column": "AI", "expected_header": "Do you need to add another address?"}
+      ]
+    },
+    {
+      "index": 2,
+      "columns": [
+        {"field": "address_type", "column": "AJ", "expected_header": "Select what applies for this address"},
+        {"field": "line_1", "column": "AK", "expected_header": "Address line 1"},
+        {"field": "line_2", "column": "AL", "expected_header": "Address line 2"},
+        {"field": "town_or_city", "column": "AM", "expected_header": "Town or city"},
+        {"field": "county", "column": "AN", "expected_header": "County"},
+        {"field": "postcode", "column": "AO", "expected_header": "Postcode"},
+        {"field": "areas_of_law", "column": "AP", "expected_header": "Does this address only apply to a specific area of law?"},
+        {"field": "court_types", "column": "AQ", "expected_header": "Does this address only apply to a specific type of court?"},
+        {"field": "add_another", "column": "AR", "expected_header": "Do you need to add another address?"}
+      ]
+    },
+    {
+      "index": 3,
+      "columns": [
+        {"field": "address_type", "column": "AS", "expected_header": "Select what applies for this address"},
+        {"field": "line_1", "column": "AT", "expected_header": "Address line 1"},
+        {"field": "line_2", "column": "AU", "expected_header": "Address line 2"},
+        {"field": "town_or_city", "column": "AV", "expected_header": "Town or city"},
+        {"field": "county", "column": "AW", "expected_header": "County"},
+        {"field": "postcode", "column": "AX", "expected_header": "Postcode"},
+        {"field": "areas_of_law", "column": "AY", "expected_header": "Does this address only apply to a specific area of law?"},
+        {"field": "court_types", "column": "AZ", "expected_header": "Does this address only apply to a specific type of court?"},
+        {"field": "add_another", "column": "BA", "expected_header": "Do you need to add another address?"}
+      ]
+    },
+    {
+      "index": 4,
+      "columns": [
+        {"field": "address_type", "column": "BB", "expected_header": "Select what applies for this address"},
+        {"field": "line_1", "column": "BC", "expected_header": "Address line 1"},
+        {"field": "line_2", "column": "BD", "expected_header": "Address line 2"},
+        {"field": "town_or_city", "column": "BE", "expected_header": "Town or city"},
+        {"field": "county", "column": "BF", "expected_header": "County"},
+        {"field": "postcode", "column": "BG", "expected_header": "Postcode"},
+        {"field": "areas_of_law", "column": "BH", "expected_header": "Does this address only apply to a specific area of law?"},
+        {"field": "court_types", "column": "BI", "expected_header": "Does this address only apply to a specific type of court?"},
+        {"field": "add_another", "column": "BJ", "expected_header": "Do you need to add another address?"}
+      ]
+    },
+    {
+      "index": 5,
+      "columns": [
+        {"field": "address_type", "column": "BK", "expected_header": "Select what applies for this address"},
+        {"field": "line_1", "column": "BL", "expected_header": "Address line 1"},
+        {"field": "line_2", "column": "BM", "expected_header": "Address line 2"},
+        {"field": "town_or_city", "column": "BN", "expected_header": "Town or city"},
+        {"field": "county", "column": "BO", "expected_header": "County"},
+        {"field": "postcode", "column": "BP", "expected_header": "Postcode"},
+        {"field": "areas_of_law", "column": "BQ", "expected_header": "Does this address only apply to a specific area of law?"},
+        {"field": "court_types", "column": "BR", "expected_header": "Does this address only apply to a specific type of court?"}
+      ]
+    }
+  ],
+  "counter_service": [
+    {"field": "specific_courts", "column": "BS", "expected_header": "Is this counter service for a specific court?"},
+    {"field": "assists_with", "column": "BT", "expected_header": "Select all that the counter can assist with"},
+    {"field": "appointment_contact", "column": "BU", "expected_header": "If an appointment is needed please provide an email or phone number for booking"},
+    {"field": "same_monday_to_friday", "column": "BV", "expected_header": "Does the counter open and close at the same time Monday to Friday?"},
+    {"field": "opening_hour", "column": "BW", "expected_header": "Opening time hour e.g. 09"},
+    {"field": "opening_minute", "column": "BX", "expected_header": "Opening time minute e.g. 30"},
+    {"field": "closing_hour", "column": "BY", "expected_header": "Closing time hour e.g. 17"},
+    {"field": "closing_minute", "column": "BZ", "expected_header": "Closing time minute e.g. 00"},
+    {"field": "monday_opening_hour", "column": "CA", "expected_header": "Monday Opening time hour e.g. 09"},
+    {"field": "monday_opening_minute", "column": "CB", "expected_header": "Monday Opening time minute e.g. 30"},
+    {"field": "monday_closing_hour", "column": "CC", "expected_header": "Monday Closing time hour e.g. 17"},
+    {"field": "monday_closing_minute", "column": "CD", "expected_header": "Monday Closing time minute e.g. 00"},
+    {"field": "tuesday_opening_hour", "column": "CE", "expected_header": "Tuesday Opening time hour e.g. 09"},
+    {"field": "tuesday_opening_minute", "column": "CF", "expected_header": "Tuesday Opening time minute e.g. 30"},
+    {"field": "tuesday_closing_hour", "column": "CG", "expected_header": "Tuesday Closing time hour e.g. 17"},
+    {"field": "tuesday_closing_minute", "column": "CH", "expected_header": "Tuesday Closing time minute e.g. 00"},
+    {"field": "wednesday_opening_hour", "column": "CI", "expected_header": "Wednesday Opening time hour e.g. 09"},
+    {"field": "wednesday_opening_minute", "column": "CJ", "expected_header": "Wednesday Opening time minute e.g. 30"},
+    {"field": "wednesday_closing_hour", "column": "CK", "expected_header": "Wednesday Closing time hour e.g. 17"},
+    {"field": "wednesday_closing_minute", "column": "CL", "expected_header": "Wednesday Closing time minute e.g. 00"},
+    {"field": "thursday_opening_hour", "column": "CM", "expected_header": "Thursday Opening time hour e.g. 09"},
+    {"field": "thursday_opening_minute", "column": "CN", "expected_header": "Thursday Opening time minute e.g. 30"},
+    {"field": "thursday_closing_hour", "column": "CO", "expected_header": "Thursday Closing time hour e.g. 17"},
+    {"field": "thursday_closing_minute", "column": "CP", "expected_header": "Thursday Closing time minute e.g. 00"},
+    {"field": "friday_opening_hour", "column": "CQ", "expected_header": "Friday Opening time hour e.g. 09"},
+    {"field": "friday_opening_minute", "column": "CR", "expected_header": "Friday Opening time minute e.g. 30"},
+    {"field": "friday_closing_hour", "column": "CS", "expected_header": "Friday Closing time hour e.g. 17"},
+    {"field": "friday_closing_minute", "column": "CT", "expected_header": "Friday Closing time minute e.g. 00"}
+  ],
+  "interview_rooms": [
+    {"field": "has_interview_rooms", "column": "CU", "expected_header": "Does this location have any interview rooms?"},
+    {"field": "room_count", "column": "CV", "expected_header": "If the location does have interview rooms, how many?"},
+    {"field": "booking_phone", "column": "CW", "expected_header": "What is the phone number to book the interview rooms?"}
+  ],
+  "contact_detail_groups": [
+    {"index": 1, "columns": [
+      {"field": "description", "column": "CX", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "CY", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "CZ", "expected_header": "Phone number"},
+      {"field": "email", "column": "DA", "expected_header": "Email"},
+      {"field": "add_another", "column": "DB", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 2, "columns": [
+      {"field": "description", "column": "DC", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "DD", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "DE", "expected_header": "Phone number"},
+      {"field": "email", "column": "DF", "expected_header": "Email"},
+      {"field": "add_another", "column": "DG", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 3, "columns": [
+      {"field": "description", "column": "DH", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "DI", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "DJ", "expected_header": "Phone number"},
+      {"field": "email", "column": "DK", "expected_header": "Email"},
+      {"field": "add_another", "column": "DL", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 4, "columns": [
+      {"field": "description", "column": "DM", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "DN", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "DO", "expected_header": "Phone number"},
+      {"field": "email", "column": "DP", "expected_header": "Email"},
+      {"field": "add_another", "column": "DQ", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 5, "columns": [
+      {"field": "description", "column": "DR", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "DS", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "DT", "expected_header": "Phone number"},
+      {"field": "email", "column": "DU", "expected_header": "Email"},
+      {"field": "add_another", "column": "DV", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 6, "columns": [
+      {"field": "description", "column": "DW", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "DX", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "DY", "expected_header": "Phone number"},
+      {"field": "email", "column": "DZ", "expected_header": "Email"},
+      {"field": "add_another", "column": "EA", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 7, "columns": [
+      {"field": "description", "column": "EB", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "EC", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "ED", "expected_header": "Phone number"},
+      {"field": "email", "column": "EE", "expected_header": "Email"},
+      {"field": "add_another", "column": "EF", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 8, "columns": [
+      {"field": "description", "column": "EG", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "EH", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "EI", "expected_header": "Phone number"},
+      {"field": "email", "column": "EJ", "expected_header": "Email"},
+      {"field": "add_another", "column": "EK", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 9, "columns": [
+      {"field": "description", "column": "EL", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "EM", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "EN", "expected_header": "Phone number"},
+      {"field": "email", "column": "EO", "expected_header": "Email"},
+      {"field": "add_another", "column": "EP", "expected_header": "Do you need to add another contact details?"}
+    ]},
+    {"index": 10, "columns": [
+      {"field": "description", "column": "EQ", "expected_header": "Choose a description for the contact details"},
+      {"field": "explanation", "column": "ER", "expected_header": "Add a short explanation if required."},
+      {"field": "phone", "column": "ES", "expected_header": "Phone number"},
+      {"field": "email", "column": "ET", "expected_header": "Email"}
+    ]}
+  ],
+  "opening_hours_groups": [
+    {"index": 1, "columns": [
+      {"field": "type", "column": "EU", "expected_header": "Select an opening hours type"},
+      {"field": "same_monday_to_friday", "column": "EV", "expected_header": "Does the court open and close at the same time Monday to Friday?"},
+      {"field": "opening_hour", "column": "EW", "expected_header": "Opening time hour e.g. 09"},
+      {"field": "opening_minute", "column": "EX", "expected_header": "Opening time minute e.g. 30"},
+      {"field": "closing_hour", "column": "EY", "expected_header": "Closing time hour e.g. 17"},
+      {"field": "closing_minute", "column": "EZ", "expected_header": "Closing time minute e.g. 00"},
+      {"field": "add_another", "column": "FA", "expected_header": "Do you need to add another type of opening hour?"},
+      {"field": "monday_opening_hour", "column": "FB", "expected_header": "Monday Opening time hour e.g. 09"},
+      {"field": "monday_opening_minute", "column": "FC", "expected_header": "Monday Opening time minute e.g. 30"},
+      {"field": "monday_closing_hour", "column": "FD", "expected_header": "Monday Closing time hour e.g. 17"},
+      {"field": "monday_closing_minute", "column": "FE", "expected_header": "Monday Closing time minute e.g. 00"},
+      {"field": "tuesday_opening_hour", "column": "FF", "expected_header": "Tuesday Opening time hour e.g. 09"},
+      {"field": "tuesday_opening_minute", "column": "FG", "expected_header": "Tuesday Opening time minute e.g. 30"},
+      {"field": "tuesday_closing_hour", "column": "FH", "expected_header": "Tuesday Closing time hour e.g. 17"},
+      {"field": "tuesday_closing_minute", "column": "FI", "expected_header": "Tuesday Closing time minute e.g. 00"},
+      {"field": "wednesday_opening_hour", "column": "FJ", "expected_header": "Wednesday Opening time hour e.g. 09"},
+      {"field": "wednesday_opening_minute", "column": "FK", "expected_header": "Wednesday Opening time minute e.g. 30"},
+      {"field": "wednesday_closing_hour", "column": "FL", "expected_header": "Wednesday Closing time hour e.g. 17"},
+      {"field": "wednesday_closing_minute", "column": "FM", "expected_header": "Wednesday Closing time minute e.g. 00"},
+      {"field": "thursday_opening_hour", "column": "FN", "expected_header": "Thursday Opening time hour e.g. 09"},
+      {"field": "thursday_opening_minute", "column": "FO", "expected_header": "Thursday Opening time minute e.g. 00"},
+      {"field": "thursday_closing_hour", "column": "FP", "expected_header": "Thursday Closing time hour e.g. 17"},
+      {"field": "thursday_closing_minute", "column": "FQ", "expected_header": "Thursday Closing time minute e.g. 00"},
+      {"field": "friday_opening_hour", "column": "FR", "expected_header": "Friday Opening time hour e.g. 09"},
+      {"field": "friday_opening_minute", "column": "FS", "expected_header": "Friday Opening time minute e.g. 30"},
+      {"field": "friday_closing_hour", "column": "FT", "expected_header": "Friday Closing time hour e.g. 17"},
+      {"field": "friday_closing_minute", "column": "FU", "expected_header": "Friday Closing time minute e.g. 00"},
+      {"field": "add_another_after_days", "column": "FV", "expected_header": "Do you need to add another type of opening hour?"}
+    ]},
+    {"index": 2, "columns": [
+      {"field": "type", "column": "FW", "expected_header": "Select an opening hours type"},
+      {"field": "same_monday_to_friday", "column": "FX", "expected_header": "Does the court open and close at the same time Monday to Friday?"},
+      {"field": "opening_hour", "column": "FY", "expected_header": "Opening time hour e.g. 09"},
+      {"field": "opening_minute", "column": "FZ", "expected_header": "Opening time minute e.g. 30"},
+      {"field": "closing_hour", "column": "GA", "expected_header": "Closing time hour e.g. 17"},
+      {"field": "closing_minute", "column": "GB", "expected_header": "Closing time minute e.g. 00"},
+      {"field": "monday_opening_hour", "column": "GC", "expected_header": "Monday Opening time hour e.g. 09"},
+      {"field": "monday_opening_minute", "column": "GD", "expected_header": "Monday Opening time minute e.g. 30"},
+      {"field": "monday_closing_hour", "column": "GE", "expected_header": "Monday Closing time hour e.g. 17"},
+      {"field": "monday_closing_minute", "column": "GF", "expected_header": "Monday Closing time minute e.g. 00"},
+      {"field": "tuesday_opening_hour", "column": "GG", "expected_header": "Tuesday Opening time hour e.g. 09"},
+      {"field": "tuesday_opening_minute", "column": "GH", "expected_header": "Tuesday Opening time minute e.g. 30"},
+      {"field": "tuesday_closing_hour", "column": "GI", "expected_header": "Tuesday Closing time hour e.g. 17"},
+      {"field": "tuesday_closing_minute", "column": "GJ", "expected_header": "Tuesday Closing time minute e.g. 00"},
+      {"field": "wednesday_opening_hour", "column": "GK", "expected_header": "Wednesday Opening time hour e.g. 09"},
+      {"field": "wednesday_opening_minute", "column": "GL", "expected_header": "Wednesday Opening time minute e.g. 30"},
+      {"field": "wednesday_closing_hour", "column": "GM", "expected_header": "Wednesday Closing time hour e.g. 17"},
+      {"field": "wednesday_closing_minute", "column": "GN", "expected_header": "Wednesday Closing time minute e.g. 00"},
+      {"field": "thursday_opening_hour", "column": "GO", "expected_header": "Thursday Opening time hour e.g. 09"},
+      {"field": "thursday_opening_minute", "column": "GP", "expected_header": "Thursday Opening time minute e.g. 00"},
+      {"field": "thursday_closing_hour", "column": "GQ", "expected_header": "Thursday Closing time hour e.g. 17"},
+      {"field": "thursday_closing_minute", "column": "GR", "expected_header": "Thursday Closing time minute e.g. 00"},
+      {"field": "friday_opening_hour", "column": "GS", "expected_header": "Friday Opening time hour e.g. 09"},
+      {"field": "friday_opening_minute", "column": "GT", "expected_header": "Friday Opening time minute e.g. 30"},
+      {"field": "friday_closing_hour", "column": "GU", "expected_header": "Friday Closing time hour e.g. 17"},
+      {"field": "friday_closing_minute", "column": "GV", "expected_header": "Friday Closing time minute e.g. 00"}
+    ]}
+  ]
 }

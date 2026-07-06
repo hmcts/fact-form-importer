@@ -58,16 +58,22 @@ def profile_workbook(
     source_path: Union[Path, str],
     sheet_name: Optional[str] = None,
 ) -> WorkbookProfile:
+    resolved_sheet_name, rows = read_workbook_rows(source_path, sheet_name)
+    return _profile_rows(Path(source_path), sheet_name=resolved_sheet_name, rows=rows)
+
+
+def read_workbook_rows(
+    source_path: Union[Path, str],
+    sheet_name: Optional[str] = None,
+) -> tuple[Optional[str], list[list[Any]]]:
     path = Path(source_path)
     suffix = path.suffix.lower()
 
     if suffix == ".csv":
-        rows = _read_csv(path)
-        return _profile_rows(path, sheet_name=None, rows=rows)
+        return None, _read_csv(path)
 
     if suffix in {".xlsx", ".xlsm"}:
-        resolved_sheet_name, rows = _read_xlsx(path, sheet_name)
-        return _profile_rows(path, sheet_name=resolved_sheet_name, rows=rows)
+        return _read_xlsx(path, sheet_name)
 
     raise ValueError(f"Unsupported workbook type: {path.suffix}")
 

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
 
 
@@ -32,6 +33,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         help="Directory to write profile.json.",
+    )
+
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest a Microsoft Forms export.")
+    ingest_parser.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        help="Path to the XLSX or CSV export.",
+    )
+    ingest_parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="Directory for generated ingest outputs.",
     )
 
     return parser
@@ -74,6 +89,20 @@ def profile(input_path: Path, output_path: Optional[Path] = None) -> int:
     return 0
 
 
+def ingest(input_path: Path, output_path: Path) -> int:
+    try:
+        result = ingest_workbook(input_path=input_path, output_path=output_path)
+    except (FileNotFoundError, KeyError, ModuleNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Ingested submissions: {len(result.submissions)}")
+    print(f"Skipped empty rows: {result.skipped_empty_rows}")
+    print(f"Mapping warnings: {len(result.mapping_warnings)}")
+    print(f"Wrote ingest outputs to: {output_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -83,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "profile":
         return profile(args.input, args.output)
+
+    if args.command == "ingest":
+        return ingest(args.input, args.output)
 
     parser.error(f"Unknown command: {args.command}")
     return 2
