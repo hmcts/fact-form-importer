@@ -3,7 +3,11 @@ import pytest
 from fact_form_importer.cleaners.booleans import normalise_yes_no
 from fact_form_importer.cleaners.emails import normalise_email
 from fact_form_importer.cleaners.multiselect import split_multiselect
-from fact_form_importer.cleaners.phones import normalise_uk_phone
+from fact_form_importer.cleaners.phones import (
+    _fallback_format_phone,
+    _looks_like_uk_phone,
+    normalise_uk_phone,
+)
 from fact_form_importer.cleaners.postcodes import normalise_uk_postcode
 from fact_form_importer.cleaners.slug import normalise_court_slug
 from fact_form_importer.cleaners.strings import collapse_spaces, null_if_empty_like, trim
@@ -52,8 +56,18 @@ def test_normalise_uk_phone():
     assert result.issues[0].code == "INVALID_PHONE"
 
 
+def test_phone_fallback_helpers():
+    assert _looks_like_uk_phone("+44 20 7946 0000") is True
+    assert _looks_like_uk_phone("123") is False
+    assert _fallback_format_phone("+44 20 7946 0000") == "020 7946 0000"
+    assert _fallback_format_phone("01234 567890") == "01234 567890"
+    assert _fallback_format_phone("ext 123") == "ext 123"
+
+
 def test_normalise_uk_postcode():
+    assert normalise_uk_postcode(None).value is None
     assert normalise_uk_postcode("sw1a1aa").value == "SW1A 1AA"
+    assert normalise_uk_postcode("GIR0AA").value == "GIR 0AA"
 
     result = normalise_uk_postcode("not a postcode")
 
@@ -76,6 +90,18 @@ def test_parse_time_parts():
 
     assert result.value == "09:05"
     assert result.status == "valid_time"
+
+
+def test_parse_time_parts_empty_partial_and_invalid():
+    assert parse_time_parts(None, None).status == "empty"
+
+    partial = parse_time_parts("9", None)
+    assert partial.status == "invalid"
+    assert partial.issues[0].code == "INVALID_TIME"
+
+    non_numeric = parse_time_parts("nine", "00")
+    assert non_numeric.status == "invalid"
+    assert non_numeric.issues[0].code == "INVALID_TIME"
 
 
 @pytest.mark.parametrize(
@@ -107,6 +133,7 @@ def test_parse_time_cell_invalid():
 
 
 def test_split_multiselect():
+    assert split_multiselect(None) == []
     assert split_multiselect("One; Two ; N/A; Three") == ["One", "Two", "Three"]
     assert split_multiselect("One\nTwo") == ["One", "Two"]
     assert split_multiselect("N/A") == []

@@ -1,7 +1,11 @@
 import pytest
 from zipfile import ZipFile
 
-from fact_form_importer.ingest.workbook_profiler import excel_column_letter, profile_workbook
+from fact_form_importer.ingest.workbook_profiler import (
+    _column_index_from_cell_ref,
+    excel_column_letter,
+    profile_workbook,
+)
 
 
 @pytest.mark.parametrize(
@@ -63,6 +67,30 @@ def test_profile_csv_counts_empty_like_values_and_samples(tmp_path):
     assert profile.columns[2].non_empty_count == 1
     assert profile.columns[2].empty_count == 2
     assert profile.columns[2].sample_values == ["Useful note"]
+
+
+def test_profile_empty_csv(tmp_path):
+    csv_path = tmp_path / "empty.csv"
+    csv_path.write_text("", encoding="utf-8")
+
+    profile = profile_workbook(csv_path)
+
+    assert profile.row_count == 0
+    assert profile.column_count == 0
+    assert profile.columns == []
+
+
+def test_profile_rejects_unsupported_file_type(tmp_path):
+    text_path = tmp_path / "sample.txt"
+    text_path.write_text("hello", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported workbook type"):
+        profile_workbook(text_path)
+
+
+def test_column_index_from_cell_ref_rejects_invalid_reference():
+    with pytest.raises(ValueError, match="Invalid cell reference"):
+        _column_index_from_cell_ref("123")
 
 
 def test_profile_xlsx_ignores_incorrect_dimension_metadata(tmp_path):

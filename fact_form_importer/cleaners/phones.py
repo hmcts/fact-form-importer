@@ -50,7 +50,9 @@ def normalise_uk_phone(value: object, field: str = "phone") -> CleaningResult:
 
 def _looks_like_uk_phone(value: str) -> bool:
     digits = re.sub(r"\D", "", value)
-    return 10 <= len(digits) <= 11 and (digits.startswith("0") or digits.startswith("44"))
+    return (10 <= len(digits) <= 11 and digits.startswith("0")) or (
+        len(digits) == 12 and digits.startswith("44")
+    )
 
 
 def _fallback_format_phone(value: str) -> str:

@@ -25,12 +25,20 @@ will be added in later tasks.
 
 Run the bootstrap script once per local checkout. It creates `.venv`, installs
 the package with development dependencies, and installs the local pre-push hook
-that runs unit tests before pushing.
+that runs unit tests with coverage before pushing.
 
 ```bash
 sh scripts/bootstrap.sh
 source .venv/bin/activate
 ```
+
+Run the unit suite with the same coverage threshold used by the pre-push hook:
+
+```bash
+python3 -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing
+```
+
+Coverage is configured to fail below 90%.
 
 ### 2. Configure local environment
 

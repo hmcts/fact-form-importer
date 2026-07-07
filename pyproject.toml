@@ -8,3 +8,16 @@ target-version = "py39"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["fact_form_importer"]
+omit = [
+  "fact_form_importer/__main__.py",
+  "fact_form_importer/config.py",
+]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true

@@ -2,5 +2,15 @@
 
 set -eu
 
-echo "Running unit tests before push..."
-python3 -m pytest tests/unit
+echo "Running unit tests with coverage before push..."
+PYTHON_BIN="python3"
+if [ -x ".venv/bin/python3" ]; then
+  PYTHON_BIN=".venv/bin/python3"
+fi
+
+if ! "$PYTHON_BIN" -c "import pytest_cov" >/dev/null 2>&1; then
+  echo "pytest-cov is not installed. Run: sh scripts/bootstrap.sh" >&2
+  exit 1
+fi
+
+"$PYTHON_BIN" -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing
