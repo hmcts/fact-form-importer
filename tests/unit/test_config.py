@@ -158,3 +158,13 @@ def test_load_field_rules_reads_json_file(tmp_path):
 
     assert rules.version == "test.2"
     assert rules.fields["translation_email"].cleaners == ["normalise_email"]
+
+
+def test_app_config_reads_fact_data_api_environment(monkeypatch):
+    monkeypatch.setenv("FACT_DATA_API_BASE_URL", "https://fact-data-api.example.test")
+    monkeypatch.setenv("FACT_DATA_API_BEARER_TOKEN", "token")
+
+    config = AppConfig()
+
+    assert config.fact_data_api_base_url == "https://fact-data-api.example.test"
+    assert config.fact_data_api_bearer_token == "token"

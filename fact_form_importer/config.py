@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+load_dotenv()
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -20,6 +24,14 @@ class AppConfig:
     @property
     def vocabularies_path(self) -> Path:
         return self.config_dir / "vocabularies.example.json"
+
+    @property
+    def fact_data_api_base_url(self) -> Optional[str]:
+        return os.getenv("FACT_DATA_API_BASE_URL") or None
+
+    @property
+    def fact_data_api_bearer_token(self) -> Optional[str]:
+        return os.getenv("FACT_DATA_API_BEARER_TOKEN") or None
 
 
 class LlmRule(BaseModel):

@@ -133,6 +133,18 @@ and write draft import/review JSON outputs.
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out"
 ```
 
+The `run` command requires `FACT_DATA_API_BASE_URL` and
+`FACT_DATA_API_BEARER_TOKEN` so controlled lists come from the FaCT Data API.
+If either value is missing, or the API rejects the token, the command fails
+instead of silently validating against stale local data.
+
+For local/offline inspection only, you can bypass the API and use the checked-in
+example vocabularies:
+
+```bash
+python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --allow-local-vocabularies
+```
+
 This also writes `profile.json` and the ingest intermediate files listed above.
 It then writes:
 
@@ -162,7 +174,8 @@ slugs, useful for filtering and review.
 
 `import_summary.json` contains the run id, source file, row and status counts,
 skipped row count, duplicate slug group count, duplicate slug affected-record
-count, mapping warnings, and issue counts by code. Duplicate groups are
+count, mapping warnings, issue counts by code, and `vocabulary_source`. In a
+normal run, `vocabulary_source` should be `fact_data_api`. Duplicate groups are
 conservative for now: every affected record is excluded from `fact_payload.json`
 and sent to human review. The importer does not pick a winner or merge duplicate
 rows until explicit merge/precedence rules exist.
@@ -215,15 +228,33 @@ values that must later match FaCT-compatible types, such as address types, court
 types, areas of law, contact description types, opening-hours types, food and
 drink options, hearing enhancement options, and counter service assistance.
 
-`fact_form_importer.validators.vocabularies` loads these lists and supports:
+The `run` command loads FaCT-owned controlled lists from the FaCT Data API before
+validation:
+
+- `/types/v1/areas-of-law`
+- `/types/v1/court-types`
+- `/types/v1/opening-hours-types`
+- `/types/v1/contact-description-types`
+
+Set both `FACT_DATA_API_BASE_URL` and `FACT_DATA_API_BEARER_TOKEN` in `.env`.
+If the API lookup fails, including an invalid or expired bearer token, `run`
+fails. This is deliberate: API-owned controlled lists should come from the
+source of truth, not an old fixture file.
+
+`--allow-local-vocabularies` is the only fallback path. It is intended for unit
+tests and offline review only, and it records `vocabulary_source` as
+`local_json` or `local_json_fallback_after_fact_data_api_error`. Local-only form
+vocabularies, such as food and drink options or hearing enhancement options,
+still come from the JSON file because they are not FaCT Data API type lists.
+
+`fact_form_importer.validators.vocabularies` loads vocabulary entries and supports:
 
 - exact matching against a code, display name, or alias
 - normalised matching for harmless case and whitespace differences
 - boolean membership checks for validators
 
-No external API calls happen at this stage. The local vocabulary loader is a
-pipeline boundary: later validators can augment or replace the file-backed
-values with FaCT API data while keeping the same matching behaviour.
+The local file is therefore a fallback/test fixture, not the preferred source of
+truth for FaCT-owned type lists.
 
 ### Validation Status
 

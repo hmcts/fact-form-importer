@@ -65,10 +65,17 @@ def test_build_import_summary_counts_statuses_and_issues(tmp_path):
     ingest_result = IngestResult(submissions=submissions, skipped_empty_rows=3)
     profile = _profile(tmp_path / "source.csv", row_count=7)
 
-    summary = build_import_summary(submissions, ingest_result, profile, "run-1")
+    summary = build_import_summary(
+        submissions,
+        ingest_result,
+        profile,
+        "run-1",
+        vocabulary_source="fact_data_api",
+    )
 
     assert summary["run_id"] == "run-1"
     assert summary["source_file"].endswith("source.csv")
+    assert summary["vocabulary_source"] == "fact_data_api"
     assert summary["row_count"] == 7
     assert summary["submission_count"] == 4
     assert summary["processed_count"] == 1
@@ -95,6 +102,7 @@ def test_write_processing_outputs_writes_expected_files(tmp_path):
         workbook_profile=profile,
         output_path=tmp_path,
         run_id="run-1",
+        vocabulary_source="local_json",
     )
 
     assert result.run_id == "run-1"
@@ -108,6 +116,7 @@ def test_write_processing_outputs_writes_expected_files(tmp_path):
     summary = json.loads((tmp_path / "import_summary.json").read_text())
     assert payload[0]["court_slug"] == "processed-court"
     assert summary["failed_count"] == 1
+    assert summary["vocabulary_source"] == "local_json"
 
 
 def _submission(court_slug, status, issue_code=None):

@@ -6,18 +6,30 @@ from fact_form_importer.ingest.column_mapping import excel_column_index, load_co
 from fact_form_importer.cli import main
 
 
-def test_run_command_writes_processing_outputs(tmp_path, capsys):
+def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("FACT_DATA_API_BASE_URL", raising=False)
+    monkeypatch.delenv("FACT_DATA_API_BEARER_TOKEN", raising=False)
     input_path = tmp_path / "sample.csv"
     output_path = tmp_path / "out"
     _write_minimal_forms_csv(input_path)
 
-    exit_code = main(["run", "--input", str(input_path), "--output", str(output_path)])
+    exit_code = main(
+        [
+            "run",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--allow-local-vocabularies",
+        ]
+    )
 
     captured = capsys.readouterr()
 
     assert exit_code == 0
     assert "Run ID:" in captured.out
     assert "Validated submissions: 1" in captured.out
+    assert "Vocabulary source: local_json" in captured.out
     assert (output_path / "profile.json").exists()
     assert (output_path / "submissions_raw.json").exists()
     assert (output_path / "submissions_cleaned.json").exists()
@@ -28,6 +40,37 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys):
     summary = json.loads((output_path / "import_summary.json").read_text())
     assert summary["submission_count"] == 1
     assert summary["processed_count"] == 1
+    assert summary["vocabulary_source"] == "local_json"
+
+
+def test_run_command_requires_fact_api_base_url_by_default(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("FACT_DATA_API_BASE_URL", raising=False)
+    monkeypatch.delenv("FACT_DATA_API_BEARER_TOKEN", raising=False)
+    input_path = tmp_path / "sample.csv"
+    output_path = tmp_path / "out"
+    _write_minimal_forms_csv(input_path)
+
+    exit_code = main(["run", "--input", str(input_path), "--output", str(output_path)])
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "FACT_DATA_API_BASE_URL is required for run" in captured.err
+
+
+def test_run_command_requires_fact_api_bearer_token_by_default(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("FACT_DATA_API_BASE_URL", "https://fact-data-api.example.test")
+    monkeypatch.delenv("FACT_DATA_API_BEARER_TOKEN", raising=False)
+    input_path = tmp_path / "sample.csv"
+    output_path = tmp_path / "out"
+    _write_minimal_forms_csv(input_path)
+
+    exit_code = main(["run", "--input", str(input_path), "--output", str(output_path)])
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "FACT_DATA_API_BEARER_TOKEN is required for run" in captured.err
 
 
 def test_run_command_returns_error_for_missing_file(tmp_path, capsys):

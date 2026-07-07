@@ -12,6 +12,7 @@ from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
 from fact_form_importer.output.logs import write_processing_outputs
 from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
+from fact_form_importer.validators.fact_api_vocabularies import load_vocabularies_from_fact_api
 from fact_form_importer.validators.business_rules import validate_all_submissions
 from fact_form_importer.validators.vocabularies import load_vocabularies
 
@@ -26,6 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Process a Microsoft Forms export.")
     run_parser.add_argument("--input", required=True, type=Path, help="Path to the XLSX or CSV export.")
     run_parser.add_argument("--output", required=True, type=Path, help="Directory for generated outputs.")
+    run_parser.add_argument(
+        "--allow-local-vocabularies",
+        action="store_true",
+        help=(
+            "Allow config/vocabularies.example.json when FaCT Data API vocabulary loading "
+            "is unavailable. Intended for local/offline review only."
+        ),
+    )
 
     profile_parser = subparsers.add_parser("profile", help="Profile a Microsoft Forms export.")
     profile_parser.add_argument(
@@ -57,11 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(input_path: Path, output_path: Path) -> int:
+def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = False) -> int:
     try:
         workbook_profile = profile_workbook(input_path)
         ingest_result = ingest_workbook(input_path=input_path, output_path=output_path)
-        vocabularies = _load_vocabularies_if_available()
+        vocabularies, vocabulary_source = _load_vocabularies_for_run(
+            allow_local_vocabularies=allow_local_vocabularies
+        )
         submissions = validate_all_submissions(ingest_result.submissions, vocabularies)
         output_path.mkdir(parents=True, exist_ok=True)
         (output_path / "profile.json").write_text(
@@ -73,6 +84,7 @@ def run(input_path: Path, output_path: Path) -> int:
             ingest_result=ingest_result,
             workbook_profile=workbook_profile,
             output_path=output_path,
+            vocabulary_source=vocabulary_source,
         )
         workbook_path = write_nsu_review_workbook(
             submissions=submissions,
@@ -93,6 +105,7 @@ def run(input_path: Path, output_path: Path) -> int:
     print(f"Needs human review: {summary['needs_human_review_count']}")
     print(f"Failed: {summary['failed_count']}")
     print(f"Skipped empty rows: {summary['skipped_count']}")
+    print(f"Vocabulary source: {summary['vocabulary_source']}")
     print(f"Wrote NSU review workbook: {workbook_path}")
     print(f"Wrote run outputs to: {output_path}")
     return 0
@@ -144,12 +157,41 @@ def ingest(input_path: Path, output_path: Path) -> int:
     return 0
 
 
-def _load_vocabularies_if_available():
-    path = AppConfig().vocabularies_path
-    if not path.exists():
-        return None
+def _load_vocabularies_for_run(allow_local_vocabularies: bool = False):
+    config = AppConfig()
+    path = config.vocabularies_path
+    local_vocabularies = load_vocabularies(path) if path.exists() else None
 
-    return load_vocabularies(path)
+    if not config.fact_data_api_base_url:
+        if allow_local_vocabularies:
+            return local_vocabularies, "local_json" if local_vocabularies else "none"
+        raise ValueError(
+            "FACT_DATA_API_BASE_URL is required for run. "
+            "Use --allow-local-vocabularies only for offline/local review."
+        )
+
+    if not config.fact_data_api_bearer_token:
+        if allow_local_vocabularies:
+            return local_vocabularies, "local_json" if local_vocabularies else "none"
+        raise ValueError(
+            "FACT_DATA_API_BEARER_TOKEN is required for run. "
+            "Use --allow-local-vocabularies only for offline/local review."
+        )
+
+    try:
+        return (
+            load_vocabularies_from_fact_api(
+                base_url=config.fact_data_api_base_url,
+                bearer_token=config.fact_data_api_bearer_token,
+                fallback=local_vocabularies,
+            ),
+            "fact_data_api",
+        )
+    except Exception as exc:
+        if not allow_local_vocabularies or local_vocabularies is None:
+            raise ValueError(f"Unable to load FaCT API vocabularies: {exc}") from exc
+        print(f"Warning: using local vocabularies because FaCT API lookup failed: {exc}", file=sys.stderr)
+        return local_vocabularies, "local_json_fallback_after_fact_data_api_error"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -157,7 +199,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "run":
-        return run(args.input, args.output)
+        return run(
+            args.input,
+            args.output,
+            allow_local_vocabularies=args.allow_local_vocabularies,
+        )
 
     if args.command == "profile":
         return profile(args.input, args.output)

@@ -34,6 +34,7 @@ def write_processing_outputs(
     workbook_profile: WorkbookProfile,
     output_path: Path,
     run_id: str | None = None,
+    vocabulary_source: str = "not_recorded",
 ) -> OutputResult:
     output_path.mkdir(parents=True, exist_ok=True)
     current_run_id = run_id or _new_run_id()
@@ -47,6 +48,7 @@ def write_processing_outputs(
         ingest_result=ingest_result,
         workbook_profile=workbook_profile,
         run_id=current_run_id,
+        vocabulary_source=vocabulary_source,
     )
 
     _write_json(output_path / "fact_payload.json", fact_payload)
@@ -78,6 +80,7 @@ def build_import_summary(
     ingest_result: IngestResult,
     workbook_profile: WorkbookProfile,
     run_id: str,
+    vocabulary_source: str = "not_recorded",
 ) -> dict[str, Any]:
     status_counts = Counter(submission.status for submission in submissions)
     issue_counts = Counter(
@@ -95,6 +98,7 @@ def build_import_summary(
     return {
         "run_id": run_id,
         "source_file": str(workbook_profile.source_path),
+        "vocabulary_source": vocabulary_source,
         "row_count": workbook_profile.row_count,
         "submission_count": len(submissions),
         "processed_count": status_counts["processed"],
