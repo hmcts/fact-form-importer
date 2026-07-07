@@ -20,7 +20,7 @@ def normalise_uk_phone(value: object, field: str = "phone") -> CleaningResult:
         import phonenumbers
 
         parsed = phonenumbers.parse(candidate, "GB")
-        if phonenumbers.is_valid_number(parsed):
+        if phonenumbers.is_possible_number(parsed):
             return CleaningResult(
                 value=phonenumbers.format_number(
                     parsed,
@@ -40,7 +40,7 @@ def normalise_uk_phone(value: object, field: str = "phone") -> CleaningResult:
                 field=field,
                 code="INVALID_PHONE",
                 severity="warning",
-                message="Phone number could not be parsed as a valid UK phone number",
+                message="Phone number could not be parsed as a possible UK phone number",
                 raw_value=value,
                 cleaned_value=candidate,
             )

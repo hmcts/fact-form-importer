@@ -30,9 +30,9 @@ def test_ingest_workbook_creates_submissions_and_outputs(tmp_path):
         "Free water dispensers",
         "Drink vending machines",
     ]
-    assert valid_submission.translation_email == "info@example.test"
+    assert valid_submission.translation_email == "info@example.com"
     assert valid_submission.addresses[0].postcode == "SW1A 1AA"
-    assert valid_submission.contacts[0].email == "contact@example.test"
+    assert valid_submission.contacts[0].email == "contact@example.com"
     assert valid_submission.opening_hours[0].monday_to_friday.open == "09:30"
     assert valid_submission.status == "processed"
 
@@ -64,7 +64,7 @@ def _build_ingest_rows(mapping):
     _set(valid, "A", "1")
     _set(valid, "B", "2026-01-01 09:00")
     _set(valid, "C", "2026-01-01 09:30")
-    _set(valid, "D", "submitter@example.test")
+    _set(valid, "D", "submitter@example.com")
     _set(valid, "E", "Submitter")
     _set(valid, "G", "https://www.find-court-tribunal.service.gov.uk/courts/Fleetwood Court")
     _set(valid, "H", "Yes")
@@ -85,7 +85,7 @@ def _build_ingest_rows(mapping):
     _set(valid, "W", "No")
     _set(valid, "X", "Yes")
     _set(valid, "Y", "02079460002")
-    _set(valid, "Z", "INFO@EXAMPLE.TEST")
+    _set(valid, "Z", "INFO@EXAMPLE.COM")
     _set(valid, "AA", "Visit")
     _set(valid, "AB", "1 Example Street")
     _set(valid, "AD", "London")
@@ -104,7 +104,7 @@ def _build_ingest_rows(mapping):
     _set(valid, "CW", "02079460003")
     _set(valid, "CX", "Enquiries")
     _set(valid, "CZ", "02079460004")
-    _set(valid, "DA", "contact@example.test")
+    _set(valid, "DA", "contact@example.com")
     _set(valid, "EU", "Court open")
     _set(valid, "EV", "Yes")
     _set(valid, "EW", "9")
@@ -116,7 +116,7 @@ def _build_ingest_rows(mapping):
     _set(missing_slug, "H", "Yes")
 
     _set(metadata_only, "A", "3")
-    _set(metadata_only, "D", "metadata-only@example.test")
+    _set(metadata_only, "D", "metadata-only@example.com")
 
     return [header, valid, missing_slug, metadata_only]
 
