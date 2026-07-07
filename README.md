@@ -78,7 +78,44 @@ To also write `out/profile.json`:
 python3 -m fact_form_importer profile --input "./input/microsoft-forms-export.xlsx" --output "./out"
 ```
 
-### 5. Run the importer
+### 5. Ingest the spreadsheet
+
+Ingestion reads the source spreadsheet, applies deterministic cleaners, and
+builds one `CourtSubmission` object per non-empty business row. It preserves
+source metadata, raw values, cleaned values, repeated groups, and issues.
+
+```bash
+python3 -m fact_form_importer ingest --input "./input/microsoft-forms-export.xlsx" --output "./out"
+```
+
+This writes three intermediate files:
+
+```text
+out/submissions_raw.json
+out/submissions_cleaned.json
+out/ingest_summary.json
+```
+
+`submissions_raw.json` contains each ingested row with source metadata, the raw
+spreadsheet values keyed by Excel column letter, row-level issues, and status.
+This is mainly an audit/debug file for tracing a cleaned value back to the
+original spreadsheet.
+
+`submissions_cleaned.json` contains the structured `CourtSubmission` records
+after deterministic cleaning. It includes cleaned facilities, addresses,
+counter service, interview rooms, contact details, opening hours, issues, and
+status. This is still an intermediate processing artifact, not the final FaCT
+API payload.
+
+`ingest_summary.json` contains counts for ingested submissions, skipped empty
+rows, failed rows, warning rows, and mapping warnings. Use it as the first check
+that ingestion behaved as expected.
+
+Later steps will use these `CourtSubmission` records for field-rule validation,
+vocabulary normalisation, optional LLM-assisted cleanup, NSU review workbook
+generation, and final `fact_payload.json` creation.
+
+### 6. Run the full importer
 
 The `run` command is currently a placeholder. Later it will process the
 spreadsheet and write import outputs:
