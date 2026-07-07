@@ -125,12 +125,46 @@ generation, and final `fact_payload.json` creation.
 
 ### 6. Run the full importer
 
-The `run` command is currently a placeholder. Later it will process the
-spreadsheet and write import outputs:
+The `run` command performs the current end-to-end non-LLM pipeline:
+profile the workbook, ingest rows, validate submissions, calculate statuses,
+and write draft import/review JSON outputs.
 
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out"
 ```
+
+This also writes `profile.json` and the ingest intermediate files listed above.
+It then writes:
+
+```text
+out/fact_payload.json
+out/failed_records.json
+out/records_needing_human_review.json
+out/issue_report.json
+out/import_summary.json
+```
+
+`fact_payload.json` contains only records with status `processed` or
+`processed_with_warnings`, provided they have no blocking error issues. The
+shape is intentionally inspectable and draft-like; it is not the final FaCT API
+request body yet.
+
+`failed_records.json` contains records that cannot progress because required
+data is missing or schema-critical validation failed.
+
+`records_needing_human_review.json` contains records blocked from automatic
+import by issues such as duplicate court slugs, invalid populated postcodes,
+ambiguous opening hours, or controlled-list mismatches.
+
+`issue_report.json` is a flat issue list with source row numbers and court
+slugs, useful for filtering and review.
+
+`import_summary.json` contains the run id, source file, row and status counts,
+skipped row count, duplicate slug group count, duplicate slug affected-record
+count, mapping warnings, and issue counts by code. Duplicate groups are
+conservative for now: every affected record is excluded from `fact_payload.json`
+and sent to human review. The importer does not pick a winner or merge duplicate
+rows until explicit merge/precedence rules exist.
 
 ## Configuration
 
