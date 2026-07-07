@@ -178,6 +178,35 @@ No external API calls happen at this stage. The local vocabulary loader is a
 pipeline boundary: later validators can augment or replace the file-backed
 values with FaCT API data while keeping the same matching behaviour.
 
+### Validation Status
+
+`fact_form_importer.validators.business_rules` validates ingested
+`CourtSubmission` records after deterministic cleaning. It does not call the
+FaCT API, Ordnance Survey, or the LLM yet.
+
+Current validation checks:
+
+- required court slug
+- optional email and phone syntax
+- populated address postcode syntax
+- opening-hours time shape and ambiguous time status
+- controlled-list values when vocabularies are loaded
+- duplicate `court_slug` values across a batch
+
+Status is recalculated after validation:
+
+- `failed`: required court identifier is missing or an error issue exists
+- `needs_human_review`: duplicate slug, invalid populated postcode, ambiguous
+  opening hours, invalid time, or controlled-list mismatch
+- `processed_with_warnings`: optional email/phone warnings or slug
+  normalisation from a URL/free text
+- `processed`: no validation issues
+
+Address existence checks against Ordnance Survey/FaCT API are intentionally not
+part of this step. They should run later as API-backed validation, after syntax
+cleaning and before final import, so possible postcode/address matches can be
+reviewed rather than treated as a simple regex pass/fail.
+
 ## Project Layout
 
 ```text

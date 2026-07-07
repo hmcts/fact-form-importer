@@ -134,10 +134,10 @@ class Vocabularies(BaseModel):
         return self.normalised_vocab_match(code_or_name, vocabulary_name) is not None
 
 
-def load_vocabularies(path: Path) -> Vocabularies:
+def load_vocabularies(path: Path | str) -> Vocabularies:
     global _DEFAULT_VOCABULARIES
 
-    vocabularies = Vocabularies(**json.loads(path.read_text(encoding="utf-8")))
+    vocabularies = Vocabularies(**json.loads(Path(path).read_text(encoding="utf-8")))
     _DEFAULT_VOCABULARIES = vocabularies
     return vocabularies
 
