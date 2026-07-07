@@ -1,1 +1,455 @@
-"""NSU review workbook output placeholders."""
+"""NSU review workbook generation."""
+
+from __future__ import annotations
+
+import json
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Iterable
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
+from pydantic import BaseModel
+
+from fact_form_importer.models.court_submission import CourtSubmission, OpeningTime
+from fact_form_importer.validators.base import DUPLICATE_COURT_SLUG
+
+WORKBOOK_NAME = "nsu_cleaned_review.xlsx"
+HEADER_FILL = PatternFill("solid", fgColor="D9EAF7")
+HEADER_FONT = Font(bold=True)
+ISSUE_EXPLANATIONS = {
+    "COURT_SLUG_NORMALISED": (
+        "The submitted court identifier was changed into a clean slug. This is usually non-blocking."
+    ),
+    "DUPLICATE_COURT_SLUG": (
+        "More than one submitted row resolves to the same court slug. The importer does not choose or merge rows automatically."
+    ),
+    "INVALID_EMAIL": "An email value could not be parsed as a valid email address.",
+    "INVALID_PHONE": "A phone value could not be parsed as a possible UK phone number.",
+    "INVALID_POSTCODE": "A populated address postcode does not match the expected UK postcode format.",
+    "INVALID_TIME": "An opening-hours value could not be parsed as a valid HH:MM time.",
+    "MISSING_COURT_IDENTIFIER": "The row has business data but no usable court identifier.",
+    "OPENING_HOURS_AMBIGUOUS": "Opening hours need review because the time values are invalid or ambiguous.",
+    "VOCAB_NO_MATCH": "A value does not match the configured controlled list.",
+}
+ISSUE_ACTIONS = {
+    "COURT_SLUG_NORMALISED": "Check only if the cleaned slug looks wrong.",
+    "DUPLICATE_COURT_SLUG": "Review all rows in the duplicate group and decide whether to merge, discard, or correct them.",
+    "INVALID_EMAIL": "Correct the email address or confirm it should be omitted.",
+    "INVALID_PHONE": "Correct the phone number or confirm it should be omitted.",
+    "INVALID_POSTCODE": "Correct the postcode before import.",
+    "INVALID_TIME": "Correct the opening-hours time before import.",
+    "MISSING_COURT_IDENTIFIER": "Add a valid court slug before import.",
+    "OPENING_HOURS_AMBIGUOUS": "Review the opening-hours fields and correct the time values.",
+    "VOCAB_NO_MATCH": "Map the value to an allowed option or confirm it needs a new controlled-list value.",
+}
+
+
+def write_nsu_review_workbook(
+    submissions: list[CourtSubmission],
+    output_path: Path,
+    summary: dict[str, Any],
+) -> Path:
+    output_path.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+
+    _add_summary_sheet(workbook, submissions, summary)
+    _add_records_sheet(
+        workbook,
+        "Processed records",
+        [submission for submission in submissions if submission.status in {"processed", "processed_with_warnings"}],
+    )
+    _add_records_sheet(
+        workbook,
+        "Needs human review",
+        [submission for submission in submissions if submission.status == "needs_human_review"],
+    )
+    _add_records_sheet(
+        workbook,
+        "Failed records",
+        [submission for submission in submissions if submission.status == "failed"],
+    )
+    _add_duplicate_courts_sheet(workbook, submissions)
+    _add_addresses_sheet(workbook, submissions)
+    _add_contacts_sheet(workbook, submissions)
+    _add_opening_hours_sheet(workbook, submissions)
+    _add_issues_sheet(workbook, submissions)
+    _add_submitter_users_sheet(workbook, submissions)
+
+    path = output_path / WORKBOOK_NAME
+    workbook.save(path)
+    return path
+
+
+def _add_summary_sheet(
+    workbook: Workbook,
+    submissions: list[CourtSubmission],
+    summary: dict[str, Any],
+) -> None:
+    status_counts = Counter(submission.status for submission in submissions)
+    issue_counts = Counter(
+        issue.code
+        for submission in submissions
+        for issue in submission.issues
+    )
+    rows = [
+        ["Metric", "Value"],
+        ["Run ID", summary.get("run_id")],
+        ["Source file", summary.get("source_file")],
+        ["Workbook rows", summary.get("row_count")],
+        ["Submissions", len(submissions)],
+        ["Processed", status_counts["processed"]],
+        ["Processed with warnings", status_counts["processed_with_warnings"]],
+        ["Needs human review", status_counts["needs_human_review"]],
+        ["Failed", status_counts["failed"]],
+        ["Skipped empty rows", summary.get("skipped_count")],
+        ["Duplicate slug groups", summary.get("duplicate_slug_group_count")],
+        ["Duplicate affected records", summary.get("duplicate_slug_affected_record_count")],
+        [],
+        ["Issue code", "Count"],
+    ]
+    rows.extend([code, count] for code, count in sorted(issue_counts.items()))
+    _write_sheet(workbook, "Summary", rows, freeze=False, autofilter=False)
+
+
+def _add_records_sheet(
+    workbook: Workbook,
+    title: str,
+    submissions: list[CourtSubmission],
+) -> None:
+    rows = [
+        [
+            "source_row_number",
+            "court_slug",
+            "status",
+            "issue_count",
+            "issue_codes",
+            "review_reason",
+            "suggested_next_action",
+            "court_slug_raw",
+            "translation_phone",
+            "translation_email",
+            "address_count",
+            "contact_count",
+            "opening_hours_count",
+        ]
+    ]
+    for submission in submissions:
+        rows.append(
+            [
+                submission.source.source_row_number,
+                submission.court_slug,
+                submission.status,
+                len(submission.issues),
+                ", ".join(sorted({issue.code for issue in submission.issues})),
+                _review_reason(submission),
+                _suggested_next_action(submission),
+                submission.court_slug_raw,
+                submission.translation_phone,
+                submission.translation_email,
+                len(submission.addresses),
+                len(submission.contacts),
+                len(submission.opening_hours),
+            ]
+        )
+
+    _write_sheet(workbook, title, rows)
+
+
+def _add_duplicate_courts_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:
+    by_slug: dict[str, list[CourtSubmission]] = defaultdict(list)
+    for submission in submissions:
+        if any(issue.code == DUPLICATE_COURT_SLUG for issue in submission.issues):
+            by_slug[submission.court_slug or ""].append(submission)
+
+    rows = [["court_slug", "record_count", "source_row_numbers", "statuses", "raw_slug_values"]]
+    for slug, matching_submissions in sorted(by_slug.items()):
+        rows.append(
+            [
+                slug,
+                len(matching_submissions),
+                ", ".join(str(submission.source.source_row_number) for submission in matching_submissions),
+                ", ".join(sorted({submission.status for submission in matching_submissions})),
+                " | ".join(sorted({str(submission.court_slug_raw) for submission in matching_submissions})),
+            ]
+        )
+
+    _write_sheet(workbook, "Duplicate courts", rows)
+
+
+def _add_addresses_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:
+    rows = [
+        [
+            "source_row_number",
+            "court_slug",
+            "status",
+            "address_index",
+            "address_type",
+            "line_1",
+            "line_2",
+            "town_or_city",
+            "county",
+            "postcode",
+            "areas_of_law",
+            "court_types",
+        ]
+    ]
+    for submission in submissions:
+        for address in submission.addresses:
+            rows.append(
+                [
+                    submission.source.source_row_number,
+                    submission.court_slug,
+                    submission.status,
+                    address.index,
+                    address.address_type,
+                    address.line_1,
+                    address.line_2,
+                    address.town_or_city,
+                    address.county,
+                    address.postcode,
+                    "; ".join(address.areas_of_law),
+                    "; ".join(address.court_types),
+                ]
+            )
+
+    _write_sheet(workbook, "Cleaned addresses", rows)
+
+
+def _add_contacts_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:
+    rows = [
+        [
+            "source_row_number",
+            "court_slug",
+            "status",
+            "contact_index",
+            "description",
+            "explanation",
+            "phone",
+            "email",
+        ]
+    ]
+    for submission in submissions:
+        for contact in submission.contacts:
+            rows.append(
+                [
+                    submission.source.source_row_number,
+                    submission.court_slug,
+                    submission.status,
+                    contact.index,
+                    contact.description,
+                    contact.explanation,
+                    contact.phone,
+                    contact.email,
+                ]
+            )
+
+    _write_sheet(workbook, "Cleaned contacts", rows)
+
+
+def _add_opening_hours_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:
+    rows = [
+        [
+            "source_row_number",
+            "court_slug",
+            "status",
+            "opening_hours_index",
+            "type",
+            "same_monday_to_friday",
+            "day",
+            "open",
+            "close",
+            "time_status",
+            "time_issue_codes",
+        ]
+    ]
+    for submission in submissions:
+        for opening_hours in submission.opening_hours:
+            for day, time_value in _opening_time_values(opening_hours):
+                rows.append(
+                    [
+                        submission.source.source_row_number,
+                        submission.court_slug,
+                        submission.status,
+                        opening_hours.index,
+                        opening_hours.type,
+                        opening_hours.same_monday_to_friday,
+                        day,
+                        time_value.open if time_value else None,
+                        time_value.close if time_value else None,
+                        time_value.status if time_value else None,
+                        ", ".join(issue.code for issue in time_value.issues) if time_value else None,
+                    ]
+                )
+
+    _write_sheet(workbook, "Cleaned opening hours", rows)
+
+
+def _add_issues_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:
+    rows = [
+        [
+            "source_row_number",
+            "court_slug",
+            "field",
+            "code",
+            "severity",
+            "message",
+            "plain_english_meaning",
+            "suggested_next_action",
+            "raw_value",
+            "cleaned_value",
+        ]
+    ]
+    for submission in submissions:
+        for issue in submission.issues:
+            rows.append(
+                [
+                    submission.source.source_row_number,
+                    submission.court_slug,
+                    issue.field,
+                    issue.code,
+                    issue.severity,
+                    issue.message,
+                    ISSUE_EXPLANATIONS.get(issue.code, "No explanation configured for this issue code."),
+                    ISSUE_ACTIONS.get(issue.code, "Review the field value."),
+                    _cell_value(issue.raw_value),
+                    _cell_value(issue.cleaned_value),
+                ]
+            )
+
+    _write_sheet(workbook, "Issues", rows)
+
+
+def _add_submitter_users_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:
+    by_submitter: dict[tuple[Any, Any], list[CourtSubmission]] = defaultdict(list)
+    for submission in submissions:
+        key = (submission.source.submitter_email, submission.source.submitter_name)
+        by_submitter[key].append(submission)
+
+    rows = [
+        [
+            "submitter_email",
+            "submitter_name",
+            "submission_count",
+            "source_row_numbers",
+            "statuses",
+        ]
+    ]
+    for (email, name), matching_submissions in sorted(by_submitter.items(), key=lambda item: str(item[0])):
+        rows.append(
+            [
+                email,
+                name,
+                len(matching_submissions),
+                ", ".join(str(submission.source.source_row_number) for submission in matching_submissions),
+                ", ".join(sorted({submission.status for submission in matching_submissions})),
+            ]
+        )
+
+    _write_sheet(workbook, "Submitter users", rows)
+
+
+def _opening_time_values(opening_hours: Any) -> Iterable[tuple[str, OpeningTime | None]]:
+    yield "Monday to Friday", opening_hours.monday_to_friday
+    yield "Monday", opening_hours.monday
+    yield "Tuesday", opening_hours.tuesday
+    yield "Wednesday", opening_hours.wednesday
+    yield "Thursday", opening_hours.thursday
+    yield "Friday", opening_hours.friday
+
+
+def _review_reason(submission: CourtSubmission) -> str:
+    if not submission.issues:
+        return "No validation issues."
+
+    issue_codes = sorted({issue.code for issue in submission.issues})
+    if submission.status == "processed_with_warnings":
+        return "Only non-blocking warnings were found: " + _issue_explanations(
+            issue_codes,
+            submission,
+        )
+
+    return _issue_explanations(issue_codes, submission)
+
+
+def _suggested_next_action(submission: CourtSubmission) -> str:
+    if not submission.issues:
+        return "No action required."
+
+    issue_codes = sorted({issue.code for issue in submission.issues})
+    return " ".join(ISSUE_ACTIONS.get(code, "Review the field value.") for code in issue_codes)
+
+
+def _issue_explanations(issue_codes: list[str], submission: CourtSubmission) -> str:
+    return " ".join(_issue_explanation(code, submission) for code in issue_codes)
+
+
+def _issue_explanation(code: str, submission: CourtSubmission) -> str:
+    matching_issues = [issue for issue in submission.issues if issue.code == code]
+    base = ISSUE_EXPLANATIONS.get(code, "No explanation configured for this issue code.")
+
+    if code == "VOCAB_NO_MATCH":
+        details = []
+        for issue in matching_issues:
+            details.append(
+                f"{issue.field} value {_cell_value(issue.raw_value)!r} did not match"
+            )
+        return f"{code}: {base} " + "; ".join(details) + "."
+
+    if code in {"INVALID_EMAIL", "INVALID_PHONE", "INVALID_POSTCODE", "INVALID_TIME"}:
+        details = []
+        for issue in matching_issues:
+            details.append(f"{issue.field} value {_cell_value(issue.raw_value)!r}")
+        return f"{code}: {base} Affected value(s): " + "; ".join(details) + "."
+
+    return f"{code}: {base}"
+
+
+def _write_sheet(
+    workbook: Workbook,
+    title: str,
+    rows: list[list[Any]],
+    freeze: bool = True,
+    autofilter: bool = True,
+) -> Worksheet:
+    worksheet = workbook.create_sheet(title=title)
+    for row in rows:
+        worksheet.append([_cell_value(value) for value in row])
+
+    if rows:
+        for cell in worksheet[1]:
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+
+    if freeze:
+        worksheet.freeze_panes = "A2"
+
+    if autofilter and rows and rows[0]:
+        worksheet.auto_filter.ref = worksheet.dimensions
+
+    _set_column_widths(worksheet)
+    return worksheet
+
+
+def _set_column_widths(worksheet: Worksheet) -> None:
+    for column_cells in worksheet.columns:
+        max_length = 0
+        column_letter = get_column_letter(column_cells[0].column)
+        for cell in column_cells:
+            if cell.value is not None:
+                max_length = max(max_length, len(str(cell.value)))
+        worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 60)
+
+
+def _cell_value(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return json.dumps(value.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    return value

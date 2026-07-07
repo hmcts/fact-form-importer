@@ -23,6 +23,7 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys):
     assert (output_path / "submissions_cleaned.json").exists()
     assert (output_path / "fact_payload.json").exists()
     assert (output_path / "import_summary.json").exists()
+    assert (output_path / "nsu_cleaned_review.xlsx").exists()
 
     summary = json.loads((output_path / "import_summary.json").read_text())
     assert summary["submission_count"] == 1

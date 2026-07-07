@@ -142,6 +142,7 @@ out/failed_records.json
 out/records_needing_human_review.json
 out/issue_report.json
 out/import_summary.json
+out/nsu_cleaned_review.xlsx
 ```
 
 `fact_payload.json` contains only records with status `processed` or
@@ -165,6 +166,18 @@ count, mapping warnings, and issue counts by code. Duplicate groups are
 conservative for now: every affected record is excluded from `fact_payload.json`
 and sent to human review. The importer does not pick a winner or merge duplicate
 rows until explicit merge/precedence rules exist.
+
+`nsu_cleaned_review.xlsx` is a reviewer-friendly Excel workbook. It is not the
+machine-readable source of truth; the JSON files remain that. The workbook helps
+NSU/product reviewers inspect what deterministic cleaning and validation did
+without recreating the original 204-column Microsoft Forms export. It contains
+tabs for summary counts, processed records, records needing human review, failed
+records, duplicate courts, cleaned addresses, cleaned contacts, cleaned opening
+hours, flat issues, and submitter users. The record tabs include
+`review_reason` and `suggested_next_action` columns. For controlled-list
+failures, `review_reason` identifies the specific field and submitted value that
+did not match, while the `Issues` tab provides one row per issue with raw and
+cleaned values.
 
 ## Configuration
 
@@ -240,6 +253,37 @@ Address existence checks against Ordnance Survey/FaCT API are intentionally not
 part of this step. They should run later as API-backed validation, after syntax
 cleaning and before final import, so possible postcode/address matches can be
 reviewed rather than treated as a simple regex pass/fail.
+
+### Issue Codes
+
+Issue codes are used in `issue_report.json` and `nsu_cleaned_review.xlsx`.
+The workbook keeps the codes for filtering, but also includes plain-English
+review reasons and suggested next actions.
+
+Current issue meanings:
+
+- `COURT_SLUG_NORMALISED`: the submitted court identifier was changed into a
+  clean slug, for example from a full Find a Court URL to `fleetwood-court`.
+  This is usually non-blocking.
+- `DUPLICATE_COURT_SLUG`: more than one submitted row resolves to the same
+  court slug. All affected rows are blocked from automatic import until a
+  reviewer decides whether to merge, discard, or correct them.
+- `INVALID_EMAIL`: an email value could not be parsed as a valid email address.
+  Optional invalid emails are preserved for review rather than silently dropped.
+- `INVALID_PHONE`: a phone value could not be parsed as a possible UK phone
+  number. Optional invalid phones are preserved for review.
+- `INVALID_POSTCODE`: a populated address postcode does not match the expected
+  UK postcode format. This blocks automatic import because address data would
+  be unreliable.
+- `INVALID_TIME`: an opening-hours value could not be parsed as a valid `HH:MM`
+  time.
+- `MISSING_COURT_IDENTIFIER`: the row has business data but no usable court
+  slug. This is a failed record until a valid court slug is added.
+- `OPENING_HOURS_AMBIGUOUS`: opening hours need review because the time values
+  are invalid or ambiguous.
+- `VOCAB_NO_MATCH`: a value does not match the configured controlled list, such
+  as court type, area of law, contact description, opening-hours type, food and
+  drink option, or hearing enhancement option.
 
 ## Project Layout
 

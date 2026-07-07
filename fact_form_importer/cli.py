@@ -11,6 +11,7 @@ from fact_form_importer.config import AppConfig
 from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
 from fact_form_importer.output.logs import write_processing_outputs
+from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
 from fact_form_importer.validators.business_rules import validate_all_submissions
 from fact_form_importer.validators.vocabularies import load_vocabularies
 
@@ -73,6 +74,11 @@ def run(input_path: Path, output_path: Path) -> int:
             workbook_profile=workbook_profile,
             output_path=output_path,
         )
+        workbook_path = write_nsu_review_workbook(
+            submissions=submissions,
+            output_path=output_path,
+            summary=output_result.summary,
+        )
     except (FileNotFoundError, KeyError, ModuleNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -87,6 +93,7 @@ def run(input_path: Path, output_path: Path) -> int:
     print(f"Needs human review: {summary['needs_human_review_count']}")
     print(f"Failed: {summary['failed_count']}")
     print(f"Skipped empty rows: {summary['skipped_count']}")
+    print(f"Wrote NSU review workbook: {workbook_path}")
     print(f"Wrote run outputs to: {output_path}")
     return 0
 
