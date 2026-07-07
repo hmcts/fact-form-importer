@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from fact_form_importer.cleaners import CleaningResult
 from fact_form_importer.cleaners.strings import null_if_empty_like

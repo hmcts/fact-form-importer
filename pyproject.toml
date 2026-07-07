@@ -13,8 +13,7 @@ testpaths = ["tests"]
 branch = true
 source = ["fact_form_importer"]
 omit = [
-  "fact_form_importer/__main__.py",
-  "fact_form_importer/config.py",
+  "fact_form_importer/__main__.py"
 ]
 
 [tool.coverage.report]

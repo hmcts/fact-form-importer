@@ -1,7 +1,359 @@
 {
-  "version": 1,
-  "fields": {},
-  "llm": {
-    "enabled": false
+  "version": "2026-07-07.1",
+  "fields": {
+    "court_slug": {
+      "required": true,
+      "cleaners": ["normalise_court_slug"],
+      "validators": ["required", "matches_clean_slug_pattern", "court_exists_in_fact_api"],
+      "llm": {"enabled": false},
+      "notes": "Raw value may be a slug, full URL, courts/<slug>, uppercase value, or court name."
+    },
+    "facilities.accessible_parking": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "facilities.accessible_parking_phone": {
+      "required": false,
+      "cleaners": ["normalise_uk_phone"],
+      "validators": ["valid_uk_phone_or_null"],
+      "llm": {"enabled": false}
+    },
+    "facilities.accessible_toilet_description": {
+      "required": true,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["required", "max_length_500"],
+      "llm": {
+        "enabled": true,
+        "purpose": "public_text_normalisation",
+        "rules": [
+          "Make the text suitable for public display.",
+          "Preserve factual location information.",
+          "Preserve accessible toilet information.",
+          "Do not invent floors, rooms, entrances, routes or availability.",
+          "If the answer is vague, contradictory, or only says to ask staff/security, flag for human review."
+        ]
+      }
+    },
+    "facilities.accessible_entrance": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "facilities.accessible_entrance_support_phone": {
+      "required": false,
+      "cleaners": ["normalise_uk_phone"],
+      "validators": ["valid_uk_phone_or_null", "required_when_accessible_entrance_is_no"],
+      "llm": {"enabled": false}
+    },
+    "facilities.hearing_enhancement_equipment": {
+      "required": true,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["required", "hearing_enhancement_in_vocab"],
+      "llm": {
+        "enabled": true,
+        "purpose": "map_to_hearing_enhancement_type",
+        "use_only_when": "not_exact_vocab_match",
+        "rules": [
+          "Map the raw value to exactly one allowed hearing enhancement option.",
+          "Return null if no safe match exists.",
+          "Do not invent a new option.",
+          "Flag for review if there are multiple possible meanings."
+        ]
+      }
+    },
+    "facilities.lift_available": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "facilities.lift_door_width": {
+      "required": false,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["number_or_null", "convert_to_cm", "max_1000_cm"],
+      "llm": {"enabled": false}
+    },
+    "facilities.lift_weight_limit": {
+      "required": false,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["number_or_null", "convert_to_kg", "max_10000_kg"],
+      "llm": {"enabled": false}
+    },
+    "facilities.quiet_room_available": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false},
+      "notes": "Quiet room appears twice in the export. Confirm intended mapping before final import."
+    },
+    "facilities.parking_available": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "facilities.food_and_drink": {
+      "required": true,
+      "cleaners": ["split_multiselect"],
+      "validators": ["required", "food_and_drink_options_in_vocab"],
+      "llm": {
+        "enabled": true,
+        "purpose": "map_to_food_and_drink_options",
+        "use_only_when": "not_exact_vocab_match",
+        "rules": [
+          "Map each raw value to allowed food and drink options.",
+          "Do not invent new options.",
+          "Return only safe matches and flag unclear values for human review."
+        ]
+      }
+    },
+    "facilities.separate_waiting_areas": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "facilities.child_waiting_area": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "facilities.quiet_room_available_2": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean", "resolve_duplicate_quiet_room_mapping"],
+      "llm": {"enabled": false},
+      "notes": "Second quiet room export column. Mapping should be confirmed before final import."
+    },
+    "facilities.baby_changing": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "facilities.wifi_available": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "translation_phone": {
+      "required": false,
+      "cleaners": ["normalise_uk_phone"],
+      "validators": ["valid_uk_phone_or_null"],
+      "llm": {"enabled": false}
+    },
+    "translation_email": {
+      "required": false,
+      "cleaners": ["normalise_email"],
+      "validators": ["valid_email_or_null"],
+      "llm": {"enabled": false}
+    },
+    "address.address_type": {
+      "required": true,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["required", "address_type_in_vocab"],
+      "llm": {
+        "enabled": true,
+        "purpose": "map_to_address_type",
+        "use_only_when": "not_exact_vocab_match",
+        "rules": [
+          "Map the raw value to Visit, Send documents to, or Visit and send documents to.",
+          "Return null if no safe match exists.",
+          "Do not invent a new address type."
+        ]
+      }
+    },
+    "address.line_1": {
+      "required": true,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["required", "max_length_255"],
+      "llm": {"enabled": false}
+    },
+    "address.line_2": {
+      "required": false,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["max_length_255"],
+      "llm": {"enabled": false}
+    },
+    "address.town_or_city": {
+      "required": true,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["required", "max_length_100"],
+      "llm": {"enabled": false}
+    },
+    "address.county": {
+      "required": false,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["max_length_100"],
+      "llm": {"enabled": false}
+    },
+    "address.postcode": {
+      "required": true,
+      "cleaners": ["normalise_uk_postcode"],
+      "validators": ["required", "valid_uk_postcode"],
+      "llm": {"enabled": false}
+    },
+    "address.areas_of_law": {
+      "required": false,
+      "cleaners": ["split_multiselect"],
+      "validators": ["areas_of_law_in_vocab"],
+      "llm": {
+        "enabled": true,
+        "purpose": "map_to_areas_of_law",
+        "use_only_when": "not_exact_vocab_match",
+        "rules": [
+          "Map each raw value to allowed areas of law.",
+          "Do not invent new areas of law.",
+          "Flag unclear values for human review."
+        ]
+      }
+    },
+    "address.court_types": {
+      "required": false,
+      "cleaners": ["split_multiselect"],
+      "validators": ["court_types_in_vocab"],
+      "llm": {
+        "enabled": true,
+        "purpose": "map_to_court_types",
+        "use_only_when": "not_exact_vocab_match",
+        "rules": [
+          "Map each raw value to allowed court types.",
+          "Do not invent new court types.",
+          "Flag unclear values for human review."
+        ]
+      }
+    },
+    "counter_service.specific_courts": {
+      "required": false,
+      "cleaners": ["split_multiselect"],
+      "validators": ["court_types_in_vocab"],
+      "llm": {"enabled": false}
+    },
+    "counter_service.assists_with": {
+      "required": false,
+      "cleaners": ["split_multiselect"],
+      "validators": ["counter_service_assists_with_in_vocab"],
+      "llm": {
+        "enabled": true,
+        "purpose": "map_to_counter_service_assistance",
+        "use_only_when": "not_exact_vocab_match",
+        "rules": [
+          "Map each raw value to allowed counter assistance options.",
+          "Do not invent new options.",
+          "Flag unclear values for human review."
+        ]
+      }
+    },
+    "counter_service.appointment_contact": {
+      "required": false,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["valid_email_or_uk_phone_or_null"],
+      "llm": {"enabled": false}
+    },
+    "counter_service.same_monday_to_friday": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "counter_service.opening_time": {
+      "required": false,
+      "cleaners": ["parse_time_parts"],
+      "validators": ["valid_time_or_known_status_or_null"],
+      "llm": {"enabled": false}
+    },
+    "interview_rooms.has_interview_rooms": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "interview_rooms.room_count": {
+      "required": false,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["positive_integer_or_null", "required_when_has_interview_rooms_is_yes"],
+      "llm": {"enabled": false}
+    },
+    "interview_rooms.booking_phone": {
+      "required": false,
+      "cleaners": ["normalise_uk_phone"],
+      "validators": ["valid_uk_phone_or_null"],
+      "llm": {"enabled": false}
+    },
+    "contact.description": {
+      "required": true,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["required", "contact_description_type_in_vocab"],
+      "llm": {
+        "enabled": true,
+        "purpose": "map_to_contact_description_type",
+        "use_only_when": "not_exact_vocab_match",
+        "rules": [
+          "Map the raw value to exactly one allowed contact description type.",
+          "Return null if no safe match exists.",
+          "Do not invent a new type.",
+          "Flag for review if there are multiple possible meanings."
+        ]
+      }
+    },
+    "contact.explanation": {
+      "required": false,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["max_length_500"],
+      "llm": {
+        "enabled": true,
+        "purpose": "public_text_normalisation",
+        "rules": [
+          "Make the text suitable for public display.",
+          "Preserve the meaning of the contact explanation.",
+          "Do not invent services, eligibility, phone numbers or email addresses.",
+          "Flag vague or contradictory text for human review."
+        ]
+      }
+    },
+    "contact.phone": {
+      "required": false,
+      "cleaners": ["normalise_uk_phone"],
+      "validators": ["valid_uk_phone_or_null", "phone_or_email_required"],
+      "llm": {"enabled": false}
+    },
+    "contact.email": {
+      "required": false,
+      "cleaners": ["normalise_email"],
+      "validators": ["valid_email_or_null", "phone_or_email_required"],
+      "llm": {"enabled": false}
+    },
+    "opening_hours.type": {
+      "required": true,
+      "cleaners": ["trim", "collapse_spaces", "null_if_empty_like"],
+      "validators": ["required", "opening_hours_type_in_vocab"],
+      "llm": {
+        "enabled": true,
+        "purpose": "map_to_opening_hours_type",
+        "use_only_when": "not_exact_vocab_match",
+        "rules": [
+          "Map the raw value to exactly one allowed opening hours type.",
+          "Return null if no safe match exists.",
+          "Do not invent a new type."
+        ]
+      }
+    },
+    "opening_hours.same_monday_to_friday": {
+      "required": true,
+      "cleaners": ["normalise_yes_no"],
+      "validators": ["required", "valid_boolean"],
+      "llm": {"enabled": false}
+    },
+    "opening_hours.time": {
+      "required": false,
+      "cleaners": ["parse_time_parts", "parse_time_cell"],
+      "validators": ["valid_time_or_known_status_or_null"],
+      "llm": {"enabled": false}
+    }
   }
 }

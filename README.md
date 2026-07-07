@@ -132,6 +132,52 @@ spreadsheet and write import outputs:
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out"
 ```
 
+## Configuration
+
+### Column Mapping
+
+`config/column_mapping.json` maps the Microsoft Forms export columns to logical
+field names. It is used during profiling/ingestion to check the workbook shape
+and to read values from known columns such as `G` for `court_slug_raw`, address
+groups, contact detail groups, and opening-hours groups.
+
+### Field Rules
+
+`config/field_rules.json` describes field-level cleaning, validation, and LLM
+normalisation policy in a declarative format. It does not contain executable
+Python code. Cleaner names, validator names, and LLM purposes are strings that
+later pipeline stages will interpret.
+
+The rules file captures things like:
+
+- whether a logical field is required
+- which deterministic cleaners should run
+- which validators should run later
+- whether GPT-assisted normalisation is allowed for that field
+- the strict instructions the LLM must follow if it is used
+
+Current ingestion does not execute `field_rules.json` yet. The next validation
+and vocabulary tasks will use these rules to decide which fields need review,
+which vocabularies to check, and which ambiguous values are eligible for
+LLM-assisted normalisation.
+
+### Vocabularies
+
+`config/vocabularies.example.json` contains local controlled-list examples for
+values that must later match FaCT-compatible types, such as address types, court
+types, areas of law, contact description types, opening-hours types, food and
+drink options, hearing enhancement options, and counter service assistance.
+
+`fact_form_importer.validators.vocabularies` loads these lists and supports:
+
+- exact matching against a code, display name, or alias
+- normalised matching for harmless case and whitespace differences
+- boolean membership checks for validators
+
+No external API calls happen at this stage. The local vocabulary loader is a
+pipeline boundary: later validators can augment or replace the file-backed
+values with FaCT API data while keeping the same matching behaviour.
+
 ## Project Layout
 
 ```text
