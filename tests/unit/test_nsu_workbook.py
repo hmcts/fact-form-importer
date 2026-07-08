@@ -37,12 +37,18 @@ def test_write_nsu_review_workbook_creates_expected_review_tabs(tmp_path):
             status="needs_human_review",
             row_number=3,
             issue_code="DUPLICATE_COURT_SLUG",
+            completion_time="2026-07-01 09:00",
+            submitter_name="Earlier Submitter",
+            submitter_email="earlier@example.com",
         ),
         _submission(
             court_slug="duplicate-court",
             status="needs_human_review",
             row_number=4,
             issue_code="DUPLICATE_COURT_SLUG",
+            completion_time="2026-07-02 10:00",
+            submitter_name="Later Submitter",
+            submitter_email="later@example.com",
         ),
         _submission(
             court_slug=None,
@@ -82,6 +88,12 @@ def test_write_nsu_review_workbook_creates_expected_review_tabs(tmp_path):
     assert workbook["Needs human review"]["F2"].value.startswith("DUPLICATE_COURT_SLUG:")
     assert "Review all rows" in workbook["Needs human review"]["G2"].value
     assert workbook["Duplicate courts"]["A2"].value == "duplicate-court"
+    assert workbook["Duplicate courts"]["D2"].value == 4
+    assert workbook["Duplicate courts"]["E2"].value == "2026-07-02 10:00"
+    assert workbook["Duplicate courts"]["F2"].value == "Earlier Submitter | Later Submitter"
+    assert workbook["Duplicate courts"]["G2"].value == "earlier@example.com | later@example.com"
+    assert "row 3: 2026-07-01 09:00, Earlier Submitter" in workbook["Duplicate courts"]["M2"].value
+    assert "row 4: 2026-07-02 10:00, Later Submitter" in workbook["Duplicate courts"]["M2"].value
     assert workbook["Cleaned addresses"]["J2"].value == "SW1A 1AA"
     assert workbook["Cleaned contacts"]["E2"].value == "Enquiries"
     assert workbook["Cleaned opening hours"]["H2"].value == "09:00"
@@ -121,6 +133,11 @@ def _submission(
     opening_hours=None,
     issue_code=None,
     issue=None,
+    completion_time=None,
+    start_time=None,
+    last_modified_time=None,
+    submitter_email="submitter@example.com",
+    submitter_name="Submitter",
 ):
     issues = []
     if issue:
@@ -138,8 +155,11 @@ def _submission(
     return CourtSubmission(
         source=SourceMetadata(
             source_row_number=row_number,
-            submitter_email="submitter@example.com",
-            submitter_name="Submitter",
+            completion_time=completion_time,
+            start_time=start_time,
+            last_modified_time=last_modified_time,
+            submitter_email=submitter_email,
+            submitter_name=submitter_name,
         ),
         court_slug_raw=court_slug,
         court_slug=court_slug,

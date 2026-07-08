@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
+from openpyxl.utils.datetime import from_excel
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 from pydantic import BaseModel
@@ -166,19 +167,150 @@ def _add_duplicate_courts_sheet(workbook: Workbook, submissions: list[CourtSubmi
         if any(issue.code == DUPLICATE_COURT_SLUG for issue in submission.issues):
             by_slug[submission.court_slug or ""].append(submission)
 
-    rows = [["court_slug", "record_count", "source_row_numbers", "statuses", "raw_slug_values"]]
+    rows = [
+        [
+            "court_slug",
+            "record_count",
+            "source_row_numbers",
+            "candidate_most_recent_row",
+            "candidate_most_recent_date",
+            "submitter_names",
+            "submitter_emails",
+            "completion_times",
+            "start_times",
+            "last_modified_times",
+            "statuses",
+            "raw_slug_values",
+            "source_rows_with_dates",
+        ]
+    ]
     for slug, matching_submissions in sorted(by_slug.items()):
+        most_recent = _most_recent_submission(matching_submissions)
         rows.append(
             [
                 slug,
                 len(matching_submissions),
                 ", ".join(str(submission.source.source_row_number) for submission in matching_submissions),
+                most_recent.source.source_row_number if most_recent else None,
+                _submission_date_for_duplicate_review(most_recent) if most_recent else None,
+                " | ".join(
+                    sorted(
+                        {
+                            submission.source.submitter_name
+                            for submission in matching_submissions
+                            if submission.source.submitter_name
+                        }
+                    )
+                ),
+                " | ".join(
+                    sorted(
+                        {
+                            submission.source.submitter_email
+                            for submission in matching_submissions
+                            if submission.source.submitter_email
+                        }
+                    )
+                ),
+                " | ".join(
+                    _dedupe_preserving_order(
+                        _format_source_date(submission.source.completion_time)
+                        for submission in matching_submissions
+                    )
+                ),
+                " | ".join(
+                    _dedupe_preserving_order(
+                        _format_source_date(submission.source.start_time)
+                        for submission in matching_submissions
+                    )
+                ),
+                " | ".join(
+                    _dedupe_preserving_order(
+                        _format_source_date(submission.source.last_modified_time)
+                        for submission in matching_submissions
+                    )
+                ),
                 ", ".join(sorted({submission.status for submission in matching_submissions})),
                 " | ".join(sorted({str(submission.court_slug_raw) for submission in matching_submissions})),
+                " | ".join(
+                    _duplicate_submission_summary(submission)
+                    for submission in sorted(
+                        matching_submissions,
+                        key=lambda item: item.source.source_row_number,
+                    )
+                ),
             ]
         )
 
     _write_sheet(workbook, "Duplicate courts", rows)
+
+
+def _most_recent_submission(submissions: list[CourtSubmission]) -> CourtSubmission | None:
+    dated_submissions = [
+        submission
+        for submission in submissions
+        if _submission_date_raw_for_duplicate_review(submission)
+    ]
+    if not dated_submissions:
+        return None
+
+    return max(
+        dated_submissions,
+        key=lambda submission: _source_date_sort_key(
+            _submission_date_raw_for_duplicate_review(submission)
+        ),
+    )
+
+
+def _submission_date_for_duplicate_review(submission: CourtSubmission | None) -> str | None:
+    return _format_source_date(_submission_date_raw_for_duplicate_review(submission))
+
+
+def _submission_date_raw_for_duplicate_review(submission: CourtSubmission | None) -> str | None:
+    if submission is None:
+        return None
+
+    return (
+        submission.source.completion_time
+        or submission.source.last_modified_time
+        or submission.source.start_time
+    )
+
+
+def _duplicate_submission_summary(submission: CourtSubmission) -> str:
+    date = _submission_date_for_duplicate_review(submission) or "no date"
+    submitter = submission.source.submitter_name or submission.source.submitter_email or "unknown submitter"
+    return f"row {submission.source.source_row_number}: {date}, {submitter}"
+
+
+def _format_source_date(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    try:
+        return from_excel(float(value)).isoformat(sep=" ", timespec="minutes")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _source_date_sort_key(value: str | None) -> tuple[int, float | str]:
+    if not value:
+        return (0, "")
+
+    try:
+        return (1, float(value))
+    except (TypeError, ValueError):
+        return (1, str(value))
+
+
+def _dedupe_preserving_order(values: Iterable[str | None]) -> list[str]:
+    seen = set()
+    deduped = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
 
 
 def _add_addresses_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:

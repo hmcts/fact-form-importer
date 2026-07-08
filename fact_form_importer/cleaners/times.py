@@ -26,6 +26,8 @@ def parse_time_parts(
 ) -> CleaningResult:
     hour = null_if_empty_like(hour_value)
     minute = null_if_empty_like(minute_value)
+    hour = _normalise_time_punctuation(hour)
+    minute = _normalise_time_punctuation(minute)
 
     if hour is None and minute is None:
         return CleaningResult(value=None, status="empty")
@@ -48,6 +50,8 @@ def parse_time_cell(value: object, field: str = "time") -> CleaningResult:
     lowered = cleaned.lower()
     if lowered in KNOWN_TEXT_STATUSES:
         return CleaningResult(value=None, status="known_text_status")
+
+    cleaned = _normalise_time_punctuation(cleaned) or ""
 
     match = TIME_PATTERN.match(cleaned.replace(".", ""))
     if not match:
@@ -110,6 +114,13 @@ def _parse_full_time_from_hour_field(
 
 def _looks_like_full_time(value: str) -> bool:
     return bool(re.match(r"^\d{1,2}:\d{2}\s*(am|pm)?$", value, re.IGNORECASE))
+
+
+def _normalise_time_punctuation(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    return value.replace(";", ":")
 
 
 def _format_time(hour: int, minute: int, field: str, raw_value: object) -> CleaningResult:

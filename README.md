@@ -194,7 +194,11 @@ hours, flat issues, and submitter users. The record tabs include
 `review_reason` and `suggested_next_action` columns. For controlled-list
 failures, `review_reason` identifies the specific field and submitted value that
 did not match, while the `Issues` tab provides one row per issue with raw and
-cleaned values.
+cleaned values. The `Duplicate courts` tab includes the duplicate source rows,
+completion/start/last-modified dates, submitter names and emails, and a
+`candidate_most_recent_row` based on the available form timestamps. This is
+review evidence for NSU/product decisions; the importer still does not
+automatically migrate only the latest duplicate until that rule is confirmed.
 
 ## Configuration
 
