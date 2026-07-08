@@ -304,16 +304,49 @@ def _build_counter_service(
         "assists_with": split_multiselect(get_cell(raw_row, refs["assists_with"].column)),
         "appointment_contact": _clean_string_ref(raw_row, refs["appointment_contact"]),
         "same_monday_to_friday": same_result.value,
-        "monday_to_friday": _build_time_from_refs(raw_row, refs, "", "counter_service", issues),
-        "monday": _build_time_from_refs(raw_row, refs, "monday_", "counter_service.monday", issues),
-        "tuesday": _build_time_from_refs(raw_row, refs, "tuesday_", "counter_service.tuesday", issues),
+        "monday_to_friday": _build_time_from_refs(
+            raw_row, refs, "", "counter_service", issues, strip_midnight_placeholder=True
+        ),
+        "monday": _build_time_from_refs(
+            raw_row,
+            refs,
+            "monday_",
+            "counter_service.monday",
+            issues,
+            strip_midnight_placeholder=True,
+        ),
+        "tuesday": _build_time_from_refs(
+            raw_row,
+            refs,
+            "tuesday_",
+            "counter_service.tuesday",
+            issues,
+            strip_midnight_placeholder=True,
+        ),
         "wednesday": _build_time_from_refs(
-            raw_row, refs, "wednesday_", "counter_service.wednesday", issues
+            raw_row,
+            refs,
+            "wednesday_",
+            "counter_service.wednesday",
+            issues,
+            strip_midnight_placeholder=True,
         ),
         "thursday": _build_time_from_refs(
-            raw_row, refs, "thursday_", "counter_service.thursday", issues
+            raw_row,
+            refs,
+            "thursday_",
+            "counter_service.thursday",
+            issues,
+            strip_midnight_placeholder=True,
         ),
-        "friday": _build_time_from_refs(raw_row, refs, "friday_", "counter_service.friday", issues),
+        "friday": _build_time_from_refs(
+            raw_row,
+            refs,
+            "friday_",
+            "counter_service.friday",
+            issues,
+            strip_midnight_placeholder=True,
+        ),
     }
 
 
@@ -415,6 +448,7 @@ def _build_time_from_refs(
     prefix: str,
     field_prefix: str,
     issues: list[Issue],
+    strip_midnight_placeholder: bool = False,
 ) -> Optional[OpeningTime]:
     required_fields = [
         f"{prefix}opening_hour",
@@ -439,6 +473,14 @@ def _build_time_from_refs(
     issues.extend(time_issues)
 
     if open_result.status == "empty" and close_result.status == "empty":
+        return None
+
+    if (
+        strip_midnight_placeholder
+        and open_result.value == "00:00"
+        and close_result.value == "00:00"
+        and not time_issues
+    ):
         return None
 
     status = "valid_time"

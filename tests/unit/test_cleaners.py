@@ -92,6 +92,32 @@ def test_parse_time_parts():
     assert result.status == "valid_time"
 
 
+@pytest.mark.parametrize(
+    ("hour_value", "minute_value", "expected_value"),
+    [
+        ("09:00", "09:00", "09:00"),
+        ("17:00", "17:00", "17:00"),
+        ("09:30", "30", "09:30"),
+        ("09:00", None, "09:00"),
+    ],
+)
+def test_parse_time_parts_accepts_full_time_in_hour_field(
+    hour_value, minute_value, expected_value
+):
+    result = parse_time_parts(hour_value, minute_value)
+
+    assert result.value == expected_value
+    assert result.status == "valid_time"
+
+
+def test_parse_time_parts_rejects_full_time_with_conflicting_minute():
+    result = parse_time_parts("09:00", "30")
+
+    assert result.value is None
+    assert result.status == "invalid"
+    assert result.issues[0].code == "INVALID_TIME"
+
+
 def test_parse_time_parts_empty_partial_and_invalid():
     assert parse_time_parts(None, None).status == "empty"
 

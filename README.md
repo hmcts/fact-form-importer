@@ -113,7 +113,11 @@ original spreadsheet.
 after deterministic cleaning. It includes cleaned facilities, addresses,
 counter service, interview rooms, contact details, opening hours, issues, and
 status. This is still an intermediate processing artifact, not the final FaCT
-API payload.
+API payload. Counter service opening times with both open and close set to
+`00:00` are stripped during ingestion because product guidance says this means
+the counter has different times that should be added manually in the admin
+portal. This rule is scoped to counter service times and does not change general
+court opening-hours records.
 
 `ingest_summary.json` contains counts for ingested submissions, skipped empty
 rows, failed rows, warning rows, and mapping warnings. Use it as the first check
@@ -265,6 +269,7 @@ FaCT API, Ordnance Survey, or the LLM yet.
 Current validation checks:
 
 - required court slug
+- cleaned court slug exists in FaCT Data API during the `run` command
 - optional email and phone syntax
 - populated address postcode syntax
 - opening-hours time shape and ambiguous time status
@@ -274,8 +279,9 @@ Current validation checks:
 Status is recalculated after validation:
 
 - `failed`: required court identifier is missing or an error issue exists
-- `needs_human_review`: duplicate slug, invalid populated postcode, ambiguous
-  opening hours, invalid time, or controlled-list mismatch
+- `needs_human_review`: court slug not found in FaCT, duplicate slug, invalid
+  populated postcode, ambiguous opening hours, invalid time, or controlled-list
+  mismatch
 - `processed_with_warnings`: optional email/phone warnings or slug
   normalisation from a URL/free text
 - `processed`: no validation issues
@@ -296,6 +302,10 @@ Current issue meanings:
 - `COURT_SLUG_NORMALISED`: the submitted court identifier was changed into a
   clean slug, for example from a full Find a Court URL to `fleetwood-court`.
   This is usually non-blocking.
+- `COURT_SLUG_NOT_FOUND`: the cleaned slug is syntactically valid but
+  `GET /courts/slug/{courtSlug}/v1` did not find it in FaCT Data API. The row is
+  blocked for human review because it may be a typo, an obsolete slug, or a
+  court that needs separate product/NSU confirmation.
 - `DUPLICATE_COURT_SLUG`: more than one submitted row resolves to the same
   court slug. All affected rows are blocked from automatic import until a
   reviewer decides whether to merge, discard, or correct them.

@@ -9,6 +9,7 @@ from fact_form_importer.models.issues import Issue
 from fact_form_importer.models.source import SourceMetadata
 from fact_form_importer.validators.base import (
     COURT_SLUG_NORMALISED,
+    COURT_SLUG_NOT_FOUND,
     DUPLICATE_COURT_SLUG,
     INVALID_EMAIL,
     INVALID_PHONE,
@@ -56,6 +57,24 @@ def test_validate_submission_marks_slug_normalisation_as_warning_status():
 
     assert validated.status == "processed_with_warnings"
     assert _has_issue(validated, COURT_SLUG_NORMALISED)
+
+
+def test_validate_submission_marks_unknown_fact_api_slug_for_review():
+    submission = _submission(court_slug="unknown-court")
+
+    validated = validate_submission(submission, court_slug_exists=lambda slug: False)
+
+    assert validated.status == "needs_human_review"
+    assert _has_issue(validated, COURT_SLUG_NOT_FOUND)
+
+
+def test_validate_submission_accepts_known_fact_api_slug():
+    submission = _submission(court_slug="known-court")
+
+    validated = validate_submission(submission, court_slug_exists=lambda slug: True)
+
+    assert validated.status == "processed"
+    assert not _has_issue(validated, COURT_SLUG_NOT_FOUND)
 
 
 def test_validate_submission_marks_invalid_populated_postcode_for_review():
@@ -175,6 +194,22 @@ def test_validate_all_submissions_marks_duplicate_slugs_for_review():
     assert validated[2].status == "processed"
     assert _has_issue(validated[0], DUPLICATE_COURT_SLUG)
     assert _has_issue(validated[1], DUPLICATE_COURT_SLUG)
+
+
+def test_validate_all_submissions_caches_court_slug_lookups():
+    calls = []
+    submissions = [
+        _submission(row_number=2, court_slug="same-court"),
+        _submission(row_number=3, court_slug="same-court"),
+        _submission(row_number=4, court_slug="other-court"),
+    ]
+
+    validate_all_submissions(
+        submissions,
+        court_slug_exists=lambda slug: calls.append(slug) or True,
+    )
+
+    assert calls == ["same-court", "other-court"]
 
 
 def test_validate_submission_preserves_existing_cleaner_issues_without_duplicates():

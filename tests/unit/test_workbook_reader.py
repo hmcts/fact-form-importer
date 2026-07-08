@@ -50,6 +50,33 @@ def test_ingest_workbook_creates_submissions_and_outputs(tmp_path):
     assert summary["failed"] == 1
 
 
+def test_ingest_workbook_strips_counter_service_midnight_placeholders(tmp_path):
+    mapping = load_column_mapping(Path("config/column_mapping.json"))
+    csv_path = tmp_path / "submissions.csv"
+    output_path = tmp_path / "out"
+    rows = _build_ingest_rows(mapping)
+    valid = rows[1]
+    _set(valid, "BW", "00")
+    _set(valid, "BX", "00")
+    _set(valid, "BY", "00")
+    _set(valid, "BZ", "00")
+    _set(valid, "EW", "00")
+    _set(valid, "EX", "00")
+    _set(valid, "EY", "00")
+    _set(valid, "EZ", "00")
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerows(rows)
+
+    result = ingest_workbook(csv_path, output_path)
+
+    submission = result.submissions[0]
+    assert submission.counter_service["monday_to_friday"] is None
+    assert submission.opening_hours[0].monday_to_friday.open == "00:00"
+    assert submission.opening_hours[0].monday_to_friday.close == "00:00"
+
+
 def _build_ingest_rows(mapping):
     columns = mapping.expected_columns()
     max_index = max(excel_column_index(column.column) for column in columns)

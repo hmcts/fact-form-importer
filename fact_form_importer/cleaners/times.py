@@ -30,6 +30,10 @@ def parse_time_parts(
     if hour is None and minute is None:
         return CleaningResult(value=None, status="empty")
 
+    full_time_from_hour = _parse_full_time_from_hour_field(hour, minute, field, hour_value)
+    if full_time_from_hour is not None:
+        return full_time_from_hour
+
     if hour is None or minute is None:
         return _invalid_time(field, f"{hour_value}:{minute_value}", "Both hour and minute are required")
 
@@ -73,6 +77,39 @@ def _parse_hour_minute(
         return _invalid_time(field, raw_value, "Hour and minute must be numeric")
 
     return _format_time(int(hour), int(minute), field, raw_value)
+
+
+def _parse_full_time_from_hour_field(
+    hour: str | None,
+    minute: str | None,
+    field: str,
+    raw_value: object,
+) -> CleaningResult | None:
+    if hour is None or not _looks_like_full_time(hour):
+        return None
+
+    hour_result = parse_time_cell(hour, field)
+    if hour_result.status != "valid_time" or hour_result.value is None:
+        return None
+
+    expected_minute = hour_result.value.split(":", 1)[1]
+    if minute is None:
+        return CleaningResult(value=hour_result.value, status="valid_time")
+
+    if _looks_like_full_time(minute):
+        minute_result = parse_time_cell(minute, field)
+        if minute_result.status == "valid_time" and minute_result.value == hour_result.value:
+            return CleaningResult(value=hour_result.value, status="valid_time")
+        return None
+
+    if minute.isdigit() and f"{int(minute):02d}" == expected_minute:
+        return CleaningResult(value=hour_result.value, status="valid_time")
+
+    return None
+
+
+def _looks_like_full_time(value: str) -> bool:
+    return bool(re.match(r"^\d{1,2}:\d{2}\s*(am|pm)?$", value, re.IGNORECASE))
 
 
 def _format_time(hour: int, minute: int, field: str, raw_value: object) -> CleaningResult:

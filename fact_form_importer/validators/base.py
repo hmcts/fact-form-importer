@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from fact_form_importer.cleaners.emails import normalise_email
 from fact_form_importer.cleaners.phones import normalise_uk_phone
@@ -15,6 +15,7 @@ from fact_form_importer.validators.vocabularies import Vocabularies
 
 MISSING_COURT_IDENTIFIER = "MISSING_COURT_IDENTIFIER"
 COURT_SLUG_NORMALISED = "COURT_SLUG_NORMALISED"
+COURT_SLUG_NOT_FOUND = "COURT_SLUG_NOT_FOUND"
 DUPLICATE_COURT_SLUG = "DUPLICATE_COURT_SLUG"
 INVALID_EMAIL = "INVALID_EMAIL"
 INVALID_PHONE = "INVALID_PHONE"
@@ -27,6 +28,7 @@ FAILED_ISSUE_CODES = {
     MISSING_COURT_IDENTIFIER,
 }
 HUMAN_REVIEW_ISSUE_CODES = {
+    COURT_SLUG_NOT_FOUND,
     DUPLICATE_COURT_SLUG,
     INVALID_POSTCODE,
     INVALID_TIME,
@@ -44,11 +46,13 @@ TIME_PATTERN = re.compile(r"^\d{2}:\d{2}$")
 def validate_submission(
     submission: CourtSubmission,
     vocabularies: Optional[Vocabularies] = None,
+    court_slug_exists: Optional[Callable[[str], bool]] = None,
 ) -> CourtSubmission:
     """Validate one already-ingested submission and recalculate its status."""
 
     _validate_required_court_slug(submission)
     _validate_slug_normalisation(submission)
+    _validate_court_slug_exists(submission, court_slug_exists)
     _validate_facility_fields(submission, vocabularies)
     _validate_translation_fields(submission)
     _validate_addresses(submission, vocabularies)
@@ -63,10 +67,15 @@ def validate_submission(
 def validate_all_submissions(
     submissions: list[CourtSubmission],
     vocabularies: Optional[Vocabularies] = None,
+    court_slug_exists: Optional[Callable[[str], bool]] = None,
 ) -> list[CourtSubmission]:
     """Validate submissions and flag duplicate court slugs across the batch."""
 
-    validated = [validate_submission(submission, vocabularies) for submission in submissions]
+    cached_court_slug_exists = _cache_court_slug_exists(court_slug_exists)
+    validated = [
+        validate_submission(submission, vocabularies, cached_court_slug_exists)
+        for submission in submissions
+    ]
     from fact_form_importer.validators.duplicates import flag_duplicate_court_slugs
 
     flag_duplicate_court_slugs(validated)
@@ -142,6 +151,45 @@ def _validate_slug_normalisation(submission: CourtSubmission) -> None:
             cleaned_value=submission.court_slug,
         ),
     )
+
+
+def _validate_court_slug_exists(
+    submission: CourtSubmission,
+    court_slug_exists: Optional[Callable[[str], bool]],
+) -> None:
+    if court_slug_exists is None or null_if_empty_like(submission.court_slug) is None:
+        return
+
+    if court_slug_exists(str(submission.court_slug)):
+        return
+
+    add_issue_once(
+        submission,
+        Issue(
+            field="court_slug",
+            code=COURT_SLUG_NOT_FOUND,
+            severity="warning",
+            message="Court slug does not exist in FaCT Data API",
+            raw_value=submission.court_slug_raw,
+            cleaned_value=submission.court_slug,
+        ),
+    )
+
+
+def _cache_court_slug_exists(
+    court_slug_exists: Optional[Callable[[str], bool]],
+) -> Optional[Callable[[str], bool]]:
+    if court_slug_exists is None:
+        return None
+
+    cache: dict[str, bool] = {}
+
+    def cached(slug: str) -> bool:
+        if slug not in cache:
+            cache[slug] = court_slug_exists(slug)
+        return cache[slug]
+
+    return cached
 
 
 def _validate_facility_fields(

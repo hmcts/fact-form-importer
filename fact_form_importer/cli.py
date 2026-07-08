@@ -12,6 +12,7 @@ from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
 from fact_form_importer.output.logs import write_processing_outputs
 from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
+from fact_form_importer.validators.fact_api_courts import court_slug_exists_in_fact_api
 from fact_form_importer.validators.fact_api_vocabularies import load_vocabularies_from_fact_api
 from fact_form_importer.validators.business_rules import validate_all_submissions
 from fact_form_importer.validators.vocabularies import load_vocabularies
@@ -70,10 +71,14 @@ def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = Fa
     try:
         workbook_profile = profile_workbook(input_path)
         ingest_result = ingest_workbook(input_path=input_path, output_path=output_path)
-        vocabularies, vocabulary_source = _load_vocabularies_for_run(
+        vocabularies, vocabulary_source, court_slug_exists = _load_fact_api_services_for_run(
             allow_local_vocabularies=allow_local_vocabularies
         )
-        submissions = validate_all_submissions(ingest_result.submissions, vocabularies)
+        submissions = validate_all_submissions(
+            ingest_result.submissions,
+            vocabularies,
+            court_slug_exists=court_slug_exists,
+        )
         output_path.mkdir(parents=True, exist_ok=True)
         (output_path / "profile.json").write_text(
             profile_to_json(workbook_profile) + "\n",
@@ -157,14 +162,14 @@ def ingest(input_path: Path, output_path: Path) -> int:
     return 0
 
 
-def _load_vocabularies_for_run(allow_local_vocabularies: bool = False):
+def _load_fact_api_services_for_run(allow_local_vocabularies: bool = False):
     config = AppConfig()
     path = config.vocabularies_path
     local_vocabularies = load_vocabularies(path) if path.exists() else None
 
     if not config.fact_data_api_base_url:
         if allow_local_vocabularies:
-            return local_vocabularies, "local_json" if local_vocabularies else "none"
+            return local_vocabularies, "local_json" if local_vocabularies else "none", None
         raise ValueError(
             "FACT_DATA_API_BASE_URL is required for run. "
             "Use --allow-local-vocabularies only for offline/local review."
@@ -172,11 +177,21 @@ def _load_vocabularies_for_run(allow_local_vocabularies: bool = False):
 
     if not config.fact_data_api_bearer_token:
         if allow_local_vocabularies:
-            return local_vocabularies, "local_json" if local_vocabularies else "none"
+            return local_vocabularies, "local_json" if local_vocabularies else "none", None
         raise ValueError(
             "FACT_DATA_API_BEARER_TOKEN is required for run. "
             "Use --allow-local-vocabularies only for offline/local review."
         )
+
+    def court_slug_exists(court_slug: str) -> bool:
+        try:
+            return court_slug_exists_in_fact_api(
+                court_slug=court_slug,
+                base_url=config.fact_data_api_base_url or "",
+                bearer_token=config.fact_data_api_bearer_token or "",
+            )
+        except Exception as exc:
+            raise ValueError(f"Unable to validate court slug '{court_slug}' against FaCT API: {exc}") from exc
 
     try:
         return (
@@ -186,12 +201,13 @@ def _load_vocabularies_for_run(allow_local_vocabularies: bool = False):
                 fallback=local_vocabularies,
             ),
             "fact_data_api",
+            court_slug_exists,
         )
     except Exception as exc:
         if not allow_local_vocabularies or local_vocabularies is None:
             raise ValueError(f"Unable to load FaCT API vocabularies: {exc}") from exc
         print(f"Warning: using local vocabularies because FaCT API lookup failed: {exc}", file=sys.stderr)
-        return local_vocabularies, "local_json_fallback_after_fact_data_api_error"
+        return local_vocabularies, "local_json_fallback_after_fact_data_api_error", None
 
 
 def main(argv: list[str] | None = None) -> int:
