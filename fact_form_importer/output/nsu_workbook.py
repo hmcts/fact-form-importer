@@ -33,6 +33,7 @@ ISSUE_EXPLANATIONS = {
     "INVALID_TIME": "An opening-hours value could not be parsed as a valid HH:MM time.",
     "MISSING_COURT_IDENTIFIER": "The row has business data but no usable court identifier.",
     "OPENING_HOURS_AMBIGUOUS": "Opening hours need review because the time values are invalid or ambiguous.",
+    "POSTCODE_TYPO_REPAIRED": "An obvious O/0 typo in a postcode digit position was repaired.",
     "VOCAB_NO_MATCH": "A value does not match the configured controlled list.",
 }
 ISSUE_ACTIONS = {
@@ -44,6 +45,7 @@ ISSUE_ACTIONS = {
     "INVALID_TIME": "Correct the opening-hours time before import.",
     "MISSING_COURT_IDENTIFIER": "Add a valid court slug before import.",
     "OPENING_HOURS_AMBIGUOUS": "Review the opening-hours fields and correct the time values.",
+    "POSTCODE_TYPO_REPAIRED": "Check only if the cleaned postcode looks wrong.",
     "VOCAB_NO_MATCH": "Map the value to an allowed option or confirm it needs a new controlled-list value.",
 }
 

@@ -30,6 +30,11 @@ def test_trim_and_collapse_spaces():
     [
         ("https://www.find-court-tribunal.service.gov.uk/courts/fleetwood-court", "fleetwood-court"),
         ("ttps://www.find-court-tribunal.service.gov.uk/courts/Fleetwood Court", "fleetwood-court"),
+        ("https://StAlbansCrownCourt", "st-albans-crown-court"),
+        (
+            "https://www.find-court-tribunal.service.gov.uk/courts/ HavantJusticeCentre",
+            "havant-justice-centre",
+        ),
         ("courts/FLEETWOOD-COURT", "fleetwood-court"),
         ("Fleetwood Court!!!", "fleetwood-court"),
         ("fleetwood--court", "fleetwood-court"),
@@ -90,6 +95,16 @@ def test_normalise_uk_postcode():
     assert normalise_uk_postcode(None).value is None
     assert normalise_uk_postcode("sw1a1aa").value == "SW1A 1AA"
     assert normalise_uk_postcode("GIR0AA").value == "GIR 0AA"
+    assert normalise_uk_postcode("YO1 9WZ").value == "YO1 9WZ"
+    assert normalise_uk_postcode("PO9 2AL").value == "PO9 2AL"
+    assert normalise_uk_postcode("CO2 7EF").value == "CO2 7EF"
+    repaired = normalise_uk_postcode("CRO 2RF")
+    assert repaired.value == "CR0 2RF"
+    assert repaired.issues[0].code == "POSTCODE_TYPO_REPAIRED"
+
+    invalid_character = normalise_uk_postcode("CF10 £PG")
+    assert invalid_character.value == "CF10 £PG"
+    assert invalid_character.issues[0].code == "INVALID_POSTCODE"
 
     result = normalise_uk_postcode("not a postcode")
 

@@ -329,6 +329,11 @@ Current issue meanings:
   slug. This is a failed record until a valid court slug is added.
 - `OPENING_HOURS_AMBIGUOUS`: opening hours need review because the time values
   are invalid or ambiguous.
+- `POSTCODE_TYPO_REPAIRED`: an obvious `O`/`0` typo in a postcode digit
+  position was repaired, for example `CRO 2RF` to `CR0 2RF`. This is
+  non-blocking and visible in the issue report for audit. Other invalid
+  characters, such as `CF10 £PG`, are not guessed and remain
+  `INVALID_POSTCODE` for review.
 - `VOCAB_NO_MATCH`: a value does not match the configured controlled list, such
   as court type, area of law, contact description, opening-hours type, food and
   drink option, or hearing enhancement option.

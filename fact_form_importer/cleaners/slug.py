@@ -26,10 +26,13 @@ def normalise_court_slug(value: object) -> str | None:
                 candidate = path_parts[court_index + 1]
         elif path_parts:
             candidate = path_parts[-1]
+        elif "." not in parsed.netloc:
+            candidate = parsed.netloc
 
     candidate = re.sub(r"^[./\\]+", "", candidate)
     candidate = re.sub(r"^courts[/\\]+", "", candidate, flags=re.IGNORECASE)
     candidate = candidate.split("?", maxsplit=1)[0].split("#", maxsplit=1)[0]
+    candidate = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", candidate)
     candidate = candidate.strip().lower()
     candidate = re.sub(r"[\s_]+", "-", candidate)
     candidate = re.sub(r"[^a-z0-9-]", "", candidate)
