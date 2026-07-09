@@ -8,8 +8,10 @@ from fact_form_importer.models.court_submission import (
 from fact_form_importer.models.issues import Issue
 from fact_form_importer.models.source import SourceMetadata
 from fact_form_importer.validators.base import (
+    COURT_SLUG_AUTO_REPAIRED,
     COURT_SLUG_NORMALISED,
     COURT_SLUG_NOT_FOUND,
+    COURT_SLUG_SUGGESTED,
     DUPLICATE_COURT_SLUG,
     INVALID_EMAIL,
     INVALID_PHONE,
@@ -18,6 +20,7 @@ from fact_form_importer.validators.base import (
     OPENING_HOURS_AMBIGUOUS,
     VOCAB_NO_MATCH,
 )
+from fact_form_importer.validators.fact_api_courts import CourtSlugSuggestion
 from fact_form_importer.validators.business_rules import (
     validate_all_submissions,
     validate_submission,
@@ -65,6 +68,65 @@ def test_validate_submission_marks_unknown_fact_api_slug_for_review():
     validated = validate_submission(submission, court_slug_exists=lambda slug: False)
 
     assert validated.status == "needs_human_review"
+    assert _has_issue(validated, COURT_SLUG_NOT_FOUND)
+
+
+def test_validate_submission_auto_repairs_high_confidence_verified_slug():
+    submission = _submission(
+        court_slug="shrewsburycrowncourt",
+        court_slug_raw="shrewsbury.crowncourt",
+    )
+
+    def exists(slug):
+        return slug == "shrewsbury-crown-court"
+
+    def suggest(slug, raw_value):
+        return CourtSlugSuggestion(
+            submitted_slug=slug,
+            suggested_slug="shrewsbury-crown-court",
+            suggested_court_name="Shrewsbury Crown Court",
+            confidence=1.0,
+            query="shrewsbury crown court",
+            reason="Best match from FaCT court name search",
+        )
+
+    validated = validate_submission(
+        submission,
+        court_slug_exists=exists,
+        court_slug_suggester=suggest,
+    )
+
+    assert validated.court_slug == "shrewsbury-crown-court"
+    assert validated.status == "processed_with_warnings"
+    assert _has_issue(validated, COURT_SLUG_AUTO_REPAIRED)
+    assert not _has_issue(validated, COURT_SLUG_NOT_FOUND)
+
+
+def test_validate_submission_keeps_low_confidence_suggestion_for_review():
+    submission = _submission(
+        court_slug="reading-county-court",
+        court_slug_raw="reading-county-court",
+    )
+
+    def suggest(slug, raw_value):
+        return CourtSlugSuggestion(
+            submitted_slug=slug,
+            suggested_slug="reading-county-court-and-family-court",
+            suggested_court_name="Reading County Court and Family Court",
+            confidence=0.702,
+            query="reading county court",
+            reason="Best match from FaCT court name search",
+        )
+
+    validated = validate_submission(
+        submission,
+        court_slug_exists=lambda slug: False,
+        court_slug_suggester=suggest,
+    )
+
+    assert validated.court_slug == "reading-county-court"
+    assert validated.status == "needs_human_review"
+    assert _has_issue(validated, COURT_SLUG_SUGGESTED)
     assert _has_issue(validated, COURT_SLUG_NOT_FOUND)
 
 

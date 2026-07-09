@@ -13,6 +13,14 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 load_dotenv()
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass(frozen=True)
 class AppConfig:
     config_dir: Path = Path("config")
@@ -32,6 +40,22 @@ class AppConfig:
     @property
     def fact_data_api_bearer_token(self) -> Optional[str]:
         return os.getenv("FACT_DATA_API_BEARER_TOKEN") or None
+
+    @property
+    def llm_enabled(self) -> bool:
+        return _env_bool("LLM_ENABLED", default=False)
+
+    @property
+    def openai_base_url(self) -> Optional[str]:
+        return os.getenv("OPENAI_BASE_URL") or None
+
+    @property
+    def openai_api_key(self) -> Optional[str]:
+        return os.getenv("OPENAI_API_KEY") or None
+
+    @property
+    def openai_model(self) -> Optional[str]:
+        return os.getenv("OPENAI_MODEL") or None
 
 
 class LlmRule(BaseModel):

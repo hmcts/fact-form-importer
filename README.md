@@ -50,6 +50,21 @@ as a blank template.
 cp .env.example .env
 ```
 
+The LLM-assisted steps are disabled by default. Leave `LLM_ENABLED=false` while
+running the deterministic/API-backed pipeline. When LLM support is implemented
+and you want to use it, set:
+
+```text
+LLM_ENABLED=true
+OPENAI_BASE_URL=https://<your-ai-foundry-resource>.services.ai.azure.com/openai/v1
+OPENAI_API_KEY=<your-api-key>
+OPENAI_MODEL=<your-deployment-name>
+```
+
+The OpenAI client will use the newer `from openai import OpenAI` style with
+`base_url`, `api_key`, and `model`; no separate Azure OpenAI API version is
+configured.
+
 ### 3. Add the source spreadsheet
 
 Place the Microsoft Forms export in `input/`. Spreadsheet files in this
@@ -162,6 +177,8 @@ out/records_needing_human_review.json
 out/issue_report.json
 out/import_summary.json
 out/nsu_cleaned_review.xlsx
+out/read_only_approval_users.json
+out/read_only_approval_users.xlsx
 ```
 
 `fact_payload.json` contains only records with status `processed` or
@@ -181,8 +198,10 @@ slugs, useful for filtering and review.
 
 `import_summary.json` contains the run id, source file, row and status counts,
 skipped row count, duplicate slug group count, duplicate slug affected-record
-count, mapping warnings, issue counts by code, and `vocabulary_source`. In a
-normal run, `vocabulary_source` should be `fact_data_api`. Duplicate groups are
+count, mapping warnings, issue counts by code, `vocabulary_source`, and whether
+LLM processing was enabled. In a normal run, `vocabulary_source` should be
+`fact_data_api`. The CLI also prints the duplicate group, affected-record, and
+LLM-enabled counts at the end of each run. Duplicate groups are
 conservative for now: every affected record is excluded from `fact_payload.json`
 and sent to human review. The importer does not pick a winner or merge duplicate
 rows until explicit merge/precedence rules exist.
@@ -202,6 +221,25 @@ completion/start/last-modified dates, submitter names and emails, and a
 `candidate_most_recent_row` based on the available form timestamps. This is
 review evidence for NSU/product decisions; the importer still does not
 automatically migrate only the latest duplicate until that rule is confirmed.
+
+`read_only_approval_users.json` and `read_only_approval_users.xlsx` contain the
+unique form submitters who should be considered for the read-only approval role.
+Submitter emails are trimmed, lowercased, and deduplicated; source row numbers
+are retained so NSU can trace each user back to submitted forms. Users listed in
+`config/team_exclusions.json` under `exclude_from_read_only_approval_role` are
+removed from the role list and written to `excluded_users` with reason
+`configured_exclusion`, because those team members should receive a different
+role.
+
+`config/team_exclusions.json` is intentionally git-ignored because it can
+contain real staff email addresses. Start from the safe committed template:
+
+```bash
+cp config/team_exclusions.example.json config/team_exclusions.json
+```
+
+Then add local exclusions to `config/team_exclusions.json`; do not commit that
+file.
 
 ## Configuration
 
@@ -277,6 +315,8 @@ Current validation checks:
 
 - required court slug
 - cleaned court slug exists in FaCT Data API during the `run` command
+- missing court slugs are searched against FaCT court-name search to find
+  possible suggestions
 - optional email and phone syntax
 - populated address postcode syntax
 - opening-hours time shape and ambiguous time status
@@ -289,8 +329,8 @@ Status is recalculated after validation:
 - `needs_human_review`: court slug not found in FaCT, duplicate slug, invalid
   populated postcode, ambiguous opening hours, invalid time, or controlled-list
   mismatch
-- `processed_with_warnings`: optional email/phone warnings or slug
-  normalisation from a URL/free text
+- `processed_with_warnings`: optional email/phone warnings, slug normalisation
+  from a URL/free text, or a very high-confidence court slug auto-repair
 - `processed`: no validation issues
 
 Address existence checks against Ordnance Survey/FaCT API are intentionally not
@@ -309,10 +349,19 @@ Current issue meanings:
 - `COURT_SLUG_NORMALISED`: the submitted court identifier was changed into a
   clean slug, for example from a full Find a Court URL to `fleetwood-court`.
   This is usually non-blocking.
+- `COURT_SLUG_AUTO_REPAIRED`: the cleaned slug did not exist in FaCT, but
+  FaCT court-name search returned a very high-confidence match of at least
+  `0.95` and `GET /courts/slug/{suggestedSlug}/v1` verified that suggested slug
+  exists. The row can still be imported, but the repair is visible as a warning
+  in `issue_report.json` and the NSU workbook.
 - `COURT_SLUG_NOT_FOUND`: the cleaned slug is syntactically valid but
   `GET /courts/slug/{courtSlug}/v1` did not find it in FaCT Data API. The row is
   blocked for human review because it may be a typo, an obsolete slug, or a
   court that needs separate product/NSU confirmation.
+- `COURT_SLUG_SUGGESTED`: the cleaned slug did not exist in FaCT, and FaCT
+  court-name search found a possible match below the auto-repair threshold. The
+  suggested slug, court name, confidence and query are written to the NSU
+  workbook, but the row remains blocked for human review.
 - `DUPLICATE_COURT_SLUG`: more than one submitted row resolves to the same
   court slug. All affected rows are blocked from automatic import until a
   reviewer decides whether to merge, discard, or correct them.

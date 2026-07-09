@@ -212,6 +212,8 @@ input/*.csv
 input/*.xls
 input/*.xlsx
 !input/.gitkeep
+config/team_exclusions.json
+!config/team_exclusions.example.json
 out/
 outputs/
 fact_payload.json

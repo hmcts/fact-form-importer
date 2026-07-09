@@ -15,7 +15,11 @@ from openpyxl.worksheet.worksheet import Worksheet
 from pydantic import BaseModel
 
 from fact_form_importer.models.court_submission import CourtSubmission, OpeningTime
-from fact_form_importer.validators.base import DUPLICATE_COURT_SLUG
+from fact_form_importer.validators.base import (
+    COURT_SLUG_AUTO_REPAIRED,
+    COURT_SLUG_SUGGESTED,
+    DUPLICATE_COURT_SLUG,
+)
 
 WORKBOOK_NAME = "nsu_cleaned_review.xlsx"
 HEADER_FILL = PatternFill("solid", fgColor="D9EAF7")
@@ -23,6 +27,12 @@ HEADER_FONT = Font(bold=True)
 ISSUE_EXPLANATIONS = {
     "COURT_SLUG_NORMALISED": (
         "The submitted court identifier was changed into a clean slug. This is usually non-blocking."
+    ),
+    "COURT_SLUG_AUTO_REPAIRED": (
+        "The submitted court slug did not exist, but a very high-confidence FaCT search match was verified and used."
+    ),
+    "COURT_SLUG_SUGGESTED": (
+        "FaCT search found a possible court slug match, but confidence was not high enough to auto-repair."
     ),
     "DUPLICATE_COURT_SLUG": (
         "More than one submitted row resolves to the same court slug. The importer does not choose or merge rows automatically."
@@ -38,6 +48,8 @@ ISSUE_EXPLANATIONS = {
 }
 ISSUE_ACTIONS = {
     "COURT_SLUG_NORMALISED": "Check only if the cleaned slug looks wrong.",
+    "COURT_SLUG_AUTO_REPAIRED": "Check only if the repaired slug looks wrong.",
+    "COURT_SLUG_SUGGESTED": "Review the suggested slug and correct the court slug if it is the right match.",
     "DUPLICATE_COURT_SLUG": "Review all rows in the duplicate group and decide whether to merge, discard, or correct them.",
     "INVALID_EMAIL": "Correct the email address or confirm it should be omitted.",
     "INVALID_PHONE": "Correct the phone number or confirm it should be omitted.",
@@ -77,6 +89,7 @@ def write_nsu_review_workbook(
         [submission for submission in submissions if submission.status == "failed"],
     )
     _add_duplicate_courts_sheet(workbook, submissions)
+    _add_court_slug_suggestions_sheet(workbook, submissions)
     _add_addresses_sheet(workbook, submissions)
     _add_contacts_sheet(workbook, submissions)
     _add_opening_hours_sheet(workbook, submissions)
@@ -139,9 +152,13 @@ def _add_records_sheet(
             "address_count",
             "contact_count",
             "opening_hours_count",
+            "suggested_slug",
+            "suggested_court_name",
+            "suggestion_confidence",
         ]
     ]
     for submission in submissions:
+        suggestion = _court_slug_suggestion(submission)
         rows.append(
             [
                 submission.source.source_row_number,
@@ -157,6 +174,9 @@ def _add_records_sheet(
                 len(submission.addresses),
                 len(submission.contacts),
                 len(submission.opening_hours),
+                suggestion.get("suggested_slug"),
+                suggestion.get("suggested_court_name"),
+                suggestion.get("confidence"),
             ]
         )
 
@@ -244,6 +264,47 @@ def _add_duplicate_courts_sheet(workbook: Workbook, submissions: list[CourtSubmi
         )
 
     _write_sheet(workbook, "Duplicate courts", rows)
+
+
+def _add_court_slug_suggestions_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:
+    rows = [
+        [
+            "source_row_number",
+            "status",
+            "issue_code",
+            "raw_slug_value",
+            "current_court_slug",
+            "submitted_slug",
+            "suggested_slug",
+            "suggested_court_name",
+            "confidence",
+            "query",
+            "reason",
+        ]
+    ]
+    for submission in submissions:
+        for issue in submission.issues:
+            if issue.code not in {COURT_SLUG_AUTO_REPAIRED, COURT_SLUG_SUGGESTED}:
+                continue
+
+            suggestion = issue.cleaned_value if isinstance(issue.cleaned_value, dict) else {}
+            rows.append(
+                [
+                    submission.source.source_row_number,
+                    submission.status,
+                    issue.code,
+                    submission.court_slug_raw,
+                    submission.court_slug,
+                    suggestion.get("submitted_slug"),
+                    suggestion.get("suggested_slug"),
+                    suggestion.get("suggested_court_name"),
+                    suggestion.get("confidence"),
+                    suggestion.get("query"),
+                    suggestion.get("reason"),
+                ]
+            )
+
+    _write_sheet(workbook, "Court slug suggestions", rows)
 
 
 def _most_recent_submission(submissions: list[CourtSubmission]) -> CourtSubmission | None:
@@ -436,6 +497,9 @@ def _add_issues_sheet(workbook: Workbook, submissions: list[CourtSubmission]) ->
             "suggested_next_action",
             "raw_value",
             "cleaned_value",
+            "suggested_slug",
+            "suggested_court_name",
+            "suggestion_confidence",
         ]
     ]
     for submission in submissions:
@@ -452,6 +516,9 @@ def _add_issues_sheet(workbook: Workbook, submissions: list[CourtSubmission]) ->
                     ISSUE_ACTIONS.get(issue.code, "Review the field value."),
                     _cell_value(issue.raw_value),
                     _cell_value(issue.cleaned_value),
+                    _issue_suggestion_value(issue, "suggested_slug"),
+                    _issue_suggestion_value(issue, "suggested_court_name"),
+                    _issue_suggestion_value(issue, "confidence"),
                 ]
             )
 
@@ -540,7 +607,30 @@ def _issue_explanation(code: str, submission: CourtSubmission) -> str:
             details.append(f"{issue.field} value {_cell_value(issue.raw_value)!r}")
         return f"{code}: {base} Affected value(s): " + "; ".join(details) + "."
 
+    if code in {COURT_SLUG_AUTO_REPAIRED, COURT_SLUG_SUGGESTED}:
+        details = []
+        for issue in matching_issues:
+            suggestion = issue.cleaned_value if isinstance(issue.cleaned_value, dict) else {}
+            details.append(
+                f"{suggestion.get('suggested_slug')} "
+                f"({suggestion.get('suggested_court_name')}, confidence {suggestion.get('confidence')})"
+            )
+        return f"{code}: {base} Suggested match(es): " + "; ".join(details) + "."
+
     return f"{code}: {base}"
+
+
+def _court_slug_suggestion(submission: CourtSubmission) -> dict[str, Any]:
+    for issue in submission.issues:
+        if issue.code in {COURT_SLUG_AUTO_REPAIRED, COURT_SLUG_SUGGESTED} and isinstance(issue.cleaned_value, dict):
+            return issue.cleaned_value
+    return {}
+
+
+def _issue_suggestion_value(issue: Any, key: str) -> Any:
+    if isinstance(issue.cleaned_value, dict):
+        return issue.cleaned_value.get(key)
+    return None
 
 
 def _write_sheet(

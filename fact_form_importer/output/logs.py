@@ -35,6 +35,7 @@ def write_processing_outputs(
     output_path: Path,
     run_id: str | None = None,
     vocabulary_source: str = "not_recorded",
+    llm_enabled: bool = False,
 ) -> OutputResult:
     output_path.mkdir(parents=True, exist_ok=True)
     current_run_id = run_id or _new_run_id()
@@ -49,6 +50,7 @@ def write_processing_outputs(
         workbook_profile=workbook_profile,
         run_id=current_run_id,
         vocabulary_source=vocabulary_source,
+        llm_enabled=llm_enabled,
     )
 
     _write_json(output_path / "fact_payload.json", fact_payload)
@@ -81,6 +83,7 @@ def build_import_summary(
     workbook_profile: WorkbookProfile,
     run_id: str,
     vocabulary_source: str = "not_recorded",
+    llm_enabled: bool = False,
 ) -> dict[str, Any]:
     status_counts = Counter(submission.status for submission in submissions)
     issue_counts = Counter(
@@ -99,6 +102,7 @@ def build_import_summary(
         "run_id": run_id,
         "source_file": str(workbook_profile.source_path),
         "vocabulary_source": vocabulary_source,
+        "llm_enabled": llm_enabled,
         "row_count": workbook_profile.row_count,
         "submission_count": len(submissions),
         "processed_count": status_counts["processed"],

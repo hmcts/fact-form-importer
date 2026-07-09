@@ -71,11 +71,13 @@ def test_build_import_summary_counts_statuses_and_issues(tmp_path):
         profile,
         "run-1",
         vocabulary_source="fact_data_api",
+        llm_enabled=True,
     )
 
     assert summary["run_id"] == "run-1"
     assert summary["source_file"].endswith("source.csv")
     assert summary["vocabulary_source"] == "fact_data_api"
+    assert summary["llm_enabled"] is True
     assert summary["row_count"] == 7
     assert summary["submission_count"] == 4
     assert summary["processed_count"] == 1

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-ALLOWED_TEMPLATE_VALUES = {"", "changeme", "placeholder", "example"}
+ALLOWED_TEMPLATE_VALUES = {"", "changeme", "placeholder", "example", "false"}
 
 
 def test_env_example_does_not_contain_real_values():

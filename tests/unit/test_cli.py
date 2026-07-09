@@ -29,6 +29,11 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     assert exit_code == 0
     assert "Run ID:" in captured.out
     assert "Validated submissions: 1" in captured.out
+    assert "Duplicate court groups: 0" in captured.out
+    assert "Duplicate affected records: 0" in captured.out
+    assert "Read-only approval users: 0" in captured.out
+    assert "Excluded submitter users: 0" in captured.out
+    assert "LLM enabled: False" in captured.out
     assert "Vocabulary source: local_json" in captured.out
     assert (output_path / "profile.json").exists()
     assert (output_path / "submissions_raw.json").exists()
@@ -36,11 +41,14 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     assert (output_path / "fact_payload.json").exists()
     assert (output_path / "import_summary.json").exists()
     assert (output_path / "nsu_cleaned_review.xlsx").exists()
+    assert (output_path / "read_only_approval_users.json").exists()
+    assert (output_path / "read_only_approval_users.xlsx").exists()
 
     summary = json.loads((output_path / "import_summary.json").read_text())
     assert summary["submission_count"] == 1
     assert summary["processed_count"] == 1
     assert summary["vocabulary_source"] == "local_json"
+    assert summary["llm_enabled"] is False
 
 
 def test_run_command_requires_fact_api_base_url_by_default(tmp_path, capsys, monkeypatch):

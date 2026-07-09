@@ -11,11 +11,14 @@ from fact_form_importer.cleaners.postcodes import normalise_uk_postcode
 from fact_form_importer.cleaners.strings import null_if_empty_like
 from fact_form_importer.models.court_submission import CourtSubmission, OpeningTime
 from fact_form_importer.models.issues import Issue
+from fact_form_importer.validators.fact_api_courts import CourtSlugSuggestion
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 MISSING_COURT_IDENTIFIER = "MISSING_COURT_IDENTIFIER"
 COURT_SLUG_NORMALISED = "COURT_SLUG_NORMALISED"
 COURT_SLUG_NOT_FOUND = "COURT_SLUG_NOT_FOUND"
+COURT_SLUG_SUGGESTED = "COURT_SLUG_SUGGESTED"
+COURT_SLUG_AUTO_REPAIRED = "COURT_SLUG_AUTO_REPAIRED"
 DUPLICATE_COURT_SLUG = "DUPLICATE_COURT_SLUG"
 INVALID_EMAIL = "INVALID_EMAIL"
 INVALID_PHONE = "INVALID_PHONE"
@@ -37,9 +40,12 @@ HUMAN_REVIEW_ISSUE_CODES = {
 }
 WARNING_STATUS_ISSUE_CODES = {
     COURT_SLUG_NORMALISED,
+    COURT_SLUG_AUTO_REPAIRED,
+    COURT_SLUG_SUGGESTED,
     INVALID_EMAIL,
     INVALID_PHONE,
 }
+COURT_SLUG_AUTO_REPAIR_CONFIDENCE_THRESHOLD = 0.95
 TIME_PATTERN = re.compile(r"^\d{2}:\d{2}$")
 
 
@@ -47,12 +53,13 @@ def validate_submission(
     submission: CourtSubmission,
     vocabularies: Optional[Vocabularies] = None,
     court_slug_exists: Optional[Callable[[str], bool]] = None,
+    court_slug_suggester: Optional[Callable[[str, str | None], CourtSlugSuggestion | None]] = None,
 ) -> CourtSubmission:
     """Validate one already-ingested submission and recalculate its status."""
 
     _validate_required_court_slug(submission)
+    _validate_court_slug_exists(submission, court_slug_exists, court_slug_suggester)
     _validate_slug_normalisation(submission)
-    _validate_court_slug_exists(submission, court_slug_exists)
     _validate_facility_fields(submission, vocabularies)
     _validate_translation_fields(submission)
     _validate_addresses(submission, vocabularies)
@@ -68,12 +75,19 @@ def validate_all_submissions(
     submissions: list[CourtSubmission],
     vocabularies: Optional[Vocabularies] = None,
     court_slug_exists: Optional[Callable[[str], bool]] = None,
+    court_slug_suggester: Optional[Callable[[str, str | None], CourtSlugSuggestion | None]] = None,
 ) -> list[CourtSubmission]:
     """Validate submissions and flag duplicate court slugs across the batch."""
 
     cached_court_slug_exists = _cache_court_slug_exists(court_slug_exists)
+    cached_court_slug_suggester = _cache_court_slug_suggester(court_slug_suggester)
     validated = [
-        validate_submission(submission, vocabularies, cached_court_slug_exists)
+        validate_submission(
+            submission,
+            vocabularies,
+            cached_court_slug_exists,
+            cached_court_slug_suggester,
+        )
         for submission in submissions
     ]
     from fact_form_importer.validators.duplicates import flag_duplicate_court_slugs
@@ -156,12 +170,52 @@ def _validate_slug_normalisation(submission: CourtSubmission) -> None:
 def _validate_court_slug_exists(
     submission: CourtSubmission,
     court_slug_exists: Optional[Callable[[str], bool]],
+    court_slug_suggester: Optional[Callable[[str, str | None], CourtSlugSuggestion | None]],
 ) -> None:
     if court_slug_exists is None or null_if_empty_like(submission.court_slug) is None:
         return
 
     if court_slug_exists(str(submission.court_slug)):
         return
+
+    suggestion = None
+    if court_slug_suggester is not None:
+        suggestion = court_slug_suggester(str(submission.court_slug), submission.court_slug_raw)
+        if (
+            suggestion is not None
+            and suggestion.confidence >= COURT_SLUG_AUTO_REPAIR_CONFIDENCE_THRESHOLD
+            and court_slug_exists(suggestion.suggested_slug)
+        ):
+            submitted_slug = submission.court_slug
+            submission.court_slug = suggestion.suggested_slug
+            add_issue_once(
+                submission,
+                Issue(
+                    field="court_slug",
+                    code=COURT_SLUG_AUTO_REPAIRED,
+                    severity="warning",
+                    message="Court slug was auto-repaired using a high-confidence FaCT search match",
+                    raw_value=submission.court_slug_raw,
+                    cleaned_value={
+                        **suggestion.as_dict(),
+                        "previous_cleaned_slug": submitted_slug,
+                    },
+                ),
+            )
+            return
+
+        if suggestion is not None:
+            add_issue_once(
+                submission,
+                Issue(
+                    field="court_slug",
+                    code=COURT_SLUG_SUGGESTED,
+                    severity="warning",
+                    message="FaCT search found a possible court slug suggestion for review",
+                    raw_value=submission.court_slug_raw,
+                    cleaned_value=suggestion.as_dict(),
+                ),
+            )
 
     add_issue_once(
         submission,
@@ -171,7 +225,7 @@ def _validate_court_slug_exists(
             severity="warning",
             message="Court slug does not exist in FaCT Data API",
             raw_value=submission.court_slug_raw,
-            cleaned_value=submission.court_slug,
+            cleaned_value=suggestion.as_dict() if suggestion is not None else submission.court_slug,
         ),
     )
 
@@ -188,6 +242,23 @@ def _cache_court_slug_exists(
         if slug not in cache:
             cache[slug] = court_slug_exists(slug)
         return cache[slug]
+
+    return cached
+
+
+def _cache_court_slug_suggester(
+    court_slug_suggester: Optional[Callable[[str, str | None], CourtSlugSuggestion | None]],
+) -> Optional[Callable[[str, str | None], CourtSlugSuggestion | None]]:
+    if court_slug_suggester is None:
+        return None
+
+    cache: dict[tuple[str, str | None], CourtSlugSuggestion | None] = {}
+
+    def cached(slug: str, raw_value: str | None) -> CourtSlugSuggestion | None:
+        key = (slug, raw_value)
+        if key not in cache:
+            cache[key] = court_slug_suggester(slug, raw_value)
+        return cache[key]
 
     return cached
 

@@ -76,6 +76,7 @@ def test_write_nsu_review_workbook_creates_expected_review_tabs(tmp_path):
         "Needs human review",
         "Failed records",
         "Duplicate courts",
+        "Court slug suggestions",
         "Cleaned addresses",
         "Cleaned contacts",
         "Cleaned opening hours",
@@ -122,6 +123,38 @@ def test_nsu_workbook_review_reason_names_vocab_field_and_raw_value(tmp_path):
     review_reason = workbook["Needs human review"]["F2"].value
     assert "contacts[1].description" in review_reason
     assert "General help" in review_reason
+
+
+def test_nsu_workbook_writes_court_slug_suggestions_tab(tmp_path):
+    submission = _submission(
+        court_slug="shrewsbury-crown-court",
+        status="processed_with_warnings",
+        row_number=2,
+        issue=Issue(
+            field="court_slug",
+            code="COURT_SLUG_AUTO_REPAIRED",
+            severity="warning",
+            message="Court slug was auto-repaired",
+            raw_value="shrewsbury.crowncourt",
+            cleaned_value={
+                "submitted_slug": "shrewsburycrowncourt",
+                "suggested_slug": "shrewsbury-crown-court",
+                "suggested_court_name": "Shrewsbury Crown Court",
+                "confidence": 1.0,
+                "query": "shrewsbury crown court",
+                "reason": "Best match from FaCT court name search",
+            },
+        ),
+    )
+
+    path = write_nsu_review_workbook([submission], tmp_path, {"run_id": "run-1"})
+
+    workbook = load_workbook(path)
+    assert workbook["Processed records"]["N2"].value == "shrewsbury-crown-court"
+    assert workbook["Processed records"]["O2"].value == "Shrewsbury Crown Court"
+    assert workbook["Processed records"]["P2"].value == 1
+    assert workbook["Court slug suggestions"]["G2"].value == "shrewsbury-crown-court"
+    assert workbook["Court slug suggestions"]["H2"].value == "Shrewsbury Crown Court"
 
 
 def _submission(

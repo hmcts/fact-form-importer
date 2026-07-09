@@ -12,7 +12,11 @@ from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
 from fact_form_importer.output.logs import write_processing_outputs
 from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
-from fact_form_importer.validators.fact_api_courts import court_slug_exists_in_fact_api
+from fact_form_importer.output.submitters import write_submitter_outputs
+from fact_form_importer.validators.fact_api_courts import (
+    court_slug_exists_in_fact_api,
+    suggest_court_slug_in_fact_api,
+)
 from fact_form_importer.validators.fact_api_vocabularies import load_vocabularies_from_fact_api
 from fact_form_importer.validators.business_rules import validate_all_submissions
 from fact_form_importer.validators.vocabularies import load_vocabularies
@@ -69,15 +73,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = False) -> int:
     try:
+        config = AppConfig()
         workbook_profile = profile_workbook(input_path)
         ingest_result = ingest_workbook(input_path=input_path, output_path=output_path)
-        vocabularies, vocabulary_source, court_slug_exists = _load_fact_api_services_for_run(
+        vocabularies, vocabulary_source, court_slug_exists, court_slug_suggester = _load_fact_api_services_for_run(
+            config=config,
             allow_local_vocabularies=allow_local_vocabularies
         )
         submissions = validate_all_submissions(
             ingest_result.submissions,
             vocabularies,
             court_slug_exists=court_slug_exists,
+            court_slug_suggester=court_slug_suggester,
         )
         output_path.mkdir(parents=True, exist_ok=True)
         (output_path / "profile.json").write_text(
@@ -90,11 +97,16 @@ def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = Fa
             workbook_profile=workbook_profile,
             output_path=output_path,
             vocabulary_source=vocabulary_source,
+            llm_enabled=config.llm_enabled,
         )
         workbook_path = write_nsu_review_workbook(
             submissions=submissions,
             output_path=output_path,
             summary=output_result.summary,
+        )
+        submitter_result = write_submitter_outputs(
+            submissions=submissions,
+            output_path=output_path,
         )
     except (FileNotFoundError, KeyError, ModuleNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -109,9 +121,15 @@ def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = Fa
     print(f"Processed with warnings: {summary['processed_with_warnings_count']}")
     print(f"Needs human review: {summary['needs_human_review_count']}")
     print(f"Failed: {summary['failed_count']}")
+    print(f"Duplicate court groups: {summary['duplicate_slug_group_count']}")
+    print(f"Duplicate affected records: {summary['duplicate_slug_affected_record_count']}")
     print(f"Skipped empty rows: {summary['skipped_count']}")
+    print(f"Read-only approval users: {submitter_result.user_count}")
+    print(f"Excluded submitter users: {submitter_result.excluded_user_count}")
+    print(f"LLM enabled: {summary['llm_enabled']}")
     print(f"Vocabulary source: {summary['vocabulary_source']}")
     print(f"Wrote NSU review workbook: {workbook_path}")
+    print(f"Wrote read-only approval users: {submitter_result.json_path}")
     print(f"Wrote run outputs to: {output_path}")
     return 0
 
@@ -162,14 +180,17 @@ def ingest(input_path: Path, output_path: Path) -> int:
     return 0
 
 
-def _load_fact_api_services_for_run(allow_local_vocabularies: bool = False):
-    config = AppConfig()
+def _load_fact_api_services_for_run(
+    config: AppConfig | None = None,
+    allow_local_vocabularies: bool = False,
+):
+    config = config or AppConfig()
     path = config.vocabularies_path
     local_vocabularies = load_vocabularies(path) if path.exists() else None
 
     if not config.fact_data_api_base_url:
         if allow_local_vocabularies:
-            return local_vocabularies, "local_json" if local_vocabularies else "none", None
+            return local_vocabularies, "local_json" if local_vocabularies else "none", None, None
         raise ValueError(
             "FACT_DATA_API_BASE_URL is required for run. "
             "Use --allow-local-vocabularies only for offline/local review."
@@ -177,7 +198,7 @@ def _load_fact_api_services_for_run(allow_local_vocabularies: bool = False):
 
     if not config.fact_data_api_bearer_token:
         if allow_local_vocabularies:
-            return local_vocabularies, "local_json" if local_vocabularies else "none", None
+            return local_vocabularies, "local_json" if local_vocabularies else "none", None, None
         raise ValueError(
             "FACT_DATA_API_BEARER_TOKEN is required for run. "
             "Use --allow-local-vocabularies only for offline/local review."
@@ -193,6 +214,17 @@ def _load_fact_api_services_for_run(allow_local_vocabularies: bool = False):
         except Exception as exc:
             raise ValueError(f"Unable to validate court slug '{court_slug}' against FaCT API: {exc}") from exc
 
+    def court_slug_suggester(court_slug: str, raw_value: str | None):
+        try:
+            return suggest_court_slug_in_fact_api(
+                court_slug=court_slug,
+                raw_value=raw_value,
+                base_url=config.fact_data_api_base_url or "",
+                bearer_token=config.fact_data_api_bearer_token or "",
+            )
+        except Exception as exc:
+            raise ValueError(f"Unable to suggest court slug for '{court_slug}' against FaCT API: {exc}") from exc
+
     try:
         return (
             load_vocabularies_from_fact_api(
@@ -202,12 +234,13 @@ def _load_fact_api_services_for_run(allow_local_vocabularies: bool = False):
             ),
             "fact_data_api",
             court_slug_exists,
+            court_slug_suggester,
         )
     except Exception as exc:
         if not allow_local_vocabularies or local_vocabularies is None:
             raise ValueError(f"Unable to load FaCT API vocabularies: {exc}") from exc
         print(f"Warning: using local vocabularies because FaCT API lookup failed: {exc}", file=sys.stderr)
-        return local_vocabularies, "local_json_fallback_after_fact_data_api_error", None
+        return local_vocabularies, "local_json_fallback_after_fact_data_api_error", None, None
 
 
 def main(argv: list[str] | None = None) -> int:

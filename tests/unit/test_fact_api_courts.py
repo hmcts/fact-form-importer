@@ -1,7 +1,10 @@
 import httpx
 import pytest
 
-from fact_form_importer.validators.fact_api_courts import court_slug_exists_in_fact_api
+from fact_form_importer.validators.fact_api_courts import (
+    court_slug_exists_in_fact_api,
+    suggest_court_slug_in_fact_api,
+)
 
 
 def test_court_slug_exists_in_fact_api_returns_true_for_200():
@@ -48,3 +51,50 @@ def test_court_slug_exists_in_fact_api_raises_for_auth_or_server_errors():
             bearer_token="wrong-token",
             client=client,
         )
+
+
+def test_suggest_court_slug_in_fact_api_returns_best_match():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "slug": "shrewsbury-crown-court",
+                    "name": "Shrewsbury Crown Court",
+                }
+            ],
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    suggestion = suggest_court_slug_in_fact_api(
+        court_slug="shrewsburycrowncourt",
+        raw_value="shrewsbury.crowncourt",
+        base_url="https://fact-data-api.example.test",
+        bearer_token="token",
+        client=client,
+    )
+
+    assert suggestion is not None
+    assert suggestion.suggested_slug == "shrewsbury-crown-court"
+    assert suggestion.suggested_court_name == "Shrewsbury Crown Court"
+    assert suggestion.confidence == 1
+    assert requests[0].url.path == "/search/courts/v1/name"
+    assert requests[0].headers["authorization"] == "Bearer token"
+
+
+def test_suggest_court_slug_in_fact_api_returns_none_when_no_candidates():
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[])))
+
+    suggestion = suggest_court_slug_in_fact_api(
+        court_slug="missing-court",
+        raw_value="missing court",
+        base_url="https://fact-data-api.example.test",
+        bearer_token="token",
+        client=client,
+    )
+
+    assert suggestion is None
