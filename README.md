@@ -4,9 +4,10 @@ Processes Microsoft Forms XLSX/CSV exports containing Find a Court or Tribunal
 court information. The importer will convert spreadsheet rows into structured,
 cleaned, validated data for later FaCT API import.
 
-The project is intentionally incremental. The initial skeleton contains package
-structure, configuration placeholders, and a CLI entry point. Processing logic
-will be added in later tasks.
+The project is intentionally incremental. The current pipeline performs
+deterministic cleaning, FaCT API-backed validation, review output generation,
+and read-only approval user export. LLM support exists as a manual structured
+client/test command, but it is not called by the main import run yet.
 
 ## Goals
 
@@ -14,10 +15,80 @@ will be added in later tasks.
 - Create one `CourtSubmission` object per spreadsheet row.
 - Preserve raw values, cleaned values, and validation issues.
 - Use deterministic Python cleaners before any LLM-assisted normalisation.
-- Use Azure OpenAI GPT-5.5 only for configured ambiguous fields.
+- Use the configured OpenAI-compatible GPT-5.5 deployment only for configured
+  ambiguous fields.
 - Keep Python responsible for the final FaCT payload shape.
 - Generate import JSON, NSU review workbook, summary logs, issue reports, and
   read-only approval user outputs.
+
+## Commands
+
+These are the maintained commands for the current importer workflow.
+
+```bash
+sh scripts/bootstrap.sh
+```
+
+Creates the local virtual environment, installs the package and dev
+dependencies, and installs the pre-push hook. Run once per checkout.
+
+```bash
+source .venv/bin/activate
+```
+
+Activates the local environment so commands use the project dependencies.
+
+```bash
+python3 -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing
+```
+
+Runs the unit suite with the same 90% coverage threshold used before pushing.
+
+```bash
+python3 -m fact_form_importer profile --input "./input/microsoft-forms-export.xlsx" --output "./out"
+```
+
+Profiles the Microsoft Forms workbook without cleaning or transforming it. Use
+this to confirm the source file shape, row count, headers, and empty columns.
+
+```bash
+python3 -m fact_form_importer ingest --input "./input/microsoft-forms-export.xlsx" --output "./out"
+```
+
+Runs deterministic ingestion only and writes intermediate raw/cleaned
+submission files. Use this when checking column mapping and cleaner behaviour
+before full validation.
+
+```bash
+python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out"
+```
+
+Runs the current end-to-end non-LLM import preparation: profiling, ingestion,
+FaCT API-backed validation, issue/status calculation, draft payload JSON, NSU
+review workbook, and read-only approval user outputs.
+
+```bash
+python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --allow-local-vocabularies
+```
+
+Runs the same pipeline with local vocabulary fixtures when FaCT API access is
+unavailable. Use only for offline/local inspection; normal runs should use
+`vocabulary_source: fact_data_api`.
+
+```bash
+python3 -m fact_form_importer check-llm
+```
+
+Checks the configured OpenAI-compatible endpoint, API key, and model with a
+tiny prompt. It does not read spreadsheet data or write import outputs.
+
+```bash
+python3 -m fact_form_importer llm-test
+```
+
+Sends a fake structured normalisation request to the configured model and
+prints the JSON response. It exercises the manual LLM client only; `run` still
+does not call the LLM.
 
 ## Workflow
 
@@ -50,9 +121,10 @@ as a blank template.
 cp .env.example .env
 ```
 
-The LLM-assisted steps are disabled by default. Leave `LLM_ENABLED=false` while
-running the deterministic/API-backed pipeline. When LLM support is implemented
-and you want to use it, set:
+The LLM-assisted pipeline steps are disabled by default. Leave
+`LLM_ENABLED=false` while running the deterministic/API-backed pipeline. The
+manual LLM commands can still be used to test credentials and structured
+responses. When future pipeline stages should use LLM assistance, set:
 
 ```text
 LLM_ENABLED=true
@@ -74,6 +146,27 @@ python3 -m fact_form_importer check-llm
 
 This sends a tiny prompt and prints the endpoint, model, `LLM_ENABLED` state,
 and response preview. It does not read the spreadsheet or write import outputs.
+
+To exercise the structured LLM normalisation client with a fake non-production
+record:
+
+```bash
+python3 -m fact_form_importer llm-test
+```
+
+This sends only fake non-production values covering the current LLM-enabled
+rule categories: accessible toilet public text, hearing enhancement, food and
+drink, address type, areas of law, court type, counter service assistance,
+contact description, contact explanation, and opening-hours type. It prints a
+sanity-check transcript with the input fields sent to the model, the output
+fields returned by the model, any issues, and the final result summary. It is a
+manual test command and is not called by `run`.
+
+`llm-test` deliberately calls the configured model even when `LLM_ENABLED=false`
+because it is a connection and response-shape sanity check. The `LLM_ENABLED`
+setting controls whether the main `run` pipeline is allowed to use LLM
+normalisation; the current pipeline reports that setting but does not call the
+LLM yet.
 
 ### 3. Add the source spreadsheet
 
@@ -151,9 +244,10 @@ The original spreadsheet text remains available in `submissions_raw.json`.
 rows, failed rows, warning rows, and mapping warnings. Use it as the first check
 that ingestion behaved as expected.
 
-Later steps will use these `CourtSubmission` records for field-rule validation,
-vocabulary normalisation, optional LLM-assisted cleanup, NSU review workbook
-generation, and final `fact_payload.json` creation.
+The full `run` command uses these `CourtSubmission` records for validation,
+vocabulary normalisation, NSU review workbook generation, read-only approval
+user export, and draft `fact_payload.json` creation. Optional LLM-assisted
+cleanup is still manual-only and not part of `run`.
 
 ### 6. Run the full importer
 
@@ -210,8 +304,9 @@ slugs, useful for filtering and review.
 skipped row count, duplicate slug group count, duplicate slug affected-record
 count, mapping warnings, issue counts by code, `vocabulary_source`, and whether
 LLM processing was enabled. In a normal run, `vocabulary_source` should be
-`fact_data_api`. The CLI also prints the duplicate group, affected-record, and
-LLM-enabled counts at the end of each run. Duplicate groups are
+`fact_data_api`. The CLI also prints duplicate group count, duplicate
+affected-record count, and whether LLM processing was enabled at the end of
+each run. Duplicate groups are
 conservative for now: every affected record is excluded from `fact_payload.json`
 and sent to human review. The importer does not pick a winner or merge duplicate
 rows until explicit merge/precedence rules exist.
@@ -265,7 +360,7 @@ groups, contact detail groups, and opening-hours groups.
 `config/field_rules.json` describes field-level cleaning, validation, and LLM
 normalisation policy in a declarative format. It does not contain executable
 Python code. Cleaner names, validator names, and LLM purposes are strings that
-later pipeline stages will interpret.
+pipeline stages interpret or will interpret as the importer grows.
 
 The rules file captures things like:
 
@@ -275,10 +370,10 @@ The rules file captures things like:
 - whether GPT-assisted normalisation is allowed for that field
 - the strict instructions the LLM must follow if it is used
 
-Current ingestion does not execute `field_rules.json` yet. The next validation
-and vocabulary tasks will use these rules to decide which fields need review,
-which vocabularies to check, and which ambiguous values are eligible for
-LLM-assisted normalisation.
+Current deterministic ingestion and validation code does not execute
+`field_rules.json` as a generic rules engine yet. The file documents intended
+field policy and is the source of truth for which fields are eligible for
+future LLM-assisted normalisation.
 
 ### Vocabularies
 
@@ -318,8 +413,11 @@ truth for FaCT-owned type lists.
 ### Validation Status
 
 `fact_form_importer.validators.business_rules` validates ingested
-`CourtSubmission` records after deterministic cleaning. It does not call the
-FaCT API, Ordnance Survey, or the LLM yet.
+`CourtSubmission` records after deterministic cleaning. During the `run`
+command, FaCT API functions are supplied to validation so court slugs,
+controlled vocabularies, and high-confidence court-slug suggestions can be
+checked against the source of truth. It does not call Ordnance Survey or the
+LLM.
 
 Current validation checks:
 

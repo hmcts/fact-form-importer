@@ -10,6 +10,7 @@ from typing import Optional
 from fact_form_importer.config import AppConfig
 from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
+from fact_form_importer.llm.client import build_llm_test_request, normalise_fields_with_llm
 from fact_form_importer.llm.openai_client import check_llm_connection
 from fact_form_importer.output.logs import write_processing_outputs
 from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
@@ -70,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("check-llm", help="Check the configured OpenAI-compatible LLM endpoint.")
+    subparsers.add_parser("llm-test", help="Send a tiny fake structured LLM normalisation request.")
 
     return parser
 
@@ -199,6 +201,65 @@ def check_llm() -> int:
     return 0
 
 
+def llm_test() -> int:
+    try:
+        config = AppConfig()
+        request = build_llm_test_request()
+        response = normalise_fields_with_llm(request, config)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print("LLM normalisation test: OK")
+    print("LLM called by this command: True")
+    print(f"Pipeline LLM enabled for run: {config.llm_enabled}")
+    print(f"OpenAI model: {config.openai_model}")
+    print("")
+    _print_llm_test_input(request)
+    print("")
+    _print_llm_test_output(response)
+    return 0
+
+
+def _print_llm_test_input(request) -> None:
+    print("Input fields:")
+    for field in request.fields:
+        print(f"- {field.field}")
+        print(f"  raw: {_display_value(field.raw_value)}")
+        print(f"  cleaned: {_display_value(field.cleaned_value)}")
+
+
+def _print_llm_test_output(response) -> None:
+    print("Output fields:")
+    for field in response.normalised_fields:
+        print(f"- {field.field}")
+        print(f"  value: {_display_value(field.value)}")
+        print(f"  confidence: {field.confidence}")
+        print(f"  needs_human_review: {field.needs_human_review}")
+        print(f"  reason: {field.reason}")
+
+    print("")
+    print("Issues:")
+    if response.issues:
+        for issue in response.issues:
+            print(f"- {issue.field} [{issue.severity}] {issue.code}: {issue.message}")
+    else:
+        print("- None")
+
+    print("")
+    print("Result:")
+    print(f"confidence: {response.confidence}")
+    print(f"needs_human_review: {response.needs_human_review}")
+
+
+def _display_value(value) -> str:
+    if value is None:
+        return "<null>"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "[]"
+    return str(value)
+
+
 def _load_fact_api_services_for_run(
     config: AppConfig | None = None,
     allow_local_vocabularies: bool = False,
@@ -281,6 +342,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check-llm":
         return check_llm()
+
+    if args.command == "llm-test":
+        return llm_test()
 
     parser.error(f"Unknown command: {args.command}")
     return 2

@@ -1,8 +1,10 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from fact_form_importer.config import AppConfig
+from fact_form_importer.llm.client import build_llm_test_request, normalise_fields_with_llm
 from fact_form_importer.llm.openai_client import check_llm_connection
 
 
@@ -40,3 +42,67 @@ def test_check_llm_connection_requires_openai_config(monkeypatch):
 
     with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
         check_llm_connection(AppConfig(), client_factory=lambda **kwargs: None)
+
+
+def test_normalise_fields_with_llm_uses_structured_json_output(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://ai-foundry.example.test/openai/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "token")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-5.5")
+    calls = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "record_id": "llm-test-record",
+                        "normalised_fields": [
+                            {
+                                "field": "facilities.accessible_toilet_description",
+                                "value": "Disabled toilet near reception. Ask security for access.",
+                                "confidence": "medium",
+                                "needs_human_review": True,
+                                "reason": "Mentions asking security, so review is required.",
+                            }
+                        ],
+                        "confidence": "medium",
+                        "needs_human_review": True,
+                        "issues": [
+                            {
+                                "field": "facilities.accessible_toilet_description",
+                                "code": "LLM_REVIEW_REQUIRED",
+                                "severity": "warning",
+                                "message": "Answer says to ask security.",
+                            }
+                        ],
+                    }
+                )
+            )
+
+    class FakeClient:
+        def __init__(self, base_url, api_key):
+            self.responses = FakeResponses()
+
+    result = normalise_fields_with_llm(
+        build_llm_test_request(),
+        AppConfig(),
+        client_factory=FakeClient,
+    )
+
+    assert result.record_id == "llm-test-record"
+    assert result.confidence == "medium"
+    assert result.needs_human_review is True
+    assert calls[0]["model"] == "gpt-5.5"
+    assert "temperature" not in calls[0]
+    assert calls[0]["text"]["format"]["type"] == "json_schema"
+    assert "accessible_toilet_description" in calls[0]["input"]
+
+
+def test_normalise_fields_with_llm_requires_openai_config(monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+
+    with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
+        normalise_fields_with_llm(build_llm_test_request(), AppConfig(), client_factory=lambda **kwargs: None)

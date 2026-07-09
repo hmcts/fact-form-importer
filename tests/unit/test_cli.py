@@ -185,6 +185,62 @@ def test_check_llm_command_reports_errors(capsys, monkeypatch):
     assert "OPENAI_API_KEY is required for check-llm" in captured.err
 
 
+def test_llm_test_command_reports_structured_response(capsys, monkeypatch):
+    monkeypatch.setenv("LLM_ENABLED", "false")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-5.5")
+
+    def fake_normalise(request, config):
+        return SimpleNamespace(
+            record_id=request.record_id,
+            normalised_fields=[
+                SimpleNamespace(
+                    field="facilities.accessible_toilet_description",
+                    value="Accessible toilet near reception.",
+                    confidence="high",
+                    needs_human_review=False,
+                    reason="Preserved the stated location.",
+                )
+            ],
+            confidence="high",
+            needs_human_review=False,
+            issues=[],
+        )
+
+    monkeypatch.setattr("fact_form_importer.cli.normalise_fields_with_llm", fake_normalise)
+
+    exit_code = main(["llm-test"])
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "LLM normalisation test: OK" in captured.out
+    assert "LLM called by this command: True" in captured.out
+    assert "Pipeline LLM enabled for run: False" in captured.out
+    assert "OpenAI model: gpt-5.5" in captured.out
+    assert "Input fields:" in captured.out
+    assert "raw: Ask security. Disabled toilet near reception." in captured.out
+    assert "Output fields:" in captured.out
+    assert "value: Accessible toilet near reception." in captured.out
+    assert "Issues:" in captured.out
+    assert "- None" in captured.out
+    assert "Result:" in captured.out
+    assert "confidence: high" in captured.out
+
+
+def test_llm_test_command_reports_errors(capsys, monkeypatch):
+    def fake_normalise(request, config):
+        raise ValueError("OPENAI_API_KEY is required for normalise_fields_with_llm")
+
+    monkeypatch.setattr("fact_form_importer.cli.normalise_fields_with_llm", fake_normalise)
+
+    exit_code = main(["llm-test"])
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "OPENAI_API_KEY is required for normalise_fields_with_llm" in captured.err
+
+
 def _write_minimal_forms_csv(path):
     mapping = load_column_mapping(Path("config/column_mapping.json"))
     columns = mapping.expected_columns()
