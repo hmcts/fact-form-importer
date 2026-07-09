@@ -1,4 +1,5 @@
 import pytest
+import builtins
 
 from fact_form_importer.cleaners.booleans import normalise_yes_no
 from fact_form_importer.cleaners.emails import extract_email_addresses, normalise_email
@@ -57,6 +58,25 @@ def test_normalise_email():
     assert result.issues[0].code == "INVALID_EMAIL"
 
 
+def test_normalise_email_fallback_when_email_validator_is_unavailable(monkeypatch):
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "email_validator":
+            raise ModuleNotFoundError("email_validator")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    assert normalise_email("USER@Example.COM").value == "user@example.com"
+    assert normalise_email("Email court@example.com for help").value == "court@example.com"
+
+    result = normalise_email("not an email")
+
+    assert result.value == "not an email"
+    assert result.issues[0].code == "INVALID_EMAIL"
+
+
 def test_extract_email_addresses():
     assert extract_email_addresses("Email A@Example.COM or b@example.com.") == [
         "a@example.com",
@@ -69,6 +89,26 @@ def test_normalise_uk_phone():
     assert normalise_uk_phone("Call 0208 603 0440 or email test@example.com").value == (
         "020 8603 0440"
     )
+
+    result = normalise_uk_phone("not a phone")
+
+    assert result.value == "not a phone"
+    assert result.issues[0].code == "INVALID_PHONE"
+
+
+def test_normalise_uk_phone_fallback_when_phonenumbers_is_unavailable(monkeypatch):
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "phonenumbers":
+            raise ModuleNotFoundError("phonenumbers")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    assert normalise_uk_phone("+44 20 7946 0000").value == "020 7946 0000"
+    assert extract_uk_phones("02079460000") == ["020 7946 0000"]
+    assert extract_uk_phones("not a phone") == []
 
     result = normalise_uk_phone("not a phone")
 
@@ -192,6 +232,18 @@ def test_parse_time_cell(value, expected_value, expected_status):
 
 def test_parse_time_cell_invalid():
     result = parse_time_cell("25:99")
+
+    assert result.value is None
+    assert result.status == "invalid"
+    assert result.issues[0].code == "INVALID_TIME"
+
+
+def test_parse_time_cell_handles_meridiem_and_text_failures():
+    assert parse_time_cell("12:00 am").value == "00:00"
+    assert parse_time_cell("12:00 pm").value == "12:00"
+    assert parse_time_cell("1:05 pm").value == "13:05"
+
+    result = parse_time_cell("ten past nine")
 
     assert result.value is None
     assert result.status == "invalid"

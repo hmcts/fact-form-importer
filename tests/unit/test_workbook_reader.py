@@ -50,6 +50,56 @@ def test_ingest_workbook_creates_submissions_and_outputs(tmp_path):
     assert summary["failed"] == 1
 
 
+def test_ingest_workbook_handles_header_only_file(tmp_path):
+    mapping = load_column_mapping(Path("config/column_mapping.json"))
+    csv_path = tmp_path / "header-only.csv"
+    output_path = tmp_path / "out"
+    header = [""] * (max(excel_column_index(column.column) for column in mapping.expected_columns()) + 1)
+
+    for column in mapping.expected_columns():
+        header[excel_column_index(column.column)] = column.expected_header or column.field
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(header)
+
+    result = ingest_workbook(csv_path, output_path)
+
+    assert result.submissions == []
+    assert result.skipped_empty_rows == 0
+    assert (output_path / "ingest_summary.json").exists()
+
+
+def test_ingest_workbook_handles_empty_file(tmp_path):
+    csv_path = tmp_path / "empty.csv"
+    output_path = tmp_path / "out"
+    csv_path.write_text("", encoding="utf-8")
+
+    result = ingest_workbook(csv_path, output_path)
+
+    assert result.submissions == []
+    assert result.skipped_empty_rows == 0
+    assert (output_path / "ingest_summary.json").exists()
+
+
+def test_ingest_workbook_marks_invalid_slug_as_failed(tmp_path):
+    mapping = load_column_mapping(Path("config/column_mapping.json"))
+    csv_path = tmp_path / "submissions.csv"
+    rows = _build_ingest_rows(mapping)
+    valid = rows[1]
+    _set(valid, "G", "!!!")
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerows(rows)
+
+    result = ingest_workbook(csv_path)
+
+    submission = result.submissions[0]
+    assert submission.status == "failed"
+    assert submission.issues[0].code == "INVALID_COURT_IDENTIFIER"
+
+
 def test_ingest_workbook_strips_counter_service_midnight_placeholders(tmp_path):
     mapping = load_column_mapping(Path("config/column_mapping.json"))
     csv_path = tmp_path / "submissions.csv"
@@ -96,6 +146,27 @@ def test_ingest_workbook_moves_misplaced_contact_email_from_phone_field(tmp_path
     assert contact.phone is None
     assert contact.email == "enquiries@example.com"
     assert all(issue.code != "INVALID_PHONE" for issue in result.submissions[0].issues)
+
+
+def test_ingest_workbook_moves_misplaced_contact_phone_from_email_field(tmp_path):
+    mapping = load_column_mapping(Path("config/column_mapping.json"))
+    csv_path = tmp_path / "submissions.csv"
+    output_path = tmp_path / "out"
+    rows = _build_ingest_rows(mapping)
+    valid = rows[1]
+    _set(valid, "CZ", "")
+    _set(valid, "DA", "0207 946 0005")
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerows(rows)
+
+    result = ingest_workbook(csv_path, output_path)
+
+    contact = result.submissions[0].contacts[0]
+    assert contact.phone == "020 7946 0005"
+    assert contact.email is None
+    assert all(issue.code != "INVALID_EMAIL" for issue in result.submissions[0].issues)
 
 
 def _build_ingest_rows(mapping):

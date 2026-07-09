@@ -3,6 +3,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+import fact_form_importer.validators.vocabularies as vocab_module
 from fact_form_importer.config import AppConfig
 from fact_form_importer.validators.vocabularies import (
     Vocabularies,
@@ -46,6 +47,17 @@ def test_normalised_vocab_match_is_case_and_space_insensitive():
 
     assert match is not None
     assert match.code == "family_court_enquiries"
+
+
+def test_vocab_matches_return_none_for_empty_or_missing_values():
+    vocabularies = load_vocabularies(AppConfig().vocabularies_path)
+
+    assert vocabularies.exact_vocab_match(None, "court_types") is None
+    assert vocabularies.exact_vocab_match("   ", "court_types") is None
+    assert vocabularies.exact_vocab_match("Missing", "court_types") is None
+    assert vocabularies.normalised_vocab_match(None, "court_types") is None
+    assert vocabularies.normalised_vocab_match("   ", "court_types") is None
+    assert vocabularies.normalised_vocab_match("Missing", "court_types") is None
 
 
 def test_value_in_vocab_accepts_code_name_or_alias():
@@ -100,9 +112,42 @@ def test_vocabularies_support_wrapped_shape_for_future_sources():
     assert vocabularies.value_in_vocab("visit", "address_types") is True
 
 
+def test_default_vocabularies_loads_when_module_global_is_empty():
+    vocab_module._DEFAULT_VOCABULARIES = None
+
+    match = exact_vocab_match("Court open", "opening_hour_types")
+
+    assert match is not None
+    assert match.code == "court_open"
+
+
 def test_vocabularies_reject_empty_or_blank_values():
+    with pytest.raises(ValidationError):
+        Vocabularies.model_validate(["not", "a", "dict"])
+
     with pytest.raises(ValidationError, match="At least one vocabulary"):
         Vocabularies(version="test.1", vocabularies={})
+
+    with pytest.raises(ValidationError, match="At least one vocabulary"):
+        Vocabularies(version="test.1")
+
+    with pytest.raises(ValidationError, match="Vocabulary names must not be blank"):
+        Vocabularies(
+            version="test.1",
+            vocabularies={
+                " ": [
+                    {"code": "visit", "name": "Visit"},
+                ]
+            },
+        )
+
+    with pytest.raises(ValidationError, match="must contain at least one entry"):
+        Vocabularies(
+            version="test.1",
+            vocabularies={
+                "address_types": [],
+            },
+        )
 
     with pytest.raises(ValidationError, match="must not be blank"):
         Vocabularies(

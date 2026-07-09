@@ -1,7 +1,10 @@
+import json
 from pathlib import Path
 
 from fact_form_importer.ingest.column_mapping import (
     build_raw_row,
+    excel_column_index,
+    excel_column_letter,
     get_cell,
     headers_broadly_match,
     load_column_mapping,
@@ -66,3 +69,42 @@ def test_build_raw_row_returns_excel_letter_keys():
         "C": "completion",
     }
     assert build_raw_row({"a": "id"}) == {"A": "id"}
+
+
+def test_column_helpers_reject_invalid_values():
+    try:
+        excel_column_index("A1")
+    except ValueError as exc:
+        assert "Invalid Excel column letter" in str(exc)
+    else:
+        raise AssertionError("Expected invalid column letter to fail")
+
+    try:
+        excel_column_letter(-1)
+    except ValueError as exc:
+        assert "zero or greater" in str(exc)
+    else:
+        raise AssertionError("Expected negative column index to fail")
+
+
+def test_load_column_mapping_warns_for_duplicate_config_columns(tmp_path):
+    path = tmp_path / "column_mapping.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "metadata": [
+                    {"field": "forms_id", "column": "A", "expected_header": "ID"},
+                ],
+                "scalars": [
+                    {"field": "court_slug_raw", "column": "A", "expected_header": "Court slug"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    mapping = load_column_mapping(path)
+
+    assert mapping.warnings[0].code == "duplicate_mapping_column"
+    assert mapping.warnings[0].column == "A"

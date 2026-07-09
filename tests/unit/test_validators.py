@@ -14,11 +14,13 @@ from fact_form_importer.validators.base import (
     COURT_SLUG_SUGGESTED,
     DUPLICATE_COURT_SLUG,
     INVALID_EMAIL,
+    INVALID_TIME,
     INVALID_PHONE,
     INVALID_POSTCODE,
     MISSING_COURT_IDENTIFIER,
     OPENING_HOURS_AMBIGUOUS,
     VOCAB_NO_MATCH,
+    calculate_status,
 )
 from fact_form_importer.validators.fact_api_courts import CourtSlugSuggestion
 from fact_form_importer.validators.business_rules import (
@@ -48,6 +50,21 @@ def test_validate_submission_marks_invalid_optional_email_and_phone_as_warnings(
     assert validated.status == "processed_with_warnings"
     assert _has_issue(validated, INVALID_EMAIL)
     assert _has_issue(validated, INVALID_PHONE)
+
+
+def test_calculate_status_failed_for_any_error_issue():
+    submission = _submission(
+        issues=[
+            Issue(
+                field="example",
+                code="SOME_ERROR",
+                severity="error",
+                message="Fatal schema problem",
+            )
+        ]
+    )
+
+    assert calculate_status(submission) == "failed"
 
 
 def test_validate_submission_marks_slug_normalisation_as_warning_status():
@@ -176,6 +193,54 @@ def test_validate_submission_marks_ambiguous_opening_hours_for_review():
     assert _has_issue(validated, OPENING_HOURS_AMBIGUOUS)
 
 
+def test_validate_submission_marks_known_text_opening_hours_for_review():
+    submission = _submission(
+        opening_hours=[
+            OpeningHoursSet(
+                index=1,
+                type="Court open",
+                monday_to_friday=OpeningTime(status="known_text_status"),
+            )
+        ]
+    )
+
+    validated = validate_submission(submission)
+
+    assert validated.status == "needs_human_review"
+    assert _has_issue(validated, OPENING_HOURS_AMBIGUOUS)
+
+
+def test_validate_submission_marks_bad_time_format_for_review():
+    submission = _submission(
+        opening_hours=[
+            OpeningHoursSet(
+                index=1,
+                type="Court open",
+                monday_to_friday=OpeningTime(open="9am", close="17:00", status="valid_time"),
+            )
+        ]
+    )
+
+    validated = validate_submission(submission)
+
+    assert validated.status == "needs_human_review"
+    assert _has_issue(validated, INVALID_TIME)
+
+
+def test_validate_submission_accepts_counter_appointment_contact_as_email_or_phone():
+    phone_submission = _submission(counter_service={"appointment_contact": "020 7946 0000"})
+    email_submission = _submission(counter_service={"appointment_contact": "court@example.com"})
+    invalid_submission = _submission(counter_service={"appointment_contact": "front desk"})
+
+    assert validate_submission(phone_submission).status == "processed"
+    assert validate_submission(email_submission).status == "processed"
+
+    validated_invalid = validate_submission(invalid_submission)
+
+    assert validated_invalid.status == "processed_with_warnings"
+    assert _has_issue(validated_invalid, INVALID_EMAIL)
+
+
 def test_validate_submission_checks_vocabularies_when_available():
     vocabularies = load_vocabularies("config/vocabularies.example.json")
     submission = _submission(
@@ -272,6 +337,33 @@ def test_validate_all_submissions_caches_court_slug_lookups():
     )
 
     assert calls == ["same-court", "other-court"]
+
+
+def test_validate_all_submissions_caches_court_slug_suggestions():
+    calls = []
+    submissions = [
+        _submission(row_number=2, court_slug="missing-court", court_slug_raw="Missing Court"),
+        _submission(row_number=3, court_slug="missing-court", court_slug_raw="Missing Court"),
+    ]
+
+    def suggest(slug, raw_value):
+        calls.append((slug, raw_value))
+        return CourtSlugSuggestion(
+            submitted_slug=slug,
+            suggested_slug="missing-court-and-tribunal",
+            suggested_court_name="Missing Court and Tribunal",
+            confidence=0.6,
+            query="missing court",
+            reason="Possible match",
+        )
+
+    validate_all_submissions(
+        submissions,
+        court_slug_exists=lambda slug: False,
+        court_slug_suggester=suggest,
+    )
+
+    assert calls == [("missing-court", "Missing Court")]
 
 
 def test_validate_submission_preserves_existing_cleaner_issues_without_duplicates():

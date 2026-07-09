@@ -40,12 +40,13 @@ Activates the local environment so commands use the project dependencies.
 
 ```bash
 python3 -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing --cov-report=json:coverage.json
-python3 scripts/check_coverage.py coverage.json --fail-under 90
+python3 scripts/check_coverage.py coverage.json --fail-under 90 --core-fail-under 95
 ```
 
-Runs the unit suite with the same exact 90% coverage threshold used before
-pushing. The second command checks the unrounded coverage JSON value, so a run
-at `89.92%` fails even if the terminal table rounds it to `90%`.
+Runs the unit suite with the same exact coverage thresholds used before
+pushing. The second command checks the unrounded coverage JSON values: global
+coverage must be at least 90%, and deterministic core groups must be at least
+95%.
 
 ```bash
 python3 -m fact_form_importer profile --input "./input/microsoft-forms-export.xlsx" --output "./out"
@@ -110,11 +111,12 @@ Run the unit suite with the same coverage threshold used by the pre-push hook:
 
 ```bash
 python3 -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing --cov-report=json:coverage.json
-python3 scripts/check_coverage.py coverage.json --fail-under 90
+python3 scripts/check_coverage.py coverage.json --fail-under 90 --core-fail-under 95
 ```
 
-Coverage is checked against the exact unrounded percentage and fails below
-90%.
+Coverage is checked against exact unrounded percentages. The global threshold
+is 90%; deterministic core coverage is checked at 95% for cleaners, ingestion
+core, and validators.
 
 ### 2. Configure local environment
 

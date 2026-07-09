@@ -14,4 +14,4 @@ if ! "$PYTHON_BIN" -c "import pytest_cov" >/dev/null 2>&1; then
 fi
 
 "$PYTHON_BIN" -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing --cov-report=json:coverage.json
-"$PYTHON_BIN" scripts/check_coverage.py coverage.json --fail-under 90
+"$PYTHON_BIN" scripts/check_coverage.py coverage.json --fail-under 90 --core-fail-under 95
