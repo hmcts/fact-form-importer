@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fact_form_importer.cleaners.booleans import normalise_yes_no
-from fact_form_importer.cleaners.emails import normalise_email
+from fact_form_importer.cleaners.emails import extract_email_addresses, normalise_email
 from fact_form_importer.cleaners.multiselect import split_multiselect
-from fact_form_importer.cleaners.phones import normalise_uk_phone
+from fact_form_importer.cleaners.phones import extract_uk_phones, normalise_uk_phone
 from fact_form_importer.cleaners.postcodes import normalise_uk_postcode
 from fact_form_importer.cleaners.slug import normalise_court_slug
 from fact_form_importer.cleaners.strings import null_if_empty_like
@@ -379,13 +379,14 @@ def _build_contacts(
             continue
 
         refs = {column_ref.field: column_ref for column_ref in group.columns}
+        phone, email = _clean_contact_phone_email_pair(raw_row, refs, issues)
         contacts.append(
             ContactDetail(
                 index=group.index,
                 description=_clean_string_ref(raw_row, refs["description"]),
                 explanation=_clean_string_ref(raw_row, refs["explanation"]),
-                phone=_clean_phone_ref(raw_row, refs["phone"], issues),
-                email=_clean_email_ref(raw_row, refs["email"], issues),
+                phone=phone,
+                email=email,
             )
         )
 
@@ -507,6 +508,28 @@ def _clean_phone_ref(
     result = normalise_uk_phone(get_cell(raw_row, column_ref.column), column_ref.field)
     issues.extend(result.issues)
     return result.value
+
+
+def _clean_contact_phone_email_pair(
+    raw_row: dict[str, Any],
+    refs: dict[str, ColumnRef],
+    issues: list[Issue],
+) -> tuple[Optional[str], Optional[str]]:
+    raw_phone = get_cell(raw_row, refs["phone"].column)
+    raw_email = get_cell(raw_row, refs["email"].column)
+
+    phone_emails = extract_email_addresses(raw_phone)
+    email_phones = extract_uk_phones(raw_email)
+
+    if null_if_empty_like(raw_email) is None and phone_emails and not extract_uk_phones(raw_phone):
+        return None, phone_emails[0]
+
+    if null_if_empty_like(raw_phone) is None and email_phones and not extract_email_addresses(raw_email):
+        return email_phones[0], None
+
+    phone = _clean_phone_ref(raw_row, refs["phone"], issues)
+    email = _clean_email_ref(raw_row, refs["email"], issues)
+    return phone, email
 
 
 def _clean_email_ref(

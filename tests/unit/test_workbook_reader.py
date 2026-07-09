@@ -77,6 +77,27 @@ def test_ingest_workbook_strips_counter_service_midnight_placeholders(tmp_path):
     assert submission.opening_hours[0].monday_to_friday.close == "00:00"
 
 
+def test_ingest_workbook_moves_misplaced_contact_email_from_phone_field(tmp_path):
+    mapping = load_column_mapping(Path("config/column_mapping.json"))
+    csv_path = tmp_path / "submissions.csv"
+    output_path = tmp_path / "out"
+    rows = _build_ingest_rows(mapping)
+    valid = rows[1]
+    _set(valid, "CZ", "enquiries@example.com")
+    _set(valid, "DA", "")
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerows(rows)
+
+    result = ingest_workbook(csv_path, output_path)
+
+    contact = result.submissions[0].contacts[0]
+    assert contact.phone is None
+    assert contact.email == "enquiries@example.com"
+    assert all(issue.code != "INVALID_PHONE" for issue in result.submissions[0].issues)
+
+
 def _build_ingest_rows(mapping):
     columns = mapping.expected_columns()
     max_index = max(excel_column_index(column.column) for column in columns)

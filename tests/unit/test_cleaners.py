@@ -1,11 +1,12 @@
 import pytest
 
 from fact_form_importer.cleaners.booleans import normalise_yes_no
-from fact_form_importer.cleaners.emails import normalise_email
+from fact_form_importer.cleaners.emails import extract_email_addresses, normalise_email
 from fact_form_importer.cleaners.multiselect import split_multiselect
 from fact_form_importer.cleaners.phones import (
     _fallback_format_phone,
     _looks_like_uk_phone,
+    extract_uk_phones,
     normalise_uk_phone,
 )
 from fact_form_importer.cleaners.postcodes import normalise_uk_postcode
@@ -40,6 +41,10 @@ def test_normalise_court_slug(value, expected):
 
 def test_normalise_email():
     assert normalise_email(" USER@Example.COM ").value == "user@example.com"
+    assert normalise_email("Email admin@example.com for help").value == "admin@example.com"
+    assert normalise_email("\u200blondonfamily@supportthroughcourt.org").value == (
+        "londonfamily@supportthroughcourt.org"
+    )
 
     result = normalise_email("not an email")
 
@@ -47,13 +52,30 @@ def test_normalise_email():
     assert result.issues[0].code == "INVALID_EMAIL"
 
 
+def test_extract_email_addresses():
+    assert extract_email_addresses("Email A@Example.COM or b@example.com.") == [
+        "a@example.com",
+        "b@example.com",
+    ]
+
+
 def test_normalise_uk_phone():
     assert normalise_uk_phone("02079460000").value == "020 7946 0000"
+    assert normalise_uk_phone("Call 0208 603 0440 or email test@example.com").value == (
+        "020 8603 0440"
+    )
 
     result = normalise_uk_phone("not a phone")
 
     assert result.value == "not a phone"
     assert result.issues[0].code == "INVALID_PHONE"
+
+
+def test_extract_uk_phones():
+    assert extract_uk_phones("Call 0207 073 4112 and 0207 073 4157") == [
+        "020 7073 4112",
+        "020 7073 4157",
+    ]
 
 
 def test_phone_fallback_helpers():

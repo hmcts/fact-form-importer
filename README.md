@@ -117,7 +117,10 @@ API payload. Counter service opening times with both open and close set to
 `00:00` are stripped during ingestion because product guidance says this means
 the counter has different times that should be added manually in the admin
 portal. This rule is scoped to counter service times and does not change general
-court opening-hours records.
+court opening-hours records. Phone and email cleaners also extract the first
+valid UK phone number or email address from free text, and contact-detail phone
+and email pairs move misplaced values into the paired empty field where safe.
+The original spreadsheet text remains available in `submissions_raw.json`.
 
 `ingest_summary.json` contains counts for ingested submissions, skipped empty
 rows, failed rows, warning rows, and mapping warnings. Use it as the first check

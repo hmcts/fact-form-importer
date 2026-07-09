@@ -15,6 +15,9 @@ def normalise_uk_phone(value: object, field: str = "phone") -> CleaningResult:
         return CleaningResult(value=None)
 
     candidate = cleaned
+    extracted = extract_uk_phones(candidate)
+    if extracted:
+        return CleaningResult(value=extracted[0])
 
     try:
         import phonenumbers
@@ -46,6 +49,31 @@ def normalise_uk_phone(value: object, field: str = "phone") -> CleaningResult:
             )
         ],
     )
+
+
+def extract_uk_phones(value: object) -> list[str]:
+    cleaned = null_if_empty_like(value)
+    if cleaned is None:
+        return []
+
+    try:
+        import phonenumbers
+
+        numbers = []
+        for match in phonenumbers.PhoneNumberMatcher(cleaned, "GB"):
+            parsed = match.number
+            if phonenumbers.is_possible_number(parsed):
+                numbers.append(
+                    phonenumbers.format_number(
+                        parsed,
+                        phonenumbers.PhoneNumberFormat.NATIONAL,
+                    )
+                )
+        return numbers
+    except ModuleNotFoundError:
+        if _looks_like_uk_phone(cleaned):
+            return [_fallback_format_phone(cleaned)]
+        return []
 
 
 def _looks_like_uk_phone(value: str) -> bool:
