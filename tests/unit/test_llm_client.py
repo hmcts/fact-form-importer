@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from fact_form_importer.config import AppConfig
-from fact_form_importer.llm.client import build_llm_test_request, normalise_fields_with_llm
-from fact_form_importer.llm.openai_client import check_llm_connection
+from fact_form_importer.llm.client import build_llm_test_request, normalise_fields_with_llm, _response_json
+from fact_form_importer.llm.openai_client import check_llm_connection, _response_preview
 
 
 def test_check_llm_connection_calls_openai_responses_api(monkeypatch):
@@ -42,6 +42,11 @@ def test_check_llm_connection_requires_openai_config(monkeypatch):
 
     with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
         check_llm_connection(AppConfig(), client_factory=lambda **kwargs: None)
+
+
+def test_response_preview_supports_output_and_fallback_shapes():
+    assert _response_preview(SimpleNamespace(output=[" OK from output "])) == "OK from output"
+    assert _response_preview(" OK from string ") == "OK from string"
 
 
 def test_normalise_fields_with_llm_uses_structured_json_output(monkeypatch):
@@ -106,3 +111,18 @@ def test_normalise_fields_with_llm_requires_openai_config(monkeypatch):
 
     with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
         normalise_fields_with_llm(build_llm_test_request(), AppConfig(), client_factory=lambda **kwargs: None)
+
+
+def test_response_json_supports_nested_output_content_and_fallback():
+    nested_response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                content=[
+                    SimpleNamespace(text='{"record_id": "nested"}')
+                ]
+            )
+        ]
+    )
+
+    assert _response_json(nested_response) == {"record_id": "nested"}
+    assert _response_json('{"record_id": "fallback"}') == {"record_id": "fallback"}

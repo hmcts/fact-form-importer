@@ -39,10 +39,13 @@ source .venv/bin/activate
 Activates the local environment so commands use the project dependencies.
 
 ```bash
-python3 -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing
+python3 -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing --cov-report=json:coverage.json
+python3 scripts/check_coverage.py coverage.json --fail-under 90
 ```
 
-Runs the unit suite with the same 90% coverage threshold used before pushing.
+Runs the unit suite with the same exact 90% coverage threshold used before
+pushing. The second command checks the unrounded coverage JSON value, so a run
+at `89.92%` fails even if the terminal table rounds it to `90%`.
 
 ```bash
 python3 -m fact_form_importer profile --input "./input/microsoft-forms-export.xlsx" --output "./out"
@@ -106,10 +109,12 @@ source .venv/bin/activate
 Run the unit suite with the same coverage threshold used by the pre-push hook:
 
 ```bash
-python3 -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing
+python3 -m pytest tests/unit --cov=fact_form_importer --cov-report=term-missing --cov-report=json:coverage.json
+python3 scripts/check_coverage.py coverage.json --fail-under 90
 ```
 
-Coverage is configured to fail below 90%.
+Coverage is checked against the exact unrounded percentage and fails below
+90%.
 
 ### 2. Configure local environment
 
