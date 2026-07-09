@@ -10,6 +10,7 @@ from typing import Optional
 from fact_form_importer.config import AppConfig
 from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
+from fact_form_importer.llm.openai_client import check_llm_connection
 from fact_form_importer.output.logs import write_processing_outputs
 from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
 from fact_form_importer.output.submitters import write_submitter_outputs
@@ -67,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Directory for generated ingest outputs.",
     )
+
+    subparsers.add_parser("check-llm", help="Check the configured OpenAI-compatible LLM endpoint.")
 
     return parser
 
@@ -180,6 +183,22 @@ def ingest(input_path: Path, output_path: Path) -> int:
     return 0
 
 
+def check_llm() -> int:
+    try:
+        config = AppConfig()
+        result = check_llm_connection(config)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print("LLM connection: OK")
+    print(f"LLM enabled: {config.llm_enabled}")
+    print(f"OpenAI base URL: {result.base_url}")
+    print(f"OpenAI model: {result.model}")
+    print(f"Response preview: {result.output_preview}")
+    return 0
+
+
 def _load_fact_api_services_for_run(
     config: AppConfig | None = None,
     allow_local_vocabularies: bool = False,
@@ -259,6 +278,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "ingest":
         return ingest(args.input, args.output)
+
+    if args.command == "check-llm":
+        return check_llm()
 
     parser.error(f"Unknown command: {args.command}")
     return 2

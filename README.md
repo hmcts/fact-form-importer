@@ -65,6 +65,16 @@ The OpenAI client will use the newer `from openai import OpenAI` style with
 `base_url`, `api_key`, and `model`; no separate Azure OpenAI API version is
 configured.
 
+To sanity-check the configured endpoint, API key, and model without running the
+import pipeline:
+
+```bash
+python3 -m fact_form_importer check-llm
+```
+
+This sends a tiny prompt and prints the endpoint, model, `LLM_ENABLED` state,
+and response preview. It does not read the spreadsheet or write import outputs.
+
 ### 3. Add the source spreadsheet
 
 Place the Microsoft Forms export in `input/`. Spreadsheet files in this

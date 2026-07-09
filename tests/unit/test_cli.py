@@ -1,6 +1,7 @@
 import json
 import csv
 from pathlib import Path
+from types import SimpleNamespace
 
 from fact_form_importer.ingest.column_mapping import excel_column_index, load_column_mapping
 from fact_form_importer.cli import main
@@ -146,6 +147,42 @@ def test_ingest_command_returns_error_for_missing_file(tmp_path, capsys):
 
     assert exit_code == 1
     assert "Error:" in captured.err
+
+
+def test_check_llm_command_reports_connection(capsys, monkeypatch):
+    monkeypatch.setenv("LLM_ENABLED", "false")
+
+    def fake_check(config):
+        return SimpleNamespace(
+            base_url="https://ai-foundry.example.test/openai/v1",
+            model="gpt-5.5",
+            output_preview="OK",
+        )
+
+    monkeypatch.setattr("fact_form_importer.cli.check_llm_connection", fake_check)
+
+    exit_code = main(["check-llm"])
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "LLM connection: OK" in captured.out
+    assert "LLM enabled: False" in captured.out
+    assert "OpenAI model: gpt-5.5" in captured.out
+
+
+def test_check_llm_command_reports_errors(capsys, monkeypatch):
+    def fake_check(config):
+        raise ValueError("OPENAI_API_KEY is required for check-llm")
+
+    monkeypatch.setattr("fact_form_importer.cli.check_llm_connection", fake_check)
+
+    exit_code = main(["check-llm"])
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "OPENAI_API_KEY is required for check-llm" in captured.err
 
 
 def _write_minimal_forms_csv(path):
