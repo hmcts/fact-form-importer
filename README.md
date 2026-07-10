@@ -144,6 +144,24 @@ The OpenAI client will use the newer `from openai import OpenAI` style with
 `base_url`, `api_key`, and `model`; no separate Azure OpenAI API version is
 configured.
 
+#### LLM field selection
+
+LLM use is deliberately split into two steps. The current code can select which
+fields would be safe to send to the model, but the main `run` command still
+does not call the LLM.
+
+Selection is handled by `fact_form_importer.llm.normalise.select_llm_fields`.
+It uses `config/field_rules.json` and the loaded vocabularies to build a small
+allow-list of candidate fields. It never sends the full spreadsheet row,
+metadata, slugs, postcodes, phone numbers, email addresses, yes/no values, or
+ordinary opening-hours time fields.
+
+For controlled vocabulary fields, Python gets first pass. If the value already
+matches the configured vocabulary exactly or after normalisation, it is not sent
+to the LLM. Only unresolved public-facing text or ambiguous vocabulary values
+are selected. Companion helpers then return only the allowed vocabulary list and
+field-specific LLM rules relevant to those selected fields.
+
 To sanity-check the configured endpoint, API key, and model without running the
 import pipeline:
 

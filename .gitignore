@@ -209,6 +209,7 @@ tempCodeRunnerFile.py
 .ruff_cache/
 
 # fact-form-importer local outputs
+AGENTS.local.md
 input/*.csv
 input/*.xls
 input/*.xlsx
