@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 
 from fact_form_importer.config import AppConfig
-from fact_form_importer.llm.client import build_llm_test_request, normalise_fields_with_llm, _response_json
+from fact_form_importer.llm.client import (
+    LlmResponseParseError,
+    build_llm_test_request,
+    normalise_fields_with_llm,
+    _response_json,
+)
 from fact_form_importer.llm.openai_client import check_llm_connection, _response_preview
 
 
@@ -126,3 +131,20 @@ def test_response_json_supports_nested_output_content_and_fallback():
 
     assert _response_json(nested_response) == {"record_id": "nested"}
     assert _response_json('{"record_id": "fallback"}') == {"record_id": "fallback"}
+
+
+def test_normalise_fields_with_llm_wraps_invalid_structured_responses(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://ai-foundry.example.test/openai/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "token")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-5.5")
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            return SimpleNamespace(output_text="not-json")
+
+    class FakeClient:
+        def __init__(self, base_url, api_key):
+            self.responses = FakeResponses()
+
+    with pytest.raises(LlmResponseParseError, match="expected structured schema"):
+        normalise_fields_with_llm(build_llm_test_request(), AppConfig(), client_factory=FakeClient)

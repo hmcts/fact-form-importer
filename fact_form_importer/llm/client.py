@@ -6,10 +6,15 @@ import json
 from typing import Any, Callable
 
 from openai import OpenAI
+from pydantic import ValidationError
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.llm.prompts import SYSTEM_PROMPT, build_llm_input
 from fact_form_importer.llm.schemas import LlmField, LlmNormalisationRequest, LlmNormalisationResponse
+
+
+class LlmResponseParseError(ValueError):
+    """The model responded, but its structured response could not be parsed."""
 
 
 def normalise_fields_with_llm(
@@ -20,7 +25,7 @@ def normalise_fields_with_llm(
     """Normalise selected fields using the configured OpenAI-compatible endpoint."""
 
     app_config = config or AppConfig()
-    _validate_openai_config(app_config, command_name="normalise_fields_with_llm")
+    validate_openai_config(app_config, command_name="normalise_fields_with_llm")
 
     client = client_factory(
         base_url=app_config.openai_base_url,
@@ -40,10 +45,15 @@ def normalise_fields_with_llm(
         },
     )
 
-    return LlmNormalisationResponse.model_validate(_response_json(response))
+    try:
+        return LlmNormalisationResponse.model_validate(_response_json(response))
+    except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+        raise LlmResponseParseError("LLM response did not match the expected structured schema") from exc
 
 
-def _validate_openai_config(config: AppConfig, command_name: str) -> None:
+def validate_openai_config(config: AppConfig, command_name: str) -> None:
+    """Fail before model calls when the OpenAI-compatible configuration is incomplete."""
+
     if not config.openai_base_url:
         raise ValueError(f"OPENAI_BASE_URL is required for {command_name}")
     if not config.openai_api_key:

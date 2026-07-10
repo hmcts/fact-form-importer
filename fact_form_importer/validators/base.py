@@ -26,6 +26,13 @@ INVALID_POSTCODE = "INVALID_POSTCODE"
 INVALID_TIME = "INVALID_TIME"
 VOCAB_NO_MATCH = "VOCAB_NO_MATCH"
 OPENING_HOURS_AMBIGUOUS = "OPENING_HOURS_AMBIGUOUS"
+LLM_NORMALISATION_FAILED = "LLM_NORMALISATION_FAILED"
+LLM_LOW_CONFIDENCE = "LLM_LOW_CONFIDENCE"
+LLM_REVIEW_REQUIRED = "LLM_REVIEW_REQUIRED"
+LLM_RETURNED_INVALID_VOCAB_VALUE = "LLM_RETURNED_INVALID_VOCAB_VALUE"
+LLM_RETURNED_INVALID_VALUE = "LLM_RETURNED_INVALID_VALUE"
+LLM_RETURNED_UNEXPECTED_FIELD = "LLM_RETURNED_UNEXPECTED_FIELD"
+LLM_RETURNED_SENSITIVE_VALUE = "LLM_RETURNED_SENSITIVE_VALUE"
 
 FAILED_ISSUE_CODES = {
     MISSING_COURT_IDENTIFIER,
@@ -37,6 +44,13 @@ HUMAN_REVIEW_ISSUE_CODES = {
     INVALID_TIME,
     VOCAB_NO_MATCH,
     OPENING_HOURS_AMBIGUOUS,
+    LLM_NORMALISATION_FAILED,
+    LLM_LOW_CONFIDENCE,
+    LLM_REVIEW_REQUIRED,
+    LLM_RETURNED_INVALID_VOCAB_VALUE,
+    LLM_RETURNED_INVALID_VALUE,
+    LLM_RETURNED_UNEXPECTED_FIELD,
+    LLM_RETURNED_SENSITIVE_VALUE,
 }
 WARNING_STATUS_ISSUE_CODES = {
     COURT_SLUG_NORMALISED,
@@ -44,6 +58,20 @@ WARNING_STATUS_ISSUE_CODES = {
     COURT_SLUG_SUGGESTED,
     INVALID_EMAIL,
     INVALID_PHONE,
+}
+VALIDATION_ISSUE_CODES = {
+    MISSING_COURT_IDENTIFIER,
+    COURT_SLUG_NORMALISED,
+    COURT_SLUG_NOT_FOUND,
+    COURT_SLUG_SUGGESTED,
+    COURT_SLUG_AUTO_REPAIRED,
+    DUPLICATE_COURT_SLUG,
+    INVALID_EMAIL,
+    INVALID_PHONE,
+    INVALID_POSTCODE,
+    INVALID_TIME,
+    VOCAB_NO_MATCH,
+    OPENING_HOURS_AMBIGUOUS,
 }
 COURT_SLUG_AUTO_REPAIR_CONFIDENCE_THRESHOLD = 0.95
 TIME_PATTERN = re.compile(r"^\d{2}:\d{2}$")
@@ -127,6 +155,19 @@ def add_issue_once(submission: CourtSubmission, issue: Issue) -> None:
         for existing in submission.issues
     ):
         submission.issues.append(issue)
+
+
+def clear_validation_issues(submissions: Iterable[CourtSubmission]) -> None:
+    """Remove derived validation issues before validating changed submissions again.
+
+    Ingest/cleaner and LLM audit issues are deliberately retained. Validation
+    issues are rebuilt from the current cleaned model values.
+    """
+
+    for submission in submissions:
+        submission.issues = [
+            issue for issue in submission.issues if issue.code not in VALIDATION_ISSUE_CODES
+        ]
 
 
 def _validate_required_court_slug(submission: CourtSubmission) -> None:

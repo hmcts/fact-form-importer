@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -43,7 +43,9 @@ class LlmNormalisedField(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     field: str
-    value: Optional[str]
+    # Some approved fields are Microsoft Forms multi-select values, so an LLM
+    # may safely return either one canonical value or a canonical value list.
+    value: Optional[Union[str, List[str]]]
     confidence: Confidence
     needs_human_review: bool
     reason: str

@@ -487,6 +487,8 @@ def _build_time_from_refs(
     status = "valid_time"
     if open_result.status == "invalid" or close_result.status == "invalid":
         status = "invalid"
+    elif open_result.status == "known_text_status" or close_result.status == "known_text_status":
+        status = "known_text_status"
 
     return OpeningTime(
         open=open_result.value,

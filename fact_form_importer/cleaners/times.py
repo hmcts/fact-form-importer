@@ -14,6 +14,7 @@ KNOWN_TEXT_STATUSES = {
     "by appointment only",
     "no counter service",
     "no counter service available",
+    "counter service not available",
     "closed",
 }
 TIME_PATTERN = re.compile(r"^(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?$", re.IGNORECASE)
@@ -31,6 +32,10 @@ def parse_time_parts(
 
     if hour is None and minute is None:
         return CleaningResult(value=None, status="empty")
+
+    if hour is not None and minute is not None and hour.lower() == minute.lower():
+        if hour.lower() in KNOWN_TEXT_STATUSES:
+            return CleaningResult(value=None, status="known_text_status")
 
     full_time_from_hour = _parse_full_time_from_hour_field(hour, minute, field, hour_value)
     if full_time_from_hour is not None:
@@ -53,7 +58,7 @@ def parse_time_cell(value: object, field: str = "time") -> CleaningResult:
 
     cleaned = _normalise_time_punctuation(cleaned) or ""
 
-    match = TIME_PATTERN.match(cleaned.replace(".", ""))
+    match = TIME_PATTERN.match(cleaned.replace(".", ":"))
     if not match:
         return _invalid_time(field, value, "Time value could not be parsed")
 
@@ -61,7 +66,7 @@ def parse_time_cell(value: object, field: str = "time") -> CleaningResult:
     minute = int(match.group(2) or "0")
     meridiem = match.group(3)
 
-    if meridiem:
+    if meridiem and hour <= 12:
         meridiem = meridiem.lower()
         if meridiem == "pm" and hour != 12:
             hour += 12
@@ -104,6 +109,12 @@ def _parse_full_time_from_hour_field(
         minute_result = parse_time_cell(minute, field)
         if minute_result.status == "valid_time" and minute_result.value == hour_result.value:
             return CleaningResult(value=hour_result.value, status="valid_time")
+        if (
+            minute_result.status == "valid_time"
+            and minute_result.value == "00:00"
+            and hour_result.value.endswith(":00")
+        ):
+            return CleaningResult(value=hour_result.value, status="valid_time")
         return None
 
     if minute.isdigit() and f"{int(minute):02d}" == expected_minute:
@@ -113,14 +124,15 @@ def _parse_full_time_from_hour_field(
 
 
 def _looks_like_full_time(value: str) -> bool:
-    return bool(re.match(r"^\d{1,2}:\d{2}\s*(am|pm)?$", value, re.IGNORECASE))
+    return bool(re.match(r"^\d{1,2}[:.]\d{2}\s*(am|pm)?$", value, re.IGNORECASE))
 
 
 def _normalise_time_punctuation(value: str | None) -> str | None:
     if value is None:
         return None
 
-    return value.replace(";", ":")
+    value = value.replace(";", ":")
+    return value.strip(".:")
 
 
 def _format_time(hour: int, minute: int, field: str, raw_value: object) -> CleaningResult:

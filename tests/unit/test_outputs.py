@@ -88,6 +88,35 @@ def test_build_import_summary_counts_statuses_and_issues(tmp_path):
     assert summary["duplicate_slug_group_count"] == 1
     assert summary["duplicate_slug_affected_record_count"] == 1
     assert summary["issue_counts_by_code"]["INVALID_PHONE"] == 1
+    assert summary["llm_requested"] is False
+    assert summary["llm_calls"] == 0
+    assert summary["llm_model"] is None
+
+
+def test_build_import_summary_includes_llm_usage_metrics(tmp_path):
+    summary = build_import_summary(
+        [_submission("processed-court", "processed")],
+        IngestResult(),
+        _profile(tmp_path / "source.csv", row_count=1),
+        "run-1",
+        llm_enabled=True,
+        llm_requested=True,
+        llm_metrics={
+            "llm_calls": 3,
+            "llm_failures": 1,
+            "llm_retries": 1,
+            "llm_fields_selected": 5,
+            "llm_fields_processed": 4,
+            "llm_submissions_with_selected_fields": 2,
+            "llm_model": "gpt-5.5",
+        },
+    )
+
+    assert summary["llm_requested"] is True
+    assert summary["llm_calls"] == 3
+    assert summary["llm_failures"] == 1
+    assert summary["llm_fields_processed"] == 4
+    assert summary["llm_model"] == "gpt-5.5"
 
 
 def test_write_processing_outputs_writes_expected_files(tmp_path):

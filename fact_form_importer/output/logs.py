@@ -36,6 +36,8 @@ def write_processing_outputs(
     run_id: str | None = None,
     vocabulary_source: str = "not_recorded",
     llm_enabled: bool = False,
+    llm_requested: bool = False,
+    llm_metrics: dict[str, Any] | None = None,
 ) -> OutputResult:
     output_path.mkdir(parents=True, exist_ok=True)
     current_run_id = run_id or _new_run_id()
@@ -51,6 +53,8 @@ def write_processing_outputs(
         run_id=current_run_id,
         vocabulary_source=vocabulary_source,
         llm_enabled=llm_enabled,
+        llm_requested=llm_requested,
+        llm_metrics=llm_metrics,
     )
 
     _write_json(output_path / "fact_payload.json", fact_payload)
@@ -84,6 +88,8 @@ def build_import_summary(
     run_id: str,
     vocabulary_source: str = "not_recorded",
     llm_enabled: bool = False,
+    llm_requested: bool = False,
+    llm_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status_counts = Counter(submission.status for submission in submissions)
     issue_counts = Counter(
@@ -98,11 +104,12 @@ def build_import_summary(
         and any(issue.code == DUPLICATE_COURT_SLUG for issue in submission.issues)
     }
 
-    return {
+    summary = {
         "run_id": run_id,
         "source_file": str(workbook_profile.source_path),
         "vocabulary_source": vocabulary_source,
         "llm_enabled": llm_enabled,
+        "llm_requested": llm_requested,
         "row_count": workbook_profile.row_count,
         "submission_count": len(submissions),
         "processed_count": status_counts["processed"],
@@ -115,6 +122,20 @@ def build_import_summary(
         "issue_counts_by_code": dict(sorted(issue_counts.items())),
         "mapping_warnings": ingest_result.mapping_warnings,
     }
+    summary.update(
+        {
+            "llm_calls": 0,
+            "llm_failures": 0,
+            "llm_retries": 0,
+            "llm_fields_selected": 0,
+            "llm_fields_processed": 0,
+            "llm_submissions_with_selected_fields": 0,
+            "llm_model": None,
+        }
+    )
+    if llm_metrics:
+        summary.update(llm_metrics)
+    return summary
 
 
 def _new_run_id() -> str:

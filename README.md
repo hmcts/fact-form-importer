@@ -6,8 +6,9 @@ cleaned, validated data for later FaCT API import.
 
 The project is intentionally incremental. The current pipeline performs
 deterministic cleaning, FaCT API-backed validation, review output generation,
-and read-only approval user export. LLM support exists as a manual structured
-client/test command, but it is not called by the main import run yet.
+and read-only approval user export. Optional LLM normalisation is available for
+strictly selected public-text and unresolved vocabulary fields, but requires an
+explicit CLI flag and environment circuit breaker.
 
 ## Goals
 
@@ -72,6 +73,15 @@ FaCT API-backed validation, issue/status calculation, draft payload JSON, NSU
 review workbook, and read-only approval user outputs.
 
 ```bash
+python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --use-llm
+```
+
+Runs the same pipeline with optional LLM normalisation. This requires
+`LLM_ENABLED=true` and configured OpenAI settings. It makes at most one
+row-level model call for each record with safe selected fields, plus one retry
+only if the structured response cannot be parsed.
+
+```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --allow-local-vocabularies
 ```
 
@@ -91,8 +101,18 @@ python3 -m fact_form_importer llm-test
 ```
 
 Sends a fake structured normalisation request to the configured model and
-prints the JSON response. It exercises the manual LLM client only; `run` still
-does not call the LLM.
+prints the JSON response. It exercises the client without using real workbook
+data.
+
+```bash
+python3 -m fact_form_importer llm-request-review --input "./input/microsoft-forms-export.xlsx" --output "./out"
+```
+
+Writes `out/llm_request_review.json` without calling the model. Use it to
+inspect exactly which safe field payloads, relevant vocabularies, field rules,
+system instructions, and response schema would be supplied by `run --use-llm`.
+It works while `LLM_ENABLED=false` and does not include actual court slugs,
+metadata, unselected fields, credentials, or endpoint details.
 
 ## Workflow
 
@@ -128,10 +148,9 @@ as a blank template.
 cp .env.example .env
 ```
 
-The LLM-assisted pipeline steps are disabled by default. Leave
-`LLM_ENABLED=false` while running the deterministic/API-backed pipeline. The
-manual LLM commands can still be used to test credentials and structured
-responses. When future pipeline stages should use LLM assistance, set:
+LLM-assisted processing is disabled by default. Leave `LLM_ENABLED=false` for
+the deterministic/API-backed pipeline. The manual LLM commands can still test
+credentials and structured responses. To permit the optional run stage, set:
 
 ```text
 LLM_ENABLED=true
@@ -146,9 +165,9 @@ configured.
 
 #### LLM field selection
 
-LLM use is deliberately split into two steps. The current code can select which
-fields would be safe to send to the model, but the main `run` command still
-does not call the LLM.
+LLM use is deliberately split into selection and application. The normal
+`run` command never calls the model. `run --use-llm` calls it only when both
+the CLI flag and `LLM_ENABLED=true` are present.
 
 Selection is handled by `fact_form_importer.llm.normalise.select_llm_fields`.
 It uses `config/field_rules.json` and the loaded vocabularies to build a small
@@ -159,8 +178,10 @@ ordinary opening-hours time fields.
 For controlled vocabulary fields, Python gets first pass. If the value already
 matches the configured vocabulary exactly or after normalisation, it is not sent
 to the LLM. Only unresolved public-facing text or ambiguous vocabulary values
-are selected. Companion helpers then return only the allowed vocabulary list and
-field-specific LLM rules relevant to those selected fields.
+are selected. Fields containing embedded email, phone, or postcode data are
+also excluded. Each request contains only selected fields, their relevant
+allowed vocabulary values, and their field-specific rules. Court slugs and all
+metadata remain out of the request.
 
 To sanity-check the configured endpoint, API key, and model without running the
 import pipeline:
@@ -185,13 +206,12 @@ drink, address type, areas of law, court type, counter service assistance,
 contact description, contact explanation, and opening-hours type. It prints a
 sanity-check transcript with the input fields sent to the model, the output
 fields returned by the model, any issues, and the final result summary. It is a
-manual test command and is not called by `run`.
+manual test command and does not use real workbook data.
 
 `llm-test` deliberately calls the configured model even when `LLM_ENABLED=false`
 because it is a connection and response-shape sanity check. The `LLM_ENABLED`
-setting controls whether the main `run` pipeline is allowed to use LLM
-normalisation; the current pipeline reports that setting but does not call the
-LLM yet.
+setting is a circuit breaker for the real pipeline: `run --use-llm` fails fast
+unless it is enabled.
 
 ### 3. Add the source spreadsheet
 
@@ -263,7 +283,13 @@ portal. This rule is scoped to counter service times and does not change general
 court opening-hours records. Phone and email cleaners also extract the first
 valid UK phone number or email address from free text, and contact-detail phone
 and email pairs move misplaced values into the paired empty field where safe.
-The original spreadsheet text remains available in `submissions_raw.json`.
+Time cleaning also repairs unambiguous punctuation and redundant zero-minute
+entries, such as `08:.30`, `15::00`, `10.00 AM` with `00:00`, and `14:00PM`
+with `00:00`. Exact text statuses such as `Appointment only` and `Counter
+service not available` are classified as statuses rather than invalid clock
+values, but still require review because FaCT opening-time entries require real
+opening and closing times. The original spreadsheet text remains available in
+`submissions_raw.json`.
 
 `ingest_summary.json` contains counts for ingested submissions, skipped empty
 rows, failed rows, warning rows, and mapping warnings. Use it as the first check
@@ -271,18 +297,30 @@ that ingestion behaved as expected.
 
 The full `run` command uses these `CourtSubmission` records for validation,
 vocabulary normalisation, NSU review workbook generation, read-only approval
-user export, and draft `fact_payload.json` creation. Optional LLM-assisted
-cleanup is still manual-only and not part of `run`.
+user export, and draft `fact_payload.json` creation. With `--use-llm`, selected
+fields are normalised, safely merged, and then validated again before outputs
+are written.
 
 ### 6. Run the full importer
 
-The `run` command performs the current end-to-end non-LLM pipeline:
-profile the workbook, ingest rows, validate submissions, calculate statuses,
-and write draft import/review JSON outputs.
+The default `run` command profiles the workbook, ingests rows, validates
+submissions, calculates statuses, and writes draft import/review JSON outputs.
+With `--use-llm`, it additionally selects safe fields, makes one row-level LLM
+request only where needed, safely applies acceptable results, and validates the
+batch again before writing outputs.
 
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out"
 ```
+
+To apply the optional LLM stage, first set `LLM_ENABLED=true`, then run:
+
+```bash
+python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --use-llm
+```
+
+The flag is intentionally explicit: setting `LLM_ENABLED=true` alone does not
+send records to the model.
 
 The `run` command requires `FACT_DATA_API_BASE_URL` and
 `FACT_DATA_API_BEARER_TOKEN` so controlled lists come from the FaCT Data API.
@@ -305,6 +343,7 @@ out/failed_records.json
 out/records_needing_human_review.json
 out/issue_report.json
 out/import_summary.json
+out/llm_request_review.json
 out/nsu_cleaned_review.xlsx
 out/read_only_approval_users.json
 out/read_only_approval_users.xlsx
@@ -325,13 +364,20 @@ ambiguous opening hours, or controlled-list mismatches.
 `issue_report.json` is a flat issue list with source row numbers and court
 slugs, useful for filtering and review.
 
+`llm_request_review.json` is an optional, local review artifact produced by
+`llm-request-review`. It records the exact safe structured request bodies the
+LLM pipeline would use, alongside the static system instructions and response
+schema. It always reports zero model calls; it is an inspection command, not a
+normalisation command. Like all files in `out/`, it is git-ignored.
+
 `import_summary.json` contains the run id, source file, row and status counts,
 skipped row count, duplicate slug group count, duplicate slug affected-record
 count, mapping warnings, issue counts by code, `vocabulary_source`, and whether
-LLM processing was enabled. In a normal run, `vocabulary_source` should be
-`fact_data_api`. The CLI also prints duplicate group count, duplicate
-affected-record count, and whether LLM processing was enabled at the end of
-each run. Duplicate groups are
+LLM processing was enabled. It also records LLM requested state, calls,
+failures, parse retries, selected and processed field counts, affected
+submissions, and model name. In a normal run, `vocabulary_source` should be
+`fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
+run. Duplicate groups are
 conservative for now: every affected record is excluded from `fact_payload.json`
 and sent to human review. The importer does not pick a winner or merge duplicate
 rows until explicit merge/precedence rules exist.
@@ -385,7 +431,7 @@ groups, contact detail groups, and opening-hours groups.
 `config/field_rules.json` describes field-level cleaning, validation, and LLM
 normalisation policy in a declarative format. It does not contain executable
 Python code. Cleaner names, validator names, and LLM purposes are strings that
-pipeline stages interpret or will interpret as the importer grows.
+pipeline stages interpret as the importer grows.
 
 The rules file captures things like:
 
@@ -395,10 +441,9 @@ The rules file captures things like:
 - whether GPT-assisted normalisation is allowed for that field
 - the strict instructions the LLM must follow if it is used
 
-Current deterministic ingestion and validation code does not execute
-`field_rules.json` as a generic rules engine yet. The file documents intended
-field policy and is the source of truth for which fields are eligible for
-future LLM-assisted normalisation.
+The importer does not treat this as a generic executable rules engine. It does
+use the file as the source of truth for LLM field selection: only fields with
+`llm.enabled=true` can be selected by `run --use-llm`.
 
 ### Vocabularies
 
@@ -460,8 +505,8 @@ Status is recalculated after validation:
 
 - `failed`: required court identifier is missing or an error issue exists
 - `needs_human_review`: court slug not found in FaCT, duplicate slug, invalid
-  populated postcode, ambiguous opening hours, invalid time, or controlled-list
-  mismatch
+  populated postcode, ambiguous opening hours, invalid time, controlled-list
+  mismatch, LLM failure, unsafe model output, or medium/low LLM confidence
 - `processed_with_warnings`: optional email/phone warnings, slug normalisation
   from a URL/free text, or a very high-confidence court slug auto-repair
 - `processed`: no validation issues

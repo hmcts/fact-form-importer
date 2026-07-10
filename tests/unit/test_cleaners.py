@@ -189,6 +189,26 @@ def test_parse_time_parts_accepts_full_time_in_hour_field(
     assert result.status == "valid_time"
 
 
+@pytest.mark.parametrize(
+    ("hour_value", "minute_value", "expected_value"),
+    [
+        ("08", ".30", "08:30"),
+        ("09", ".00", "09:00"),
+        ("15", ":00", "15:00"),
+        ("09;00", "00:00", "09:00"),
+        ("10.00 AM", "00:00", "10:00"),
+        ("14:00PM", "00:00", "14:00"),
+    ],
+)
+def test_parse_time_parts_repairs_safe_punctuation_and_redundant_zero_minutes(
+    hour_value, minute_value, expected_value
+):
+    result = parse_time_parts(hour_value, minute_value)
+
+    assert result.value == expected_value
+    assert result.status == "valid_time"
+
+
 def test_parse_time_parts_rejects_full_time_with_conflicting_minute():
     result = parse_time_parts("09:00", "30")
 
@@ -207,6 +227,17 @@ def test_parse_time_parts_empty_partial_and_invalid():
     non_numeric = parse_time_parts("nine", "00")
     assert non_numeric.status == "invalid"
     assert non_numeric.issues[0].code == "INVALID_TIME"
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["Appointment Only", "appointments only", "Counter service not available"],
+)
+def test_parse_time_parts_classifies_repeated_known_statuses(status):
+    result = parse_time_parts(status, status)
+
+    assert result.value is None
+    assert result.status == "known_text_status"
 
 
 @pytest.mark.parametrize(

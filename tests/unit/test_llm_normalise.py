@@ -133,6 +133,19 @@ def test_selected_llm_fields_only_include_relevant_vocabularies_and_rules():
     }
 
 
+def test_select_llm_fields_excludes_public_text_that_contains_contact_data():
+    submission = _submission(
+        facilities={
+            "accessible_toilet_description": "Call 020 7946 0000 for the accessible toilet.",
+        }
+    )
+    rules = _field_rules({"facilities.accessible_toilet_description": {"enabled": True}})
+
+    fields = select_llm_fields(submission, rules, _vocabularies())
+
+    assert fields == []
+
+
 def _submission(**kwargs):
     defaults = {
         "source": SourceMetadata(source_row_number=2),

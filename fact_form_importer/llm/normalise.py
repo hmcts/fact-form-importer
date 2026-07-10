@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from fact_form_importer.cleaners.emails import extract_email_addresses
+from fact_form_importer.cleaners.phones import extract_uk_phones
+from fact_form_importer.cleaners.postcodes import normalise_uk_postcode
 from fact_form_importer.config import FieldRule, FieldRulesConfig
 from fact_form_importer.llm.schemas import LlmField
 from fact_form_importer.models.court_submission import Address, ContactDetail, CourtSubmission, OpeningHoursSet
@@ -30,6 +34,7 @@ SENSITIVE_OR_DETERMINISTIC_TOKENS = {
     "same_monday_to_friday",
     "time",
 }
+EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,8 @@ def select_llm_fields(
             continue
         if _is_empty(candidate.value):
             continue
+        if contains_embedded_sensitive_value(candidate.value):
+            continue
         if _requires_failed_vocab_match(rule, candidate.rule_name):
             vocabulary_name = VOCABULARY_BY_FIELD.get(candidate.rule_name)
             if vocabulary_name is None:
@@ -91,8 +98,7 @@ def allowed_vocabularies_for_llm_fields(
 
     allowed: dict[str, list[str]] = {}
     for field in fields:
-        rule_name = _rule_name_from_field_path(field.field)
-        vocabulary_name = VOCABULARY_BY_FIELD.get(rule_name)
+        vocabulary_name = vocabulary_name_for_field_path(field.field)
         if vocabulary_name is None:
             continue
         allowed[field.field] = [entry.name for entry in vocabularies.get(vocabulary_name)]
@@ -110,7 +116,7 @@ def field_rules_for_llm_fields(
     selected_rules: dict[str, list[str]] = {}
 
     for field in fields:
-        rule_name = _rule_name_from_field_path(field.field)
+        rule_name = rule_name_from_field_path(field.field)
         rule = rules.get(rule_name)
         if rule is not None and rule.llm.enabled:
             selected_rules[field.field] = list(rule.llm.rules)
@@ -199,7 +205,9 @@ def _value_matches_vocab(value: Any, vocabulary_name: str, vocabularies: Vocabul
     )
 
 
-def _rule_name_from_field_path(field_path: str) -> str:
+def rule_name_from_field_path(field_path: str) -> str:
+    """Return the declarative rule name for a concrete model field path."""
+
     if field_path.startswith("addresses["):
         return "address." + field_path.split("].", 1)[1]
     if field_path.startswith("contacts["):
@@ -207,6 +215,12 @@ def _rule_name_from_field_path(field_path: str) -> str:
     if field_path.startswith("opening_hours["):
         return "opening_hours." + field_path.split("].", 1)[1]
     return field_path
+
+
+def vocabulary_name_for_field_path(field_path: str) -> str | None:
+    """Return the only vocabulary relevant to an LLM field path, if any."""
+
+    return VOCABULARY_BY_FIELD.get(rule_name_from_field_path(field_path))
 
 
 def _is_sensitive_or_deterministic(rule_name: str) -> bool:
@@ -220,4 +234,19 @@ def _is_empty(value: Any) -> bool:
         return not value.strip()
     if isinstance(value, list):
         return not any(not _is_empty(item) for item in value)
+    return False
+
+
+def contains_embedded_sensitive_value(value: Any) -> bool:
+    """Avoid leaking contact/postcode data from otherwise public free text."""
+
+    values = value if isinstance(value, list) else [value]
+    for item in values:
+        if not isinstance(item, str):
+            continue
+        if EMAIL_PATTERN.search(item) or extract_email_addresses(item) or extract_uk_phones(item):
+            return True
+        postcode = normalise_uk_postcode(item, "llm_field_selection")
+        if postcode.value is not None and not postcode.issues:
+            return True
     return False

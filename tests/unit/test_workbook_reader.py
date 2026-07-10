@@ -169,6 +169,27 @@ def test_ingest_workbook_moves_misplaced_contact_phone_from_email_field(tmp_path
     assert all(issue.code != "INVALID_EMAIL" for issue in result.submissions[0].issues)
 
 
+def test_ingest_workbook_preserves_known_counter_service_status_for_review(tmp_path):
+    mapping = load_column_mapping(Path("config/column_mapping.json"))
+    csv_path = tmp_path / "submissions.csv"
+    rows = _build_ingest_rows(mapping)
+    valid = rows[1]
+    _set(valid, "BW", "Appointment only")
+    _set(valid, "BX", "Appointment only")
+    _set(valid, "BY", "Appointment only")
+    _set(valid, "BZ", "Appointment only")
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerows(rows)
+
+    result = ingest_workbook(csv_path)
+
+    opening_time = result.submissions[0].counter_service["monday_to_friday"]
+    assert opening_time.status == "known_text_status"
+    assert all(issue.code != "INVALID_TIME" for issue in result.submissions[0].issues)
+
+
 def _build_ingest_rows(mapping):
     columns = mapping.expected_columns()
     max_index = max(excel_column_index(column.column) for column in columns)

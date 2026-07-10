@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Optional
 
-from fact_form_importer.config import AppConfig
+from fact_form_importer.config import AppConfig, load_default_field_rules
 from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
-from fact_form_importer.llm.client import build_llm_test_request, normalise_fields_with_llm
+from fact_form_importer.llm.client import (
+    build_llm_test_request,
+    normalise_fields_with_llm,
+    validate_openai_config,
+)
+from fact_form_importer.llm.pipeline import (
+    LlmUsageMetrics,
+    build_llm_request_review,
+    normalise_submissions_with_llm,
+)
+from fact_form_importer.llm.prompts import SYSTEM_PROMPT
+from fact_form_importer.llm.schemas import LlmNormalisationResponse
 from fact_form_importer.llm.openai_client import check_llm_connection
 from fact_form_importer.output.logs import write_processing_outputs
 from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
@@ -21,6 +33,7 @@ from fact_form_importer.validators.fact_api_courts import (
 )
 from fact_form_importer.validators.fact_api_vocabularies import load_vocabularies_from_fact_api
 from fact_form_importer.validators.business_rules import validate_all_submissions
+from fact_form_importer.validators.base import clear_validation_issues
 from fact_form_importer.validators.vocabularies import load_vocabularies
 
 
@@ -40,6 +53,36 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow config/vocabularies.example.json when FaCT Data API vocabulary loading "
             "is unavailable. Intended for local/offline review only."
+        ),
+    )
+
+    llm_review_parser = subparsers.add_parser(
+        "llm-request-review",
+        help="Write the safe LLM request payloads without calling the model.",
+    )
+    llm_review_parser.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        help="Path to the XLSX or CSV export.",
+    )
+    llm_review_parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="Directory for llm_request_review.json.",
+    )
+    llm_review_parser.add_argument(
+        "--allow-local-vocabularies",
+        action="store_true",
+        help="Allow local vocabulary fixtures when FaCT Data API access is unavailable.",
+    )
+    run_parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help=(
+            "Apply optional LLM normalisation to selected safe fields. Requires "
+            "LLM_ENABLED=true and configured OpenAI settings."
         ),
     )
 
@@ -76,9 +119,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = False) -> int:
+def run(
+    input_path: Path,
+    output_path: Path,
+    allow_local_vocabularies: bool = False,
+    use_llm: bool = False,
+) -> int:
     try:
         config = AppConfig()
+        if use_llm and not config.llm_enabled:
+            raise ValueError("--use-llm requires LLM_ENABLED=true in .env")
+        if use_llm:
+            validate_openai_config(config, command_name="run --use-llm")
         workbook_profile = profile_workbook(input_path)
         ingest_result = ingest_workbook(input_path=input_path, output_path=output_path)
         vocabularies, vocabulary_source, court_slug_exists, court_slug_suggester = _load_fact_api_services_for_run(
@@ -91,6 +143,23 @@ def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = Fa
             court_slug_exists=court_slug_exists,
             court_slug_suggester=court_slug_suggester,
         )
+        llm_metrics = LlmUsageMetrics()
+        if use_llm:
+            llm_result = normalise_submissions_with_llm(
+                submissions,
+                field_rules=load_default_field_rules(config),
+                vocabularies=vocabularies,
+                config=config,
+            )
+            submissions = llm_result.submissions
+            llm_metrics = llm_result.metrics
+            clear_validation_issues(submissions)
+            submissions = validate_all_submissions(
+                submissions,
+                vocabularies,
+                court_slug_exists=court_slug_exists,
+                court_slug_suggester=court_slug_suggester,
+            )
         output_path.mkdir(parents=True, exist_ok=True)
         (output_path / "profile.json").write_text(
             profile_to_json(workbook_profile) + "\n",
@@ -103,6 +172,8 @@ def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = Fa
             output_path=output_path,
             vocabulary_source=vocabulary_source,
             llm_enabled=config.llm_enabled,
+            llm_requested=use_llm,
+            llm_metrics=llm_metrics.as_dict(config.openai_model if use_llm else None),
         )
         workbook_path = write_nsu_review_workbook(
             submissions=submissions,
@@ -132,10 +203,65 @@ def run(input_path: Path, output_path: Path, allow_local_vocabularies: bool = Fa
     print(f"Read-only approval users: {submitter_result.user_count}")
     print(f"Excluded submitter users: {submitter_result.excluded_user_count}")
     print(f"LLM enabled: {summary['llm_enabled']}")
+    print(f"LLM requested: {summary['llm_requested']}")
+    print(f"LLM calls: {summary['llm_calls']}")
+    print(f"LLM failures: {summary['llm_failures']}")
+    print(f"LLM fields processed: {summary['llm_fields_processed']}")
+    if summary["llm_model"]:
+        print(f"LLM model: {summary['llm_model']}")
     print(f"Vocabulary source: {summary['vocabulary_source']}")
     print(f"Wrote NSU review workbook: {workbook_path}")
     print(f"Wrote read-only approval users: {submitter_result.json_path}")
     print(f"Wrote run outputs to: {output_path}")
+    return 0
+
+
+def llm_request_review(
+    input_path: Path,
+    output_path: Path,
+    allow_local_vocabularies: bool = False,
+) -> int:
+    """Write exact safe request payloads for inspection without model calls."""
+
+    try:
+        config = AppConfig()
+        ingest_result = ingest_workbook(input_path=input_path)
+        vocabularies, vocabulary_source, _, _ = _load_fact_api_services_for_run(
+            config=config,
+            allow_local_vocabularies=allow_local_vocabularies,
+        )
+        requests = build_llm_request_review(
+            ingest_result.submissions,
+            field_rules=load_default_field_rules(config),
+            vocabularies=vocabularies,
+        )
+        payload = {
+            "source_file": str(input_path),
+            "model": config.openai_model,
+            "llm_enabled": config.llm_enabled,
+            "model_calls_made": 0,
+            "vocabulary_source": vocabulary_source,
+            "request_count": len(requests),
+            "field_count": sum(len(request.fields) for request in requests),
+            "instructions": SYSTEM_PROMPT,
+            "response_schema": LlmNormalisationResponse.model_json_schema(),
+            "requests": [request.model_dump(mode="json", exclude_none=True) for request in requests],
+        }
+        output_path.mkdir(parents=True, exist_ok=True)
+        review_path = output_path / "llm_request_review.json"
+        review_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except (FileNotFoundError, KeyError, ModuleNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"LLM request review records: {payload['request_count']}")
+    print(f"LLM request review fields: {payload['field_count']}")
+    print("LLM calls made: 0")
+    print(f"Vocabulary source: {payload['vocabulary_source']}")
+    print(f"Wrote LLM request review: {review_path}")
     return 0
 
 
@@ -332,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             args.input,
             args.output,
             allow_local_vocabularies=args.allow_local_vocabularies,
+            use_llm=args.use_llm,
         )
 
     if args.command == "profile":
@@ -345,6 +472,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "llm-test":
         return llm_test()
+
+    if args.command == "llm-request-review":
+        return llm_request_review(
+            args.input,
+            args.output,
+            allow_local_vocabularies=args.allow_local_vocabularies,
+        )
 
     parser.error(f"Unknown command: {args.command}")
     return 2
