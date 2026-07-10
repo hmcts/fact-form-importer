@@ -198,7 +198,10 @@ def run(
     print(f"Needs human review: {summary['needs_human_review_count']}")
     print(f"Failed: {summary['failed_count']}")
     print(f"Duplicate court groups: {summary['duplicate_slug_group_count']}")
-    print(f"Duplicate affected records: {summary['duplicate_slug_affected_record_count']}")
+    print(
+        "Duplicate affected records "
+        f"(included in needs human review): {summary['duplicate_slug_affected_record_count']}"
+    )
     print(f"Skipped empty rows: {summary['skipped_count']}")
     print(f"Read-only approval users: {submitter_result.user_count}")
     print(f"Excluded submitter users: {submitter_result.excluded_user_count}")

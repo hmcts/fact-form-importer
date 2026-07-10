@@ -32,7 +32,7 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     assert "Run ID:" in captured.out
     assert "Validated submissions: 1" in captured.out
     assert "Duplicate court groups: 0" in captured.out
-    assert "Duplicate affected records: 0" in captured.out
+    assert "Duplicate affected records (included in needs human review): 0" in captured.out
     assert "Read-only approval users: 0" in captured.out
     assert "Excluded submitter users: 0" in captured.out
     assert "LLM enabled: False" in captured.out

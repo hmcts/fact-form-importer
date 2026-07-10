@@ -377,10 +377,12 @@ LLM processing was enabled. It also records LLM requested state, calls,
 failures, parse retries, selected and processed field counts, affected
 submissions, and model name. In a normal run, `vocabulary_source` should be
 `fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
-run. Duplicate groups are
-conservative for now: every affected record is excluded from `fact_payload.json`
-and sent to human review. The importer does not pick a winner or merge duplicate
-rows until explicit merge/precedence rules exist.
+run. Duplicate groups are conservative for now: every affected record is
+excluded from `fact_payload.json` and included in the `needs_human_review`
+count. The duplicate count is not an additional status category: a duplicate
+record can also have other review issues, such as invalid opening hours. The
+importer does not pick a winner or merge duplicate rows until explicit
+merge/precedence rules exist.
 
 `nsu_cleaned_review.xlsx` is a reviewer-friendly Excel workbook. It is not the
 machine-readable source of truth; the JSON files remain that. The workbook helps

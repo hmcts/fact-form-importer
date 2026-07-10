@@ -124,7 +124,10 @@ def _add_summary_sheet(
         ["Failed", status_counts["failed"]],
         ["Skipped empty rows", summary.get("skipped_count")],
         ["Duplicate slug groups", summary.get("duplicate_slug_group_count")],
-        ["Duplicate affected records", summary.get("duplicate_slug_affected_record_count")],
+        [
+            "Duplicate affected records (included in needs human review)",
+            summary.get("duplicate_slug_affected_record_count"),
+        ],
         [],
         ["Issue code", "Count"],
     ]

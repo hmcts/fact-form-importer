@@ -88,6 +88,10 @@ def test_write_nsu_review_workbook_creates_expected_review_tabs(tmp_path):
     assert workbook["Processed records"]["B2"].value == "processed-court"
     assert workbook["Needs human review"]["F2"].value.startswith("DUPLICATE_COURT_SLUG:")
     assert "Review all rows" in workbook["Needs human review"]["G2"].value
+    assert (
+        workbook["Summary"]["A12"].value
+        == "Duplicate affected records (included in needs human review)"
+    )
     assert workbook["Duplicate courts"]["A2"].value == "duplicate-court"
     assert workbook["Duplicate courts"]["D2"].value == 4
     assert workbook["Duplicate courts"]["E2"].value == "2026-07-02 10:00"
