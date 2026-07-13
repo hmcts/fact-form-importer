@@ -21,6 +21,7 @@ from fact_form_importer.execution.models import (
     ExecutionLedger,
     utc_now,
 )
+from fact_form_importer.execution.report import build_execution_summary
 from fact_form_importer.output.archive import load_run_archive
 from fact_form_importer.output.fact_api_manifest import (
     normalise_fact_api_action_body,
@@ -70,7 +71,7 @@ class ApiExecutionService:
         finally:
             if close:
                 client.close()
-        return self.store.save(ledger)
+        return self._save_with_summary(run_id, ledger)
 
     def execute_action(self, run_id: str, court_slug: str, action_id: str) -> ExecutionLedger:
         self._require_writes_enabled()
@@ -83,13 +84,12 @@ class ApiExecutionService:
         try:
             self._preflight_actions(ledger, record, [action], client)
             state = self._action_state(ledger, court_slug, action_id)
-            if state.status != "ready":
-                return self.store.save(ledger)
-            self._write_action(ledger, record, action, client)
+            if state.status == "ready":
+                self._write_action(ledger, record, action, client)
         finally:
             if close:
                 client.close()
-        return self.store.save(ledger)
+        return self._save_with_summary(run_id, ledger)
 
     def execute_safe_court_actions(self, run_id: str, court_slug: str) -> ExecutionLedger:
         self._require_writes_enabled()
@@ -105,9 +105,62 @@ class ApiExecutionService:
         finally:
             if close:
                 client.close()
-        return self.store.save(ledger)
+        return self._save_with_summary(run_id, ledger)
+
+    def execute_all_safe_actions(self, run_id: str) -> ExecutionLedger:
+        """Execute every unattempted reviewed court action sequentially.
+
+        This is intentionally a single-threaded operation. It shares the
+        postcode cache/rate limiter, preserves progress after each court, and
+        never automatically retries terminal action states from an earlier
+        execution attempt.
+        """
+
+        self._require_writes_enabled()
+        report = self._readiness_report(run_id)
+        records = sorted(
+            report.get("records", []), key=lambda record: str(record.get("court_slug") or "")
+        )
+        ledger = self.store.load(run_id)
+        client, close = self._client_or_new()
+        try:
+            for record in records:
+                court_slug = str(record.get("court_slug") or "")
+                actions = self._batch_actions_to_attempt(ledger, record)
+                if not actions:
+                    self._update_court_status(
+                        self._court_state(ledger, court_slug), record.get("actions", [])
+                    )
+                    self._save_with_summary(run_id, ledger, report)
+                    continue
+                try:
+                    self._preflight_actions(ledger, record, actions, client)
+                    for action in actions:
+                        state = self._action_state(ledger, court_slug, str(action["action_id"]))
+                        if state.status == "ready":
+                            self._write_action(ledger, record, action, client)
+                except Exception as exc:  # retain progress and continue with later courts
+                    self._record_unexpected_court_error(ledger, record, actions, exc)
+                self._save_with_summary(run_id, ledger, report)
+        finally:
+            if close:
+                client.close()
+        return self._save_with_summary(run_id, ledger, report)
+
+    def get_execution_summary(self, run_id: str) -> dict[str, Any]:
+        existing = self.store.load_summary(run_id)
+        if existing is not None:
+            return existing
+        return build_execution_summary(run_id, self._readiness_report(run_id), self.store.load(run_id))
 
     def _record(self, run_id: str, court_slug: str) -> dict[str, Any]:
+        report = self._readiness_report(run_id)
+        record = next((item for item in report.get("records", []) if item.get("court_slug") == court_slug), None)
+        if record is None:
+            raise ValueError(f"Court '{court_slug}' is not in the API readiness report")
+        return record
+
+    def _readiness_report(self, run_id: str) -> dict[str, Any]:
         archive = load_run_archive(self.output_root, run_id)
         if archive is None:
             raise ValueError(f"Run '{run_id}' does not exist")
@@ -116,11 +169,46 @@ class ApiExecutionService:
             raise ValueError("This archive does not contain an API readiness report")
         import json
 
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        record = next((item for item in report.get("records", []) if item.get("court_slug") == court_slug), None)
-        if record is None:
-            raise ValueError(f"Court '{court_slug}' is not in the API readiness report")
-        return record
+        return json.loads(report_path.read_text(encoding="utf-8"))
+
+    def _save_with_summary(
+        self,
+        run_id: str,
+        ledger: ExecutionLedger,
+        report: dict[str, Any] | None = None,
+    ) -> ExecutionLedger:
+        saved = self.store.save(ledger)
+        self.store.save_summary(
+            run_id,
+            build_execution_summary(run_id, report or self._readiness_report(run_id), saved),
+        )
+        return saved
+
+    @staticmethod
+    def _batch_actions_to_attempt(
+        ledger: ExecutionLedger, record: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        court = ledger.courts.get(str(record.get("court_slug") or ""))
+        actions = []
+        for action in record.get("actions", []):
+            action_id = str(action.get("action_id") or "")
+            state = court.actions.get(action_id) if court else None
+            if state is None or state.status in {"planned", "ready"}:
+                actions.append(action)
+        return actions
+
+    def _record_unexpected_court_error(
+        self,
+        ledger: ExecutionLedger,
+        record: dict[str, Any],
+        actions: Iterable[dict[str, Any]],
+        exc: Exception,
+    ) -> None:
+        court_slug = str(record.get("court_slug") or "")
+        reason = f"Unexpected execution error ({type(exc).__name__}): {exc}"
+        for action in actions:
+            self._set_action(ledger, court_slug, action, "unknown", "execute", None, reason)
+        self._update_court_status(self._court_state(ledger, court_slug), record.get("actions", []))
 
     def _client_or_new(self) -> tuple[FactApiExecutionClient, bool]:
         return (self._client, False) if self._client else (FactApiExecutionClient(self.config), True)
@@ -144,6 +232,7 @@ class ApiExecutionService:
         actions: Iterable[dict[str, Any]],
         client: FactApiExecutionClient,
     ) -> None:
+        actions = list(actions)
         court_slug = str(record["court_slug"])
         self._postcode_lookup.set_lookup(
             lambda postcode: client.get(f"/search/address/v1/postcode/{quote(postcode, safe='')}")
@@ -251,38 +340,50 @@ class ApiExecutionService:
                 ledger, court_slug, action, "unknown", "execute", None,
                 "Court UUID was unavailable after a successful preflight",
             )
-            self._update_court_status(self._court_state(ledger, court_slug), record.get("actions", []))
-            return
-        body = self._execution_body(action, court_id)
-        body_reason = validate_fact_api_action_body(str(action.get("resource") or ""), body)
-        if body_reason:
-            self._set_action(
-                ledger,
-                court_slug,
-                action,
-                "blocked",
-                "execute",
-                None,
-                f"Action body cannot be sent to FaCT: {body_reason}",
-            )
-            self._update_court_status(self._court_state(ledger, court_slug), record.get("actions", []))
-            return
-        try:
-            response = client.write(action["method"], action["path"], body)
-        except httpx.TimeoutException:
-            self._set_action(ledger, court_slug, action, "unknown", "execute", None, "Write timed out; outcome is unknown")
-            return
-        except httpx.HTTPError as exc:
-            http_status, reason = _preflight_error_details("write request", exc)
-            self._set_action(ledger, court_slug, action, "failed", "execute", http_status, reason)
-            return
-        if 200 <= response.status_code < 300:
-            self._set_action(ledger, court_slug, action, "succeeded", "execute", response.status_code, None)
         else:
-            self._set_action(
-                ledger, court_slug, action, "failed", "execute", response.status_code,
-                _write_rejection_reason(response.status_code, response.body),
-            )
+            body = self._execution_body(action, court_id)
+            body_reason = validate_fact_api_action_body(str(action.get("resource") or ""), body)
+            if body_reason:
+                self._set_action(
+                    ledger,
+                    court_slug,
+                    action,
+                    "blocked",
+                    "execute",
+                    None,
+                    f"Action body cannot be sent to FaCT: {body_reason}",
+                )
+            else:
+                try:
+                    response = client.write(action["method"], action["path"], body)
+                except httpx.TimeoutException:
+                    self._set_action(
+                        ledger,
+                        court_slug,
+                        action,
+                        "unknown",
+                        "execute",
+                        None,
+                        "Write timed out; outcome is unknown",
+                    )
+                except httpx.HTTPError as exc:
+                    http_status, reason = _preflight_error_details("write request", exc)
+                    self._set_action(ledger, court_slug, action, "failed", "execute", http_status, reason)
+                else:
+                    if 200 <= response.status_code < 300:
+                        self._set_action(
+                            ledger, court_slug, action, "succeeded", "execute", response.status_code, None
+                        )
+                    else:
+                        self._set_action(
+                            ledger,
+                            court_slug,
+                            action,
+                            "failed",
+                            "execute",
+                            response.status_code,
+                            _write_rejection_reason(response.status_code, response.body),
+                        )
         self._update_court_status(self._court_state(ledger, court_slug), record.get("actions", []))
 
     @staticmethod

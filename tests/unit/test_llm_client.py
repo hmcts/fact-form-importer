@@ -11,6 +11,7 @@ from fact_form_importer.llm.client import (
     _response_json,
 )
 from fact_form_importer.llm.openai_client import check_llm_connection, _response_preview
+from fact_form_importer.llm.schemas import LlmNormalisationResponse
 
 
 def test_check_llm_connection_calls_openai_responses_api(monkeypatch):
@@ -86,6 +87,7 @@ def test_normalise_fields_with_llm_uses_structured_json_output(monkeypatch):
                                 "message": "Answer says to ask security.",
                             }
                         ],
+                        "address_matches": [],
                     }
                 )
             )
@@ -107,6 +109,14 @@ def test_normalise_fields_with_llm_uses_structured_json_output(monkeypatch):
     assert "temperature" not in calls[0]
     assert calls[0]["text"]["format"]["type"] == "json_schema"
     assert "accessible_toilet_description" in calls[0]["input"]
+
+
+def test_llm_response_schema_requires_every_object_property_for_azure():
+    schema = LlmNormalisationResponse.model_json_schema()
+
+    assert set(schema["properties"]) == set(schema["required"])
+    address_match = schema["$defs"]["LlmAddressMatch"]
+    assert set(address_match["properties"]) == set(address_match["required"])
 
 
 def test_normalise_fields_with_llm_requires_openai_config(monkeypatch):

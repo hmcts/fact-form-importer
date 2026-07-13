@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>LLM Review Factors: {{ archive.manifest.run_id }}</h1>
+<nav>
+  <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
+  <a href="{{ url_for('records', run_id=archive.manifest.run_id, status='needs_human_review') }}">All review rows</a>
+</nav>
+<p>These are model-specific conditions that contribute to a row being held for human review. Aggregate model confidence and aggregate review signals are audit-only and do not appear here.</p>
+<p class="muted">{{ factor_summary.llm_review_submission_count }} review rows, {{ factor_summary.llm_review_issue_count }} contributing LLM factors.</p>
+<table>
+  <thead><tr><th>Row</th><th>Court</th><th>Field</th><th>Factor</th><th>Message</th></tr></thead>
+  <tbody>{% for factor in factors %}
+    <tr>
+      <td><a href="{{ url_for('record_detail', run_id=archive.manifest.run_id, source_row_number=factor.source_row_number) }}">{{ factor.source_row_number }}</a></td>
+      <td>{{ factor.court_slug }}</td>
+      <td><code>{{ factor.field }}</code></td>
+      <td><code>{{ factor.code }}</code></td>
+      <td>{{ factor.message }}</td>
+    </tr>
+  {% else %}<tr><td colspan="5">No LLM factors currently hold rows for review.</td></tr>{% endfor %}</tbody>
+</table>
+{% if pages > 1 %}<p>Page {{ page }} of {{ pages }}{% if page > 1 %} · <a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id, page=page-1) }}">Previous</a>{% endif %}{% if page < pages %} · <a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id, page=page+1) }}">Next</a>{% endif %}</p>{% endif %}
+{% endblock %}

@@ -19,7 +19,7 @@ from fact_form_importer.output.fact_json import (
     build_human_review_records,
 )
 from fact_form_importer.validators.fact_api_courts import CourtReference
-from fact_form_importer.validators.base import DUPLICATE_COURT_SLUG
+from fact_form_importer.validators.base import DUPLICATE_COURT_SLUG, LLM_HUMAN_REVIEW_ISSUE_CODES
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 
@@ -121,6 +121,13 @@ def build_import_summary(
         if submission.court_slug
         and any(issue.code == DUPLICATE_COURT_SLUG for issue in submission.issues)
     }
+    unique_court_slugs = {submission.court_slug for submission in submissions if submission.court_slug}
+    llm_review_submissions = [
+        submission
+        for submission in submissions
+        if submission.status == "needs_human_review"
+        and any(issue.code in LLM_HUMAN_REVIEW_ISSUE_CODES for issue in submission.issues)
+    ]
 
     summary = {
         "run_id": run_id,
@@ -130,6 +137,15 @@ def build_import_summary(
         "llm_requested": llm_requested,
         "row_count": workbook_profile.row_count,
         "submission_count": len(submissions),
+        "unique_court_slug_count": len(unique_court_slugs),
+        "status_count_total": sum(status_counts.values()),
+        "llm_review_submission_count": len(llm_review_submissions),
+        "llm_review_issue_count": sum(
+            1
+            for submission in llm_review_submissions
+            for issue in submission.issues
+            if issue.code in LLM_HUMAN_REVIEW_ISSUE_CODES
+        ),
         "processed_count": status_counts["processed"],
         "processed_with_warnings_count": status_counts["processed_with_warnings"],
         "needs_human_review_count": status_counts["needs_human_review"],
@@ -164,6 +180,7 @@ def build_import_summary(
             "address_verification_unsupported_postcode_region_count": 0,
             "address_verification_missing_postcode_count": 0,
             "address_verification_action_blocking_count": 0,
+            "address_verification_action_blocking_submission_count": 0,
             "address_verification_unavailable_count": 0,
         }
     )

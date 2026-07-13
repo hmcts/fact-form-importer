@@ -69,6 +69,17 @@ class AppConfig:
         return _env_bool("LLM_ENABLED", default=False)
 
     @property
+    def llm_max_concurrency(self) -> int:
+        """Maximum number of independent row-level LLM requests in flight."""
+
+        raw = os.getenv("LLM_MAX_CONCURRENCY", "8")
+        try:
+            value = int(raw)
+        except ValueError:
+            return 8
+        return min(max(value, 1), 16)
+
+    @property
     def openai_base_url(self) -> Optional[str]:
         return os.getenv("OPENAI_BASE_URL") or None
 

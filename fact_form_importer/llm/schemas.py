@@ -86,7 +86,10 @@ class LlmAddressMatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     address_index: int
-    uprn: Optional[str] = None
+    # Azure structured output requires every property to be listed in
+    # ``required``. A nullable-but-required key lets the model explicitly
+    # return ``null`` when no supplied candidate is a safe match.
+    uprn: Optional[str]
     confidence: Confidence
     needs_human_review: bool
     reason: str
@@ -100,4 +103,6 @@ class LlmNormalisationResponse(BaseModel):
     confidence: Confidence
     needs_human_review: bool
     issues: list[LlmIssue]
-    address_matches: list[LlmAddressMatch] = Field(default_factory=list)
+    # As above, return an empty list rather than omitting this key. This keeps
+    # the generated JSON schema compatible with Azure structured outputs.
+    address_matches: list[LlmAddressMatch]

@@ -2,6 +2,7 @@ import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from zipfile import ZIP_STORED, ZipFile
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.fact_api import ApiResponse
@@ -29,7 +30,9 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
 
     assert client.get("/").status_code == 200
     assert run_id.encode() in client.get("/").data
-    assert client.get(f"/runs/{run_id}").status_code == 200
+    run_page = client.get(f"/runs/{run_id}")
+    assert run_page.status_code == 200
+    assert b"Download this run (.zip)" in run_page.data
     assert client.get(f"/runs/{run_id}/records?status=processed").status_code == 200
     review = client.get(f"/runs/{run_id}/records?status=needs_human_review")
     assert b"review-court" in review.data
@@ -37,8 +40,16 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert detail.status_code == 200
     assert b"Raw submitted values" in detail.data
     assert client.get(f"/runs/{run_id}/issues").status_code == 200
+    assert b"LLM Review Factors" in client.get(f"/runs/{run_id}/llm-review-factors").data
+    assert b"OS-Held Address Actions" in client.get(f"/runs/{run_id}/os-address-factors").data
     assert client.get(f"/runs/{run_id}/api-actions?readiness=ready").status_code == 200
+    assert client.get(f"/runs/{run_id}/execution-summary").status_code == 200
+    execution_json = client.get(f"/runs/{run_id}/execution-summary.json")
+    assert execution_json.status_code == 200
+    assert execution_json.headers["Content-Disposition"].startswith("attachment")
     assert b"Duplicate form decision workbook" in client.get(f"/runs/{run_id}").data
+    assert b"LLM review rows" in client.get("/").data
+    assert b"OS-held address rows" in client.get("/").data
 
 
 def test_review_ui_allows_only_manifested_artifact_downloads(tmp_path):
@@ -49,6 +60,21 @@ def test_review_ui_allows_only_manifested_artifact_downloads(tmp_path):
     assert response.status_code == 200
     assert response.headers["Content-Disposition"].startswith("attachment")
     assert client.get(f"/runs/{run_id}/download/../.env").status_code == 404
+
+
+def test_review_ui_downloads_a_complete_run_zip(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    client = create_app(output_root).test_client()
+
+    response = client.get(f"/runs/{run_id}/download/archive.zip")
+
+    assert response.status_code == 200
+    assert response.headers["Content-Disposition"].endswith(f"{run_id}.zip")
+    with ZipFile(io.BytesIO(response.data)) as archive:
+        assert "run_manifest.json" in archive.namelist()
+        assert "import_summary.json" in archive.namelist()
+        assert "nsu_cleaned_review.xlsx" in archive.namelist()
+        assert archive.getinfo("import_summary.json").compress_type == ZIP_STORED
 
 
 def test_review_ui_downloads_reports_from_a_relative_output_directory(tmp_path, monkeypatch):
@@ -286,6 +312,24 @@ def test_review_ui_executes_all_safe_actions_and_handles_execution_errors(tmp_pa
     assert failing_client.post(
         f"/runs/{run_id}/courts/example-court/execute-safe", data={"source_row_number": "2"}
     ).status_code == 400
+    assert failing_client.post(f"/runs/{run_id}/execute-safe").status_code == 400
+
+
+def test_review_ui_executes_all_safe_actions_for_a_run_and_shows_summary(tmp_path, monkeypatch):
+    output_root, run_id = _archive(tmp_path)
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    execution_client = _FakeExecutionClient()
+    execution = ApiExecutionService(output_root, AppConfig(), execution_client)
+    client = create_app(output_root, config=AppConfig(), execution_service=execution).test_client()
+
+    assert b"Run all currently safe actions" in client.get(f"/runs/{run_id}").data
+    response = client.post(f"/runs/{run_id}/execute-safe")
+
+    assert response.status_code == 302
+    assert execution_client.writes
+    summary = client.get(f"/runs/{run_id}/execution-summary")
+    assert b"Succeeded actions" in summary.data
+    assert b"completed" in summary.data
 
 
 def test_action_evidence_projects_cleaned_and_raw_fields(monkeypatch, tmp_path):
@@ -308,7 +352,13 @@ def test_action_evidence_projects_cleaned_and_raw_fields(monkeypatch, tmp_path):
         "addresses[1]", "contacts[1]", "opening_hours[1]",
     ]
 
-    evidence = _action_evidence(submission, {"source_fields": fields})
+    evidence = _action_evidence(
+        submission,
+        {
+            "source_fields": fields,
+            "migration_assumptions": ["Approved migration default"],
+        },
+    )
 
     assert evidence["cleaned"]["addresses[1]"]["line_1"] == "1 Main Street"
     assert evidence["cleaned"]["contacts[1]"]["email"] == "contact@example.test"
@@ -316,6 +366,7 @@ def test_action_evidence_projects_cleaned_and_raw_fields(monkeypatch, tmp_path):
     assert evidence["raw"]["AB"] == "1 Main Street"
     assert evidence["address_verification"] is None
     assert evidence["request_body_normalisations"] == {}
+    assert evidence["migration_assumptions"] == ["Approved migration default"]
     assert _value_at_path({}, "missing.value") is None
     assert _raw_evidence_for_fields({"A": "value"}, ["addresses[bad]"]) == {}
 
@@ -373,9 +424,18 @@ def _archive_at_path(output_root):
         "court_slug_raw": "Review Court",
         "status": "needs_human_review",
         "raw": {"court_slug": "Review Court"},
-        "issues": [{"code": "DUPLICATE_COURT_SLUG"}],
+        "issues": [
+            {"code": "DUPLICATE_COURT_SLUG"},
+            {
+                "field": "facilities.accessible_toilet_description",
+                "code": "LLM_LOW_CONFIDENCE",
+                "message": "LLM normalisation confidence was not high",
+            },
+        ],
     }
     summary = {
+        "submission_count": 2,
+        "unique_court_slug_count": 2,
         "processed_count": 1,
         "processed_with_warnings_count": 0,
         "needs_human_review_count": 1,
@@ -388,6 +448,21 @@ def _archive_at_path(output_root):
     }
     (staging / "submissions_cleaned.json").write_text(json.dumps([submission, review_submission]))
     (staging / "issue_report.json").write_text("[]")
+    (staging / "address_verification_report.json").write_text(
+        json.dumps(
+            {
+                "verifications": [
+                    {
+                        "source_row_number": 3,
+                        "court_slug": "review-court",
+                        "address_index": 1,
+                        "status": "review_required",
+                        "message": "No unique high-confidence OS match was found",
+                    }
+                ]
+            }
+        )
+    )
     (staging / "import_summary.json").write_text(json.dumps(summary))
     (staging / "api_readiness_report.json").write_text(
         json.dumps(
@@ -447,6 +522,16 @@ class _FailingExecutionService:
     def get_ledger(self, run_id):
         return ExecutionLedger(run_id=run_id)
 
+    def get_execution_summary(self, run_id):
+        return {
+            "selected_court_count": 0,
+            "court_status_counts": {"completed": 0, "attention_required": 0},
+            "action_status_counts": {"succeeded": 0, "blocked": 0, "failed": 0, "unknown": 0},
+            "common_error_themes": [],
+            "attention_actions": [],
+            "courts": [],
+        }
+
     def check_court(self, run_id, court_slug):
         raise ValueError("cannot check")
 
@@ -454,4 +539,7 @@ class _FailingExecutionService:
         raise ValueError("cannot execute")
 
     def execute_safe_court_actions(self, run_id, court_slug):
+        raise ValueError("cannot execute")
+
+    def execute_all_safe_actions(self, run_id):
         raise ValueError("cannot execute")

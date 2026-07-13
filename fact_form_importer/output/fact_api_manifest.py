@@ -19,7 +19,7 @@ from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "1.3"
+API_MANIFEST_VERSION = "1.4"
 
 # These expressions deliberately mirror the public FaCT Data API request
 # constraints. Keeping them here makes a rejected action reviewable before a
@@ -54,6 +54,7 @@ class FactApiAction(BaseModel):
     # Python 3.9 environment cannot evaluate the latter inside Pydantic.
     address_verification: Optional[dict[str, Any]] = None
     request_body_normalisations: dict[str, dict[str, str]] = Field(default_factory=dict)
+    migration_assumptions: list[str] = Field(default_factory=list)
 
 
 class FactApiRecord(BaseModel):
@@ -138,6 +139,7 @@ def _build_record(
         reason: str | None = None,
         source_fields: list[str] | None = None,
         address_verification: dict[str, Any] | None = None,
+        migration_assumptions: list[str] | None = None,
     ) -> None:
         nonlocal action_number
         # FaCT validates the request object before its service layer applies the
@@ -169,6 +171,7 @@ def _build_record(
                 source_fields=source_fields or [],
                 address_verification=address_verification,
                 request_body_normalisations=_body_normalisations(original_body, body),
+                migration_assumptions=migration_assumptions or [],
             )
         )
         action_number += 1
@@ -218,8 +221,8 @@ def _build_record(
         "POST",
         "/courts/{court_id}/v1/professional-information",
         _professional_information_body(submission),
-        _professional_information_reason(submission),
         source_fields=["interview_rooms"],
+        migration_assumptions=_professional_information_assumptions(submission),
     )
 
     counter_body, counter_reason = _counter_service_body(submission, vocabularies)
@@ -341,24 +344,38 @@ def _translation_body(submission: CourtSubmission) -> dict[str, Any]:
 
 def _professional_information_body(submission: CourtSubmission) -> dict[str, Any]:
     rooms = submission.interview_rooms
+    if not _has_professional_information_evidence(rooms):
+        return {}
+
     body = _without_none(
         {
             "interviewRooms": rooms.get("has_interview_rooms"),
             "interviewRoomCount": _positive_int(rooms.get("room_count")),
             "interviewPhoneNumber": rooms.get("booking_phone"),
+            # The Microsoft Forms export does not collect these three fields.
+            # Product approved false as the migration default; this applies only
+            # to the FaCT request body and never changes the source submission.
+            "videoHearings": False,
+            "commonPlatform": False,
+            "accessScheme": False,
         }
     )
     return {"professionalInformation": body} if body else {}
 
 
-def _professional_information_reason(submission: CourtSubmission) -> str | None:
-    """The form does not collect all required ProfessionalInformationDto values."""
+def _professional_information_assumptions(submission: CourtSubmission) -> list[str]:
+    if not _has_professional_information_evidence(submission.interview_rooms):
+        return []
+    return [
+        "Migration policy: the form does not collect videoHearings, commonPlatform, "
+        "or accessScheme, so this request defaults each field to false."
+    ]
 
-    if not submission.interview_rooms:
-        return None
-    return (
-        "The form does not collect the FaCT-required videoHearings, commonPlatform, "
-        "and accessScheme values for professional information"
+
+def _has_professional_information_evidence(rooms: dict[str, Any]) -> bool:
+    return any(
+        rooms.get(field) is not None
+        for field in ("has_interview_rooms", "room_count", "booking_phone")
     )
 
 
@@ -612,6 +629,20 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
             for field in ("interviewRooms", "videoHearings", "commonPlatform", "accessScheme"):
                 if professional_information.get(field) is None:
                     errors.append(f"professionalInformation.{field} is required by the FaCT API")
+            interview_rooms = professional_information.get("interviewRooms")
+            room_count = professional_information.get("interviewRoomCount")
+            if interview_rooms is True and (
+                not isinstance(room_count, int) or not 1 <= room_count <= 150
+            ):
+                errors.append(
+                    "professionalInformation.interviewRoomCount must be between 1 and 150 "
+                    "when interviewRooms is true"
+                )
+            if interview_rooms is False and room_count is not None and room_count != 0:
+                errors.append(
+                    "professionalInformation.interviewRoomCount must be omitted or zero "
+                    "when interviewRooms is false"
+                )
     return "; ".join(errors) if errors else None
 
 

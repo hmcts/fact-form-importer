@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -31,6 +32,13 @@ from fact_form_importer.validators.vocabularies import Vocabularies
 from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 
 LLM_FIELD_NORMALISED = "LLM_FIELD_NORMALISED"
+# These codes deliberately remain outside the validator's human-review codes.
+# Azure requires the aggregate response fields, but they cannot safely identify
+# which source field needs review. Field-level results and address suggestions
+# carry that decision instead.
+LLM_RESPONSE_LOW_CONFIDENCE = "LLM_RESPONSE_LOW_CONFIDENCE"
+LLM_RESPONSE_REVIEW_ADVISORY = "LLM_RESPONSE_REVIEW_ADVISORY"
+LLM_MODEL_NOTE = "LLM_MODEL_NOTE"
 
 
 @dataclass
@@ -64,6 +72,21 @@ class LlmNormalisationResult:
     metrics: LlmUsageMetrics
 
 
+@dataclass(frozen=True)
+class _PreparedLlmCall:
+    submission: CourtSubmission
+    fields: list[LlmField]
+    request: LlmNormalisationRequest
+
+
+@dataclass(frozen=True)
+class _LlmCallOutcome:
+    response: LlmNormalisationResponse | None
+    error: Exception | None
+    calls: int
+    retries: int
+
+
 Normaliser = Callable[[LlmNormalisationRequest, Optional[AppConfig]], LlmNormalisationResponse]
 
 
@@ -75,10 +98,16 @@ def normalise_submissions_with_llm(
     normaliser: Normaliser = normalise_fields_with_llm,
     address_verifications: AddressVerificationBatch | None = None,
 ) -> LlmNormalisationResult:
-    """Run at most one row-level LLM request, plus one parse retry, per submission."""
+    """Run scoped LLM requests concurrently, with at most one request per row.
+
+    Calls are isolated from each other, while results are applied in source order
+    after the requests finish. This avoids a long serial run without combining
+    form rows or exposing one row's data to another request.
+    """
 
     app_config = config or AppConfig()
     metrics = LlmUsageMetrics()
+    prepared_calls: list[_PreparedLlmCall] = []
 
     for submission in submissions:
         fields = select_llm_fields(submission, field_rules, vocabularies)
@@ -99,9 +128,36 @@ def normalise_submissions_with_llm(
             address_candidates=address_candidates,
         )
 
-        try:
-            response = _call_with_one_parse_retry(request, app_config, normaliser, metrics)
-        except Exception as exc:
+        prepared_calls.append(
+            _PreparedLlmCall(
+                submission=submission,
+                fields=fields,
+                request=request,
+            )
+        )
+
+    if not prepared_calls:
+        return LlmNormalisationResult(submissions=submissions, metrics=metrics)
+
+    max_workers = min(app_config.llm_max_concurrency, len(prepared_calls))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="fact-llm") as executor:
+        outcomes = list(
+            executor.map(
+                lambda prepared: _call_with_one_parse_retry(
+                    prepared.request,
+                    app_config,
+                    normaliser,
+                ),
+                prepared_calls,
+            )
+        )
+
+    for prepared, outcome in zip(prepared_calls, outcomes):
+        submission = prepared.submission
+        metrics.calls += outcome.calls
+        metrics.retries += outcome.retries
+
+        if outcome.error is not None:
             metrics.failures += 1
             add_issue_once(
                 submission,
@@ -111,15 +167,18 @@ def normalise_submissions_with_llm(
                     severity="warning",
                     message="LLM normalisation failed; this row requires human review",
                     raw_value=None,
-                    cleaned_value={"error_type": type(exc).__name__},
+                    cleaned_value={"error_type": type(outcome.error).__name__},
                 ),
             )
             continue
 
+        if outcome.response is None:
+            raise AssertionError("A successful LLM call must include a response")
+
         metrics.fields_processed += apply_llm_response(
             submission,
-            response,
-            fields,
+            outcome.response,
+            prepared.fields,
             vocabularies,
             address_verifications=address_verifications,
             metrics=metrics,
@@ -167,6 +226,16 @@ def apply_llm_response(
             continue
 
         if normalised_field.value is None:
+            # The model must scope an unresolved selected field here rather
+            # than relying on the aggregate response-level review flag.
+            if normalised_field.needs_human_review:
+                _add_llm_issue(
+                    submission,
+                    selected.field,
+                    LLM_REVIEW_REQUIRED,
+                    "LLM marked this field as requiring human review",
+                    normalised_field.reason,
+                )
             continue
 
         value = _safe_value_for_field(
@@ -218,22 +287,7 @@ def apply_llm_response(
                 normalised_field.reason,
             )
 
-    if response.confidence in {"medium", "low"}:
-        _add_llm_issue(
-            submission,
-            "llm",
-            LLM_LOW_CONFIDENCE,
-            "LLM response confidence was not high",
-            response.confidence,
-        )
-    if response.needs_human_review:
-        _add_llm_issue(
-            submission,
-            "llm",
-            LLM_REVIEW_REQUIRED,
-            "LLM marked this record as requiring human review",
-            None,
-        )
+    _record_response_advisories(submission, response)
 
     for issue in response.issues:
         issue_field = issue.field if issue.field in selected_by_path else "llm"
@@ -241,11 +295,15 @@ def apply_llm_response(
             submission,
             Issue(
                 field=issue_field,
-                code=issue.code,
-                severity=issue.severity,
-                message=issue.message,
-                raw_value=None,
-                cleaned_value=None,
+                # Model-authored issue codes must not change status by
+                # colliding with importer-owned validation codes. Field-level
+                # confidence/review flags above are the only model signals
+                # that can hold a record for review.
+                code=LLM_MODEL_NOTE,
+                severity="info",
+                message=f"LLM note ({issue.code}): {issue.message}",
+                raw_value=issue.code,
+                cleaned_value={"model_severity": issue.severity},
             ),
         )
 
@@ -267,17 +325,35 @@ def _call_with_one_parse_retry(
     request: LlmNormalisationRequest,
     config: AppConfig,
     normaliser: Normaliser,
-    metrics: LlmUsageMetrics,
-) -> LlmNormalisationResponse:
+) -> _LlmCallOutcome:
+    calls = 0
+    retries = 0
     for attempt in range(2):
-        metrics.calls += 1
+        calls += 1
         try:
-            return normaliser(request, config)
-        except LlmResponseParseError:
+            return _LlmCallOutcome(
+                response=normaliser(request, config),
+                error=None,
+                calls=calls,
+                retries=retries,
+            )
+        except LlmResponseParseError as exc:
             if attempt == 0:
-                metrics.retries += 1
+                retries += 1
                 continue
-            raise
+            return _LlmCallOutcome(
+                response=None,
+                error=exc,
+                calls=calls,
+                retries=retries,
+            )
+        except Exception as exc:
+            return _LlmCallOutcome(
+                response=None,
+                error=exc,
+                calls=calls,
+                retries=retries,
+            )
 
     raise AssertionError("LLM parse retry loop should always return or raise")
 
@@ -517,3 +593,42 @@ def _add_llm_issue(
             cleaned_value=cleaned_value,
         ),
     )
+
+
+def _record_response_advisories(
+    submission: CourtSubmission,
+    response: LlmNormalisationResponse,
+) -> None:
+    """Keep aggregate model signals for audit without widening record scope.
+
+    A row can contain several selected fields and advisory address candidates.
+    The top-level response confidence does not say which one is uncertain, so
+    treating it as a submission-level blocker turns otherwise importable rows
+    into review records. The response schema still preserves these values for
+    observability; only field-level flags control review status.
+    """
+
+    if response.confidence in {"medium", "low"}:
+        add_issue_once(
+            submission,
+            Issue(
+                field="llm",
+                code=LLM_RESPONSE_LOW_CONFIDENCE,
+                severity="info",
+                message="LLM returned aggregate confidence below high; see field-level results",
+                raw_value=None,
+                cleaned_value=response.confidence,
+            ),
+        )
+    if response.needs_human_review:
+        add_issue_once(
+            submission,
+            Issue(
+                field="llm",
+                code=LLM_RESPONSE_REVIEW_ADVISORY,
+                severity="info",
+                message="LLM returned an aggregate review signal; see field-level results",
+                raw_value=None,
+                cleaned_value=None,
+            ),
+        )

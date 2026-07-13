@@ -126,6 +126,7 @@ def test_verification_handles_invalid_postcodes_and_unavailable_service_without_
     assert batch.action_reason_for(unavailable, 1) is None
     assert batch.as_dict()["action_blocking_count"] == 1
     assert batch.summary_metrics()["address_verification_action_blocking_count"] == 1
+    assert batch.summary_metrics()["address_verification_action_blocking_submission_count"] == 1
     assert calls == ["SW1A 1AA"]
 
 

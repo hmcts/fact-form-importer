@@ -266,6 +266,75 @@ def test_api_execution_commands_require_explicit_confirmation(tmp_path, capsys):
     assert exit_code == 1
     assert "--confirm is required" in captured.err
 
+    exit_code = main(
+        [
+            "api-execute-run",
+            "--output",
+            str(tmp_path / "out"),
+            "--run-id",
+            "run-1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--confirm is required" in captured.err
+
+
+def test_api_execute_run_reports_execution_summary(tmp_path, capsys, monkeypatch):
+    calls = []
+
+    class FakeExecutionService:
+        def __init__(self, output_path):
+            calls.append(output_path)
+
+        def execute_all_safe_actions(self, run_id):
+            calls.append(run_id)
+
+        def get_execution_summary(self, run_id):
+            return {
+                "selected_court_count": 2,
+                "planned_action_count": 3,
+                "court_status_counts": {"completed": 1, "attention_required": 1},
+                "action_status_counts": {"succeeded": 1, "blocked": 1, "failed": 1, "unknown": 0},
+                "common_error_themes": [
+                    {
+                        "label": "Address verification prevented the write",
+                        "action_count": 1,
+                        "court_count": 1,
+                    }
+                ],
+                "attention_actions": [
+                    {
+                        "court_slug": "example-court",
+                        "resource": "address",
+                        "status": "failed",
+                        "reason": "FaCT API rejected the write request",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr("fact_form_importer.cli.ApiExecutionService", FakeExecutionService)
+    output_path = tmp_path / "out"
+
+    exit_code = main(
+        [
+            "api-execute-run",
+            "--output",
+            str(output_path),
+            "--run-id",
+            "run-1",
+            "--confirm",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert calls == [output_path, "run-1"]
+    assert "Courts considered: 2" in captured.out
+    assert "Failed actions: 1" in captured.out
+    assert "Address verification prevented the write: 1 actions across 1 courts" in captured.out
+    assert "per-court action list" in captured.out
 
 def test_run_command_returns_error_for_missing_file(tmp_path, capsys):
     exit_code = main(["run", "--input", str(tmp_path / "missing.csv"), "--output", str(tmp_path)])

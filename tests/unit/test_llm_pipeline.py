@@ -1,11 +1,21 @@
-from fact_form_importer.config import FieldRulesConfig
+import threading
+
+from fact_form_importer.config import AppConfig, FieldRulesConfig
 from fact_form_importer.llm.client import LlmResponseParseError
 from fact_form_importer.llm.pipeline import (
     LLM_FIELD_NORMALISED,
+    LLM_MODEL_NOTE,
+    LLM_RESPONSE_LOW_CONFIDENCE,
+    LLM_RESPONSE_REVIEW_ADVISORY,
     apply_llm_response,
     normalise_submissions_with_llm,
 )
-from fact_form_importer.llm.schemas import LlmAddressMatch, LlmNormalisedField, LlmNormalisationResponse
+from fact_form_importer.llm.schemas import (
+    LlmAddressMatch,
+    LlmIssue,
+    LlmNormalisedField,
+    LlmNormalisationResponse,
+)
 from fact_form_importer.llm.schemas import LlmField
 from fact_form_importer.models.court_submission import Address, ContactDetail, CourtSubmission
 from fact_form_importer.models.source import SourceMetadata
@@ -69,6 +79,34 @@ def test_pipeline_does_not_call_model_when_all_values_match_vocabularies():
 
     assert result.metrics.calls == 0
     assert result.metrics.submissions_with_selected_fields == 0
+
+
+def test_pipeline_runs_independent_rows_with_bounded_concurrency(monkeypatch):
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "2")
+    first = _submission(description="general enquiries")
+    second = _submission(description="general appointments")
+    second.source = SourceMetadata(source_row_number=3)
+    barrier = threading.Barrier(2, timeout=1)
+    requests = []
+
+    def normaliser(request, config):
+        barrier.wait()
+        requests.append(request.record_id)
+        return _response(request.record_id, "contacts[1].description", "Enquiries")
+
+    result = normalise_submissions_with_llm(
+        [first, second],
+        _rules(),
+        _vocabularies(),
+        config=AppConfig(),
+        normaliser=normaliser,
+    )
+
+    assert sorted(requests) == ["source-row-2", "source-row-3"]
+    assert result.metrics.calls == 2
+    assert result.metrics.failures == 0
+    assert first.contacts[0].description == "Enquiries"
+    assert second.contacts[0].description == "Enquiries"
 
 
 def test_pipeline_retries_once_for_unparseable_response():
@@ -226,7 +264,7 @@ def test_list_vocabulary_value_is_canonicalised_and_applied_to_address():
     assert submission.addresses[0].areas_of_law == ["Family"]
 
 
-def test_record_level_llm_review_flag_requires_human_review():
+def test_record_level_llm_review_flag_is_advisory_when_fields_are_safe():
     submission = _submission(description="general enquiries")
     fields = [LlmField(field="contacts[1].description", raw_value="general enquiries")]
     response = _response("source-row-2", "contacts[1].description", "Enquiries")
@@ -235,7 +273,66 @@ def test_record_level_llm_review_flag_requires_human_review():
 
     apply_llm_response(submission, response, fields, _vocabularies())
 
+    assert calculate_status(submission) == "processed"
+    assert _has_issue(submission, LLM_RESPONSE_REVIEW_ADVISORY)
+
+
+def test_record_level_low_confidence_is_advisory_when_fields_are_high_confidence():
+    submission = _submission(description="general enquiries")
+    fields = [LlmField(field="contacts[1].description", raw_value="general enquiries")]
+    response = _response("source-row-2", "contacts[1].description", "Enquiries")
+    response.confidence = "low"
+
+    apply_llm_response(submission, response, fields, _vocabularies())
+
+    assert calculate_status(submission) == "processed"
+    assert _has_issue(submission, LLM_RESPONSE_LOW_CONFIDENCE)
+
+
+def test_null_field_with_explicit_review_flag_requires_human_review():
+    submission = _submission(description="general enquiries")
+    fields = [LlmField(field="contacts[1].description", raw_value="general enquiries")]
+    response = LlmNormalisationResponse(
+        record_id="source-row-2",
+        normalised_fields=[
+            LlmNormalisedField(
+                field="contacts[1].description",
+                value=None,
+                confidence="high",
+                needs_human_review=True,
+                reason="No safe controlled-list match exists.",
+            )
+        ],
+        confidence="high",
+        needs_human_review=False,
+        issues=[],
+        address_matches=[],
+    )
+
+    apply_llm_response(submission, response, fields, _vocabularies())
+
+    assert submission.contacts[0].description == "general enquiries"
+    assert _has_issue(submission, "LLM_REVIEW_REQUIRED")
     assert calculate_status(submission) == "needs_human_review"
+
+
+def test_model_authored_issue_is_kept_as_a_nonblocking_note():
+    submission = _submission(description="general enquiries")
+    fields = [LlmField(field="contacts[1].description", raw_value="general enquiries")]
+    response = _response("source-row-2", "contacts[1].description", "Enquiries")
+    response.issues = [
+        LlmIssue(
+            field="contacts[1].description",
+            code="LLM_REVIEW_REQUIRED",
+            severity="warning",
+            message="Model-only observation.",
+        )
+    ]
+
+    apply_llm_response(submission, response, fields, _vocabularies())
+
+    assert calculate_status(submission) == "processed"
+    assert _has_issue(submission, LLM_MODEL_NOTE)
 
 
 def test_revalidation_removes_stale_vocab_issue_after_valid_llm_mapping():
@@ -309,6 +406,7 @@ def test_pipeline_can_record_an_advisory_os_candidate_without_mutating_the_addre
 
     assert submission.addresses[0].line_1 == "1 Main Street"
     assert verification.llm_suggestion["uprn"] == "uprn-1"
+    assert calculate_status(submission) == "processed"
     assert result.metrics.address_candidate_groups_selected == 1
     assert result.metrics.address_suggestions_recorded == 1
 
@@ -365,6 +463,7 @@ def _response(record_id, field, value, confidence="high"):
         confidence=confidence,
         needs_human_review=False,
         issues=[],
+        address_matches=[],
     )
 
 

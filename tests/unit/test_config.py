@@ -174,6 +174,7 @@ def test_app_config_reads_fact_data_api_environment(monkeypatch):
 
 def test_app_config_reads_openai_environment(monkeypatch):
     monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "12")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://ai-foundry.example.test/openai/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "token")
     monkeypatch.setenv("OPENAI_MODEL", "gpt-5.5")
@@ -181,6 +182,7 @@ def test_app_config_reads_openai_environment(monkeypatch):
     config = AppConfig()
 
     assert config.llm_enabled is True
+    assert config.llm_max_concurrency == 12
     assert config.openai_base_url == "https://ai-foundry.example.test/openai/v1"
     assert config.openai_api_key == "token"
     assert config.openai_model == "gpt-5.5"
@@ -188,6 +190,7 @@ def test_app_config_reads_openai_environment(monkeypatch):
 
 def test_app_config_defaults_llm_to_disabled(monkeypatch):
     monkeypatch.delenv("LLM_ENABLED", raising=False)
+    monkeypatch.delenv("LLM_MAX_CONCURRENCY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_MODEL", raising=False)
@@ -195,6 +198,7 @@ def test_app_config_defaults_llm_to_disabled(monkeypatch):
     config = AppConfig()
 
     assert config.llm_enabled is False
+    assert config.llm_max_concurrency == 8
     assert config.openai_base_url is None
     assert config.openai_api_key is None
     assert config.openai_model is None

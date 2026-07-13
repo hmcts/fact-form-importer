@@ -120,7 +120,13 @@ def test_build_fact_import_payload_preserves_api_ready_child_sections_without_re
     assert record["buildingFacilities"]["freeWaterDispensers"] is True
     assert record["accessibilityOptions"]["quietRoom"] is True
     assert record["translationServices"] == {"email": "translation@example.test"}
-    assert record["professionalInformation"] == {"interviewRooms": True, "interviewRoomCount": 2}
+    assert record["professionalInformation"] == {
+        "interviewRooms": True,
+        "interviewRoomCount": 2,
+        "videoHearings": False,
+        "commonPlatform": False,
+        "accessScheme": False,
+    }
     assert record["addresses"][0]["areasOfLaw"] == ["area-id"]
     assert record["addresses"][0]["courtTypes"] == ["type-id"]
     assert record["contactDetails"][0]["courtContactDescriptionId"] == "contact-id"
@@ -181,6 +187,8 @@ def test_build_import_summary_counts_statuses_and_issues(tmp_path):
     assert summary["llm_enabled"] is True
     assert summary["row_count"] == 7
     assert summary["submission_count"] == 4
+    assert summary["unique_court_slug_count"] == 4
+    assert summary["status_count_total"] == 4
     assert summary["processed_count"] == 1
     assert summary["processed_with_warnings_count"] == 1
     assert summary["needs_human_review_count"] == 1
@@ -218,6 +226,24 @@ def test_build_import_summary_includes_llm_usage_metrics(tmp_path):
     assert summary["llm_failures"] == 1
     assert summary["llm_fields_processed"] == 4
     assert summary["llm_model"] == "gpt-5.5"
+
+
+def test_build_import_summary_counts_llm_review_rows(tmp_path):
+    submission = _submission(
+        "review-court",
+        "needs_human_review",
+        issue_code="LLM_LOW_CONFIDENCE",
+    )
+
+    summary = build_import_summary(
+        [submission],
+        IngestResult(),
+        _profile(tmp_path / "source.csv", row_count=1),
+        "run-1",
+    )
+
+    assert summary["llm_review_submission_count"] == 1
+    assert summary["llm_review_issue_count"] == 1
 
 
 def test_write_processing_outputs_writes_expected_files(tmp_path):

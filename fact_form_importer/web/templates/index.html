@@ -21,9 +21,11 @@
 </form>
 <h2>Archived runs</h2>
 <table>
-  <thead><tr><th>Run</th><th>Completed</th><th>Source</th><th>Processed</th><th>Warnings</th><th>Review</th><th>Failed</th><th>Address check</th><th>LLM</th></tr></thead>
-  <tbody>{% for archive in archives %}{% set summary = archive.manifest.summary %}
-    <tr><td><a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">{{ archive.manifest.run_id }}</a></td><td>{{ archive.manifest.completed_at }}</td><td>{{ archive.manifest.source_name }}</td><td>{{ summary.processed_count }}</td><td>{{ summary.processed_with_warnings_count }}</td><td>{{ summary.needs_human_review_count }}</td><td>{{ summary.failed_count }}</td><td>{{ summary.address_verification_count or 0 }}</td><td>{{ 'requested' if summary.llm_requested else 'not used' }}</td></tr>
-  {% else %}<tr><td colspan="9">No completed archives yet.</td></tr>{% endfor %}</tbody>
+  <thead><tr><th>Run</th><th>Completed</th><th>Source</th><th>Form rows</th><th>Unique court slugs</th><th>Processed rows</th><th>Warning rows</th><th>Review rows</th><th>Failed rows</th>{% if has_llm_review_factors %}<th>LLM review rows</th>{% endif %}{% if has_os_address_factors %}<th>OS-held address rows</th>{% endif %}<th>Address check</th><th>LLM</th></tr></thead>
+  <tbody>{% for archive in archives %}{% set summary = archive.manifest.summary %}{% set factors = archive.factor_summary %}
+    {% set status_total = summary.get('processed_count', 0) + summary.get('processed_with_warnings_count', 0) + summary.get('needs_human_review_count', 0) + summary.get('failed_count', 0) %}
+    <tr><td><a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">{{ archive.manifest.run_id }}</a></td><td>{{ archive.manifest.completed_at }}</td><td>{{ archive.manifest.source_name }}</td><td>{{ summary.get('submission_count', status_total) }}</td><td>{{ summary.get('unique_court_slug_count', factors.unique_court_slug_count) }}</td><td>{{ summary.processed_count }}</td><td>{{ summary.processed_with_warnings_count }}</td><td>{{ summary.needs_human_review_count }}</td><td>{{ summary.failed_count }}</td>{% if has_llm_review_factors %}<td>{% if factors.llm_review_submission_count %}<a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id) }}">{{ factors.llm_review_submission_count }}</a>{% else %}0{% endif %}</td>{% endif %}{% if has_os_address_factors %}<td>{% if factors.os_action_blocking_submission_count %}<a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id) }}">{{ factors.os_action_blocking_submission_count }}</a>{% else %}0{% endif %}</td>{% endif %}<td>{{ summary.address_verification_count or 0 }}</td><td>{{ 'requested' if summary.llm_requested else 'not used' }}</td></tr>
+  {% else %}<tr><td colspan="13">No completed archives yet.</td></tr>{% endfor %}</tbody>
 </table>
+<p class="muted">Processed, warning, review, and failed counts are form-row statuses and always sum to Form rows. LLM review rows are direct model-related review factors. OS-held address rows are address actions awaiting review; OS evidence does not itself change the row's import status.</p>
 {% endblock %}

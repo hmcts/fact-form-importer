@@ -93,7 +93,9 @@ python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" 
 Runs the same pipeline with optional LLM normalisation. This requires
 `LLM_ENABLED=true` and configured OpenAI settings. It makes at most one
 row-level model call for each record with safe selected fields, plus one retry
-only if the structured response cannot be parsed.
+only if the structured response cannot be parsed. Independent rows run in a
+bounded pool (eight by default), but their request contents and returned values
+are never combined.
 
 `--verify-addresses --use-llm` may additionally send unresolved OS candidate
 comparisons to the same row-level request. It sends no postcode, contact data,
@@ -123,8 +125,8 @@ python3 -m fact_form_importer api-check-court --output "./out" --run-id "<run-id
 
 Re-resolves one existing court by slug and checks each target FaCT section
 without making a write. This records `ready`, `blocked`, or `unknown` action
-states in `out/execution-state/<run-id>.json`; it is the required first step
-before executing any action.
+states in `out/execution-state/<run-id>.json`. It is useful for reviewing one
+court before writing; every write command repeats the same live checks.
 
 If a preflight fails, the record view and ledger now retain a safe diagnostic,
 including the HTTP status where the API supplied one. `HTTP 401` or `HTTP 403`
@@ -135,13 +137,20 @@ A connection error means the FaCT **application** is not reachable at
 ```bash
 python3 -m fact_form_importer api-execute-action --output "./out" --run-id "<run-id>" --court-slug "<court-slug>" --action-id "<action-id>" --confirm
 python3 -m fact_form_importer api-execute-court --output "./out" --run-id "<run-id>" --court-slug "<court-slug>" --confirm
+python3 -m fact_form_importer api-execute-run --output "./out" --run-id "<run-id>" --confirm
 ```
 
 Executes one reviewed API action, or all currently safe actions for one court.
-Both require `FACT_DATA_API_WRITES_ENABLED=true`, an existing FaCT user UUID in
+`api-execute-run` processes every importable court sequentially in slug order.
+It re-resolves each court and preflights every action immediately before a
+write, continues after failures, and does not automatically retry an earlier
+`blocked`, `failed`, or `unknown` action. All three commands require
+`FACT_DATA_API_WRITES_ENABLED=true`, an existing FaCT user UUID in
 `FACT_DATA_API_USER_ID`, and explicit `--confirm` acknowledgement. FaCT uses
 that UUID to attribute its audit records; the importer never creates a user
-automatically. There is deliberately no all-courts write command.
+automatically. The batch command prints counts and grouped attention themes;
+use `out/execution_summary.json` or the execution-summary page in the local UI
+for the complete per-court action list.
 
 ```bash
 python3 -m fact_form_importer check-llm
@@ -212,6 +221,7 @@ credentials and structured responses. To permit the optional run stage, set:
 
 ```text
 LLM_ENABLED=true
+LLM_MAX_CONCURRENCY=8
 OPENAI_BASE_URL=https://<your-ai-foundry-resource>.services.ai.azure.com/openai/v1
 OPENAI_API_KEY=<your-api-key>
 OPENAI_MODEL=<your-deployment-name>
@@ -219,7 +229,8 @@ OPENAI_MODEL=<your-deployment-name>
 
 The OpenAI client will use the newer `from openai import OpenAI` style with
 `base_url`, `api_key`, and `model`; no separate Azure OpenAI API version is
-configured.
+configured. `LLM_MAX_CONCURRENCY` is capped between 1 and 16; reduce it if the
+Azure deployment reports capacity or rate-limit errors.
 
 Address verification uses the existing FaCT API credential settings, not a
 direct Ordnance Survey integration:
@@ -253,6 +264,14 @@ are selected. Fields containing embedded email, phone, or postcode data are
 also excluded. Each request contains only selected fields, their relevant
 allowed vocabulary values, and their field-specific rules. Court slugs and all
 metadata remain out of the request.
+
+LLM status is deliberately field-scoped. A selected field returned with medium
+or low confidence, or explicitly marked for review, holds that submission for
+review. The model's aggregate response confidence and aggregate review flag are
+retained as audit notes only: they cannot downgrade a whole court when the
+uncertainty relates to a separate field or an advisory OS address candidate.
+Unresolved OS address verification blocks only the affected address action in
+the API-readiness plan; it does not itself downgrade the court submission.
 
 To sanity-check the configured endpoint, API key, and model without running the
 import pipeline:
@@ -482,6 +501,34 @@ the target API section. Under the current conservative policy, a populated
 target section blocks that action for human review rather than replacing,
 merging, or deleting existing FaCT data.
 
+For professional information, the form supplies only interview-room values.
+The approved migration policy sets `videoHearings`, `commonPlatform`, and
+`accessScheme` to `false` in the generated FaCT request when professional
+information is present. It never changes the source submission; each action
+records this as a visible `migration_assumptions` item in the readiness report
+and review UI.
+
+### API-required values not collected by the form
+
+The importer does **not** invent text, telephone numbers, measurements, or
+contact details merely to satisfy a FaCT API constraint. In particular, when a
+court has no lift, FaCT currently requires `liftSupportPhoneNumber`, but the
+Microsoft Form has no lift-specific support-number question. That field is a
+validated public telephone number, not free text: values such as `unknown`,
+`N/A`, or a numeric placeholder would either be rejected or displayed to court
+users as a misleading phone number. The action therefore remains pending.
+
+The same rule applies to a missing accessible-entrance support number and to
+lift dimensions/weight limits that were left blank in the optional form fields.
+Only explicit, product-approved boolean defaults are applied, such as the
+professional-information defaults above.
+
+The public FaCT frontend already has a safe no-number fallback for a court with
+no lift. To unblock these actions without inventing data, either provide a
+verified court-specific support number through a reviewed override, or relax
+the existing FaCT API conditional validation to permit a null value. Neither
+option requires a new API endpoint.
+
 The action report is generated against the FaCT API contract in use at the
 time of the run. Before a write, the execution layer validates the body again
 with the freshly resolved court UUID. This protects older archives from being
@@ -511,14 +558,24 @@ Confirmed `succeeded` and `blocked` states are retained if a later live
 preflight cannot reach FaCT, so a transient token or connectivity problem does
 not erase prior execution evidence.
 
+Each check or write also creates
+`out/execution-state/<run-id>.summary.json` and refreshes the latest
+`out/execution_summary.json`. These mutable reports contain per-court action
+outcomes, an explicit list of actions needing attention, and grouped error
+themes such as existing target data, address verification, missing
+accessibility details, inconsistent interview-room data, opening-hours
+constraints, API validation, and authentication failures. They intentionally
+contain no action bodies or raw form data.
+
 `run_manifest.json` records the source display name, completion time, run
 summary, and SHA-256 hashes of every archived artifact. Use it to identify a
 historic run and verify its files.
 
-`out/execution-state/` is a local, git-ignored execution ledger rather than an
-archive artifact. It lets the UI show whether individual actions have been
-checked, blocked, completed, failed, or have an unknown outcome without
-changing the generated run evidence or its integrity hashes.
+`out/execution-state/` is a local, git-ignored execution ledger and execution
+report directory rather than an archive artifact. It lets the UI show whether
+individual actions have been checked, blocked, completed, failed, or have an
+unknown outcome without changing the generated run evidence or its integrity
+hashes.
 
 `failed_records.json` contains records that cannot progress because required
 data is missing or schema-critical validation failed.
@@ -559,8 +616,8 @@ count, mapping warnings, issue counts by code, `vocabulary_source`, and whether
 LLM processing was enabled. It also records LLM requested state, calls,
 failures, parse retries, selected and processed field counts, affected
 submissions, model name, address-verification enabled/count/cache/review and
-address-action-blocking
-metrics, and API-readiness ready/pending action counts. In a
+address-action-blocking metrics, direct LLM review-row counts, and API-readiness
+ready/pending action counts. In a
 normal run, `vocabulary_source` should be
 `fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
 run. Duplicate groups are conservative for now: every affected record is
@@ -569,6 +626,17 @@ count. The duplicate count is not an additional status category: a duplicate
 record can also have other review issues, such as invalid opening hours. The
 importer does not pick a winner or merge duplicate rows until explicit
 merge/precedence rules exist.
+
+The status counts are counts of submitted form rows and always add up to
+`submission_count`. `unique_court_slug_count` is reported separately because a
+single court can have multiple submitted forms while duplicate handling remains
+awaiting an NSU decision.
+
+`llm_review_submission_count` counts rows with an LLM-specific issue that
+contributes to `needs_human_review`. Address verification is deliberately
+separate: `address_verification_action_blocking_submission_count` counts rows
+with an address action held by FaCT/OS evidence. An OS-held address does not,
+by itself, change the row's import status.
 
 `nsu_cleaned_review.xlsx` is a reviewer-friendly Excel workbook. It is not the
 machine-readable source of truth; the JSON files remain that. The workbook helps
@@ -599,11 +667,19 @@ newest to oldest. Select a run to inspect its summary, records, raw submitted
 values, cleaned values, issues, duplicate status and API readiness report. A
 record with an action plan has a FaCT API execution table showing the request
 body, relevant cleaned values, mapped raw source values, preflight outcome and
-current execution state. The UI can check a court, run one action, or run all
-safe actions for that one court. Write buttons appear only when
+current execution state. The run page links to an execution summary with a
+downloadable JSON report and can run all currently safe actions sequentially.
+The record page can still check a court, run one action, or run all safe actions
+for that one court. Write buttons appear only when
 `FACT_DATA_API_WRITES_ENABLED=true`; server-side checks enforce the same rule.
-There is no global bulk-write control. Tables support status/court-row filtering
-and pagination; every listed archive artifact can be downloaded. The upload
+The run-level write control prompts for confirmation and uses the same
+no-overwrite preflight as the record controls. Tables support status/court-row
+filtering and pagination. When relevant, the run list and run page show direct
+LLM review rows and OS-held address rows separately, each linking to a paginated
+factor page. LLM factors are model-specific causes of human review; OS factors hold
+only the affected address action. Each run has a single ZIP download containing
+its JSON, workbooks, reports, and immutable manifest; individual files remain
+available in a collapsed list. The upload
 form accepts CSV/XLSX only, runs one job at a time, deletes the original upload
 on completion, and offers optional address verification when FaCT credentials
 are configured and LLM use only as an explicit checkbox when `LLM_ENABLED=true`.

@@ -16,6 +16,11 @@ If a value is unclear, vague, contradictory, or cannot be safely mapped, keep it
 For controlled vocabularies, return only exact allowed vocabulary values.
 For address candidates, choose only a UPRN supplied in the request, or null.
 Address candidate selections are advisory and must not reconstruct or invent an address.
+Return one normalised_fields item for every selected field. If no safe value can
+be returned, set that field's value to null and set its needs_human_review flag
+appropriately. Put field uncertainty on that field, not only on the aggregate
+response. Address-candidate ambiguity belongs in address_matches, not in the
+aggregate response-level review flag.
 """
 
 

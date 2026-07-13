@@ -1,25 +1,52 @@
 {% extends "base.html" %}
 {% block content %}
 {% set summary = archive.manifest.summary %}
+{% set status_total = summary.get('processed_count', 0) + summary.get('processed_with_warnings_count', 0) + summary.get('needs_human_review_count', 0) + summary.get('failed_count', 0) %}
 <h1>Run {{ archive.manifest.run_id }}</h1>
 <p>{{ archive.manifest.source_name }} · {{ archive.manifest.completed_at }}</p>
 <nav>
   <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">All records</a>
   <a href="{{ url_for('records', run_id=archive.manifest.run_id, status='needs_human_review') }}">Needs review</a>
   <a href="{{ url_for('issues', run_id=archive.manifest.run_id) }}">Issues</a>
+  {% if factor_summary.llm_review_submission_count %}<a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id) }}">LLM review factors</a>{% endif %}
+  {% if factor_summary.os_action_blocking_submission_count %}<a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id) }}">OS-held addresses</a>{% endif %}
   <a href="{{ url_for('api_actions', run_id=archive.manifest.run_id) }}">Readiness report</a>
+  <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Execution summary</a>
 </nav>
 <div class="summary">
-  {% for label, key in [('Processed','processed_count'),('Warnings','processed_with_warnings_count'),('Needs review','needs_human_review_count'),('Failed','failed_count'),('Duplicate records','duplicate_slug_affected_record_count'),('Addresses checked','address_verification_count'),('Address actions held','address_verification_action_blocking_count'),('Ready API actions','api_manifest_ready_action_count'),('Pending API actions','api_manifest_pending_action_count'),('LLM calls','llm_calls')] %}
-  <div><strong>{{ label }}</strong><br>{{ summary.get(key, 0) }}</div>
+  {% for label, value in [('Form rows', summary.get('submission_count', status_total)),('Unique court slugs', summary.get('unique_court_slug_count', factor_summary.unique_court_slug_count)),('Processed rows', summary.get('processed_count', 0)),('Warning rows', summary.get('processed_with_warnings_count', 0)),('Needs review rows', summary.get('needs_human_review_count', 0)),('Failed rows', summary.get('failed_count', 0)),('Duplicate rows', summary.get('duplicate_slug_affected_record_count', 0)),('Addresses checked', summary.get('address_verification_count', 0)),('Address actions held', summary.get('address_verification_action_blocking_count', 0)),('Ready API actions', summary.get('api_manifest_ready_action_count', 0)),('Pending API actions', summary.get('api_manifest_pending_action_count', 0)),('LLM calls', summary.get('llm_calls', 0))] %}
+  <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
-<h2>Import payload</h2>
-{% if primary_artifacts %}
-<ul>{% for artifact in primary_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>
-{% else %}<p>This legacy run does not contain an import payload.</p>{% endif %}
-<h2>Review reports</h2>
-<ul>{% for artifact in report_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>
-<h2>Other archived files</h2>
-<ul>{% for artifact in other_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>
+<p class="muted">The four status counts are form-row counts and sum to Form rows. Unique court slugs can be lower because duplicate submissions remain separate for review.</p>
+{% if factor_summary.llm_review_submission_count or factor_summary.os_action_blocking_submission_count %}
+<h2>Review Factors</h2>
+<div class="summary">
+  {% if factor_summary.llm_review_submission_count %}<div><strong>LLM review rows</strong><br><a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id) }}">{{ factor_summary.llm_review_submission_count }}</a><br><span class="muted">{{ factor_summary.llm_review_issue_count }} field factors</span></div>{% endif %}
+  {% if factor_summary.os_action_blocking_submission_count %}<div><strong>OS-held address rows</strong><br><a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id) }}">{{ factor_summary.os_action_blocking_submission_count }}</a><br><span class="muted">{{ factor_summary.os_action_blocking_address_count }} address actions</span></div>{% endif %}
+</div>
+<p class="muted">LLM review rows have a model-specific issue that contributes to human review. OS-held addresses require a decision before that address action can be sent, but do not independently change the court row's import status.</p>
+{% endif %}
+<h2>API execution</h2>
+<div class="summary">
+  {% for label, value in [('Completed courts', execution_summary.court_status_counts.completed), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  <div><strong>{{ label }}</strong><br>{{ value }}</div>
+  {% endfor %}
+</div>
+{% if writes_enabled %}
+<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe action for this archived run? Existing FaCT data will remain blocked.');">
+  <button type="submit">Run all currently safe actions</button>
+</form>
+{% else %}
+<p class="muted">Run-level writes are disabled. Set <code>FACT_DATA_API_WRITES_ENABLED=true</code> only when ready to make approved FaCT changes.</p>
+{% endif %}
+<h2>Downloads</h2>
+<a class="button-link" href="{{ url_for('download_archive', run_id=archive.manifest.run_id) }}">Download this run (.zip)</a>
+<p class="muted">Includes the JSON outputs, review workbooks, reports, and immutable run manifest.</p>
+<details>
+  <summary>Individual files</summary>
+  {% if primary_artifacts %}<h3>Import payload</h3><ul>{% for artifact in primary_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>{% endif %}
+  {% if report_artifacts %}<h3>Review reports</h3><ul>{% for artifact in report_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>{% endif %}
+  {% if other_artifacts %}<h3>Other archived files</h3><ul>{% for artifact in other_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>{% endif %}
+</details>
 {% endblock %}

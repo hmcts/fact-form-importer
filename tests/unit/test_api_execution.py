@@ -5,6 +5,7 @@ import pytest
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.fact_api import ApiResponse, FactApiExecutionClient
+from fact_form_importer.execution.report import _error_theme
 from fact_form_importer.execution.service import ApiExecutionService
 from fact_form_importer.output.archive import publish_run_archive, stage_path
 from fact_form_importer.validators.fact_api_courts import CourtReference
@@ -31,8 +32,10 @@ class FakeFactApiClient:
         self.address_lookup = address_lookup
         self.get_paths = []
         self.writes = []
+        self.lookup_slugs = []
 
     def lookup_court(self, slug):
+        self.lookup_slugs.append(slug)
         if self.lookup_error:
             raise self.lookup_error
         return self.court
@@ -390,14 +393,134 @@ def test_execution_reports_nested_api_validation_feedback(tmp_path, monkeypatch)
     assert action.reason == "FaCT API rejected the write request (HTTP 400): courtId: must not be null"
 
 
-def _archive(tmp_path, actions=None):
+def test_execute_all_safe_actions_runs_in_slug_order_continues_after_failure_and_writes_summary(
+    tmp_path, monkeypatch
+):
+    run_id = _archive(
+        tmp_path,
+        records=[
+            {
+                "court_slug": "bravo-court",
+                "court_id": "court-id",
+                "source_row_numbers": [3],
+                "actions": [_action("bravo-court-1")],
+            },
+            {
+                "court_slug": "alpha-court",
+                "court_id": "court-id",
+                "source_row_numbers": [2],
+                "actions": [_action("alpha-court-1")],
+            },
+        ],
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+
+    class FailFirstWriteClient(FakeFactApiClient):
+        def write(self, method, path, body):
+            self.writes.append((method, path, body))
+            return ApiResponse(400, {"message": "first action rejected"}) if len(self.writes) == 1 else ApiResponse(201)
+
+    client = FailFirstWriteClient(target=ApiResponse(204))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    ledger = service.execute_all_safe_actions(run_id)
+    summary = service.get_execution_summary(run_id)
+
+    assert client.lookup_slugs == ["alpha-court", "bravo-court"]
+    assert len(client.writes) == 2
+    assert ledger.courts["alpha-court"].status == "attention_required"
+    assert ledger.courts["bravo-court"].status == "completed"
+    assert summary["action_status_counts"]["failed"] == 1
+    assert summary["action_status_counts"]["succeeded"] == 1
+    assert summary["common_error_themes"][0]["code"] == "api_validation"
+    assert (tmp_path / "out" / "execution-state" / f"{run_id}.summary.json").exists()
+    assert (tmp_path / "out" / "execution_summary.json").exists()
+
+    service.execute_all_safe_actions(run_id)
+    assert len(client.writes) == 2
+
+
+def test_execute_all_safe_actions_marks_unexpected_court_error_and_continues(tmp_path, monkeypatch):
+    run_id = _archive(
+        tmp_path,
+        records=[
+            {
+                "court_slug": "alpha-court",
+                "court_id": "court-id",
+                "source_row_numbers": [2],
+                "actions": [_action("alpha-court-1")],
+            },
+            {
+                "court_slug": "bravo-court",
+                "court_id": "court-id",
+                "source_row_numbers": [3],
+                "actions": [_action("bravo-court-1")],
+            },
+        ],
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+
+    class ExplodingTargetClient(FakeFactApiClient):
+        def __init__(self):
+            super().__init__(target=ApiResponse(204), write=ApiResponse(201))
+            self.current_slug = None
+
+        def lookup_court(self, slug):
+            self.current_slug = slug
+            return super().lookup_court(slug)
+
+        def get(self, path):
+            if self.current_slug == "alpha-court":
+                raise RuntimeError("unexpected target failure")
+            return super().get(path)
+
+    client = ExplodingTargetClient()
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    ledger = service.execute_all_safe_actions(run_id)
+
+    assert ledger.courts["alpha-court"].actions["alpha-court-1"].status == "unknown"
+    assert ledger.courts["bravo-court"].actions["bravo-court-1"].status == "succeeded"
+    assert "Unexpected execution error" in ledger.courts["alpha-court"].actions[
+        "alpha-court-1"
+    ].reason
+    assert len(client.writes) == 1
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_code"),
+    [
+        ("liftDoorWidth is required by the FaCT API when lift is true", "missing_accessibility_detail"),
+        (
+            "professionalInformation.interviewRoomCount must be between 1 and 150 when interviewRooms is true",
+            "invalid_interview_room_detail",
+        ),
+        (
+            "openingTimesDetails must contain at least one valid opening period for the FaCT API",
+            "invalid_opening_hours",
+        ),
+        ("phoneNumber does not match the FaCT API phone format", "invalid_contact_detail"),
+        (
+            "Address verification requires review: Postcode region is not supported by the FaCT API",
+            "address_verification",
+        ),
+    ],
+)
+def test_execution_summary_groups_common_form_and_api_contract_gaps(reason, expected_code):
+    code, _ = _error_theme("blocked", None, reason)
+
+    assert code == expected_code
+
+
+def _archive(tmp_path, actions=None, records=None):
     run_id = "20260713T120000Z-execution"
     output_root = tmp_path / "out"
     staging = stage_path(output_root, run_id)
     staging.mkdir(parents=True)
     report = {
         "run_id": run_id,
-        "records": [
+        "records": records
+        or [
             {
                 "court_slug": "example-court",
                 "court_id": "court-id",

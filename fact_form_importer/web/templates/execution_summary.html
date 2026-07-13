@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>API execution summary: {{ archive.manifest.run_id }}</h1>
+<nav>
+  <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
+  <a href="{{ url_for('execution_summary_json', run_id=archive.manifest.run_id) }}">Download JSON</a>
+</nav>
+<div class="summary">
+  {% for label, value in [('Courts considered', execution_summary.selected_court_count), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  <div><strong>{{ label }}</strong><br>{{ value }}</div>
+  {% endfor %}
+</div>
+
+<h2>Common error themes</h2>
+<table>
+  <thead><tr><th>Theme</th><th>Actions</th><th>Courts</th><th>Example reason</th></tr></thead>
+  <tbody>{% for theme in execution_summary.common_error_themes %}
+    <tr><td><strong>{{ theme.label }}</strong><br><code>{{ theme.code }}</code></td><td>{{ theme.action_count }}</td><td>{{ theme.courts | join(', ') }}</td><td>{{ theme.example_reason }}</td></tr>
+  {% else %}<tr><td colspan="4">No actions currently need attention.</td></tr>{% endfor %}</tbody>
+</table>
+
+<h2>Actions needing attention</h2>
+<table>
+  <thead><tr><th>Court</th><th>Source rows</th><th>Action</th><th>Status</th><th>HTTP</th><th>Reason</th></tr></thead>
+  <tbody>{% for action in execution_summary.attention_actions %}
+    <tr><td>{{ action.court_slug }}</td><td>{{ action.source_row_numbers | join(', ') }}</td><td>{{ action.resource }}<br><code>{{ action.method }} {{ action.path }}</code></td><td>{{ action.status }}</td><td>{{ action.http_status or '' }}</td><td>{{ action.reason }}</td></tr>
+  {% else %}<tr><td colspan="6">No actions currently need attention.</td></tr>{% endfor %}</tbody>
+</table>
+
+<h2>Court status</h2>
+<table>
+  <thead><tr><th>Court</th><th>Source rows</th><th>Status</th><th>Action outcomes</th></tr></thead>
+  <tbody>{% for court in execution_summary.courts %}
+    <tr><td>{{ court.court_slug }}</td><td>{{ court.source_row_numbers | join(', ') }}</td><td>{{ court.status }}</td><td>{% for action in court.actions %}{{ action.resource }}: {{ action.status }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td></tr>
+  {% else %}<tr><td colspan="4">No importable courts have an API action plan.</td></tr>{% endfor %}</tbody>
+</table>
+{% endblock %}

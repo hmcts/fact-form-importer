@@ -7,10 +7,23 @@ import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
+from zipfile import ZIP_STORED, ZipFile
 
-from flask import Flask, abort, jsonify, redirect, render_template, request, send_from_directory, url_for
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    send_from_directory,
+    url_for,
+)
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
@@ -19,9 +32,17 @@ from fact_form_importer.execution.service import ApiExecutionService
 from fact_form_importer.ingest.column_mapping import load_column_mapping
 from fact_form_importer.output.archive import load_run_archive, list_run_archives
 from fact_form_importer.processing import ProcessingResult, process_workbook
+from fact_form_importer.validators.base import LLM_HUMAN_REVIEW_ISSUE_CODES
 
 PAGE_SIZE = 50
 ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
+OS_ACTION_BLOCKING_STATUSES = {
+    "review_required",
+    "invalid_postcode",
+    "unsupported_postcode_region",
+    "no_os_result",
+    "missing_postcode",
+}
 
 
 @dataclass(frozen=True)
@@ -186,11 +207,21 @@ def create_app(
 
     @app.get("/")
     def index():
+        archives = list_run_archives(output_root)
+        for archive in archives:
+            archive["factor_summary"] = _run_factor_summary(archive)
         return render_template(
             "index.html",
-            archives=list_run_archives(output_root),
+            archives=archives,
             llm_enabled=app.config["APP_CONFIG"].llm_enabled,
             address_verification_available=_address_verification_available(app.config["APP_CONFIG"]),
+            has_llm_review_factors=any(
+                archive["factor_summary"]["llm_review_submission_count"] > 0 for archive in archives
+            ),
+            has_os_address_factors=any(
+                archive["factor_summary"]["os_action_blocking_submission_count"] > 0
+                for archive in archives
+            ),
         )
 
     @app.post("/runs")
@@ -236,6 +267,9 @@ def create_app(
             primary_artifacts=primary_artifacts,
             report_artifacts=report_artifacts,
             other_artifacts=other_artifacts,
+            factor_summary=_run_factor_summary(archive),
+            execution_summary=app.config["EXECUTION_SERVICE"].get_execution_summary(run_id),
+            writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
         )
 
     @app.get("/runs/<run_id>/records")
@@ -324,6 +358,34 @@ def create_app(
             "issues.html", archive=archive, issues=issues_page, code=code, page=page, pages=pages
         )
 
+    @app.get("/runs/<run_id>/llm-review-factors")
+    def llm_review_factors(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        factors = _llm_review_factors(archive)
+        page, pages, factors_page = _paginate(factors, request.args.get("page"))
+        return render_template(
+            "llm_review_factors.html",
+            archive=archive,
+            factors=factors_page,
+            factor_summary=_run_factor_summary(archive),
+            page=page,
+            pages=pages,
+        )
+
+    @app.get("/runs/<run_id>/os-address-factors")
+    def os_address_factors(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        factors = _os_address_factors(archive)
+        page, pages, factors_page = _paginate(factors, request.args.get("page"))
+        return render_template(
+            "os_address_factors.html",
+            archive=archive,
+            factors=factors_page,
+            factor_summary=_run_factor_summary(archive),
+            page=page,
+            pages=pages,
+        )
+
     @app.get("/runs/<run_id>/api-actions")
     def api_actions(run_id: str):
         archive = _archive_or_404(output_root, run_id)
@@ -353,6 +415,29 @@ def create_app(
             page=page,
             pages=pages,
             writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
+        )
+
+    @app.get("/runs/<run_id>/execution-summary")
+    def execution_summary(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        return render_template(
+            "execution_summary.html",
+            archive=archive,
+            execution_summary=app.config["EXECUTION_SERVICE"].get_execution_summary(run_id),
+        )
+
+    @app.get("/runs/<run_id>/execution-summary.json")
+    def execution_summary_json(run_id: str):
+        _archive_or_404(output_root, run_id)
+        payload = app.config["EXECUTION_SERVICE"].get_execution_summary(run_id)
+        return Response(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{run_id}-execution-summary.json"'
+                )
+            },
         )
 
     @app.post("/runs/<run_id>/courts/<court_slug>/api-check")
@@ -385,6 +470,27 @@ def create_app(
         except ValueError as exc:
             abort(400, str(exc))
         return redirect(url_for("record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]))
+
+    @app.post("/runs/<run_id>/execute-safe")
+    def api_execute_run(run_id: str):
+        _archive_or_404(output_root, run_id)
+        if not app.config["APP_CONFIG"].fact_data_api_writes_enabled:
+            abort(403, "FaCT API writes are disabled by FACT_DATA_API_WRITES_ENABLED")
+        try:
+            app.config["EXECUTION_SERVICE"].execute_all_safe_actions(run_id)
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.get("/runs/<run_id>/download/archive.zip")
+    def download_archive(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        return send_file(
+            _zip_archive(archive["path"]),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"{run_id}.zip",
+        )
 
     @app.get("/runs/<run_id>/download/<artifact_name>")
     def download(run_id: str, artifact_name: str):
@@ -468,6 +574,105 @@ def _artifact_groups(archive: dict[str, Any]) -> tuple[list[dict[str, Any]], lis
     return primary, reports, other
 
 
+def _run_factor_summary(archive: dict[str, Any]) -> dict[str, int]:
+    """Summarise review contributors without mutating an immutable archive."""
+
+    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    llm_factors = _llm_review_factors(archive)
+    os_factors = _os_address_factors(archive)
+    return {
+        "unique_court_slug_count": len(
+            {submission.get("court_slug") for submission in submissions if submission.get("court_slug")}
+        ),
+        "llm_review_submission_count": len(
+            {factor["source_row_number"] for factor in llm_factors}
+        ),
+        "llm_review_issue_count": len(llm_factors),
+        "os_action_blocking_submission_count": len(
+            {factor["source_row_number"] for factor in os_factors}
+        ),
+        "os_action_blocking_address_count": len(os_factors),
+    }
+
+
+def _llm_review_factors(archive: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return model-specific factors that directly hold a row for review."""
+
+    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    factors: list[dict[str, Any]] = []
+    for submission in submissions:
+        if submission.get("status") != "needs_human_review":
+            continue
+        source_row_number = submission.get("source", {}).get("source_row_number")
+        for issue in submission.get("issues", []):
+            if issue.get("code") not in LLM_HUMAN_REVIEW_ISSUE_CODES:
+                continue
+            factors.append(
+                {
+                    "source_row_number": source_row_number,
+                    "court_slug": submission.get("court_slug"),
+                    "status": submission.get("status"),
+                    "field": issue.get("field"),
+                    "code": issue.get("code"),
+                    "message": issue.get("message"),
+                    "raw_value": issue.get("raw_value"),
+                    "cleaned_value": issue.get("cleaned_value"),
+                }
+            )
+    return sorted(
+        factors,
+        key=lambda factor: (
+            factor["source_row_number"] is None,
+            factor["source_row_number"] or 0,
+            factor["field"] or "",
+            factor["code"] or "",
+        ),
+    )
+
+
+def _os_address_factors(archive: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return address actions held by FaCT/OS verification evidence."""
+
+    report = _load_json(archive["path"] / "address_verification_report.json", {})
+    verifications = report.get("verifications", []) if isinstance(report, dict) else []
+    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    statuses_by_row = {
+        submission.get("source", {}).get("source_row_number"): submission.get("status")
+        for submission in submissions
+    }
+    factors = [
+        {
+            **verification,
+            "record_status": statuses_by_row.get(verification.get("source_row_number")),
+        }
+        for verification in verifications
+        if verification.get("status") in OS_ACTION_BLOCKING_STATUSES
+    ]
+    return sorted(
+        factors,
+        key=lambda factor: (
+            factor.get("source_row_number") is None,
+            factor.get("source_row_number") or 0,
+            factor.get("address_index") or 0,
+        ),
+    )
+
+
+def _zip_archive(archive_path: Path) -> BytesIO:
+    """Build a download-only ZIP from the immutable run archive files."""
+
+    archive_buffer = BytesIO()
+    # The archive already contains XLSX files and large JSON outputs. Avoid
+    # expensive recompression during a local browser request; the ZIP is a
+    # convenient single-file container, not a storage optimisation.
+    with ZipFile(archive_buffer, mode="w", compression=ZIP_STORED) as zip_file:
+        for artifact in sorted(archive_path.iterdir()):
+            if artifact.is_file():
+                zip_file.write(artifact, arcname=artifact.name)
+    archive_buffer.seek(0)
+    return archive_buffer
+
+
 def _matches_record_query(submission: dict[str, Any], query: str) -> bool:
     if not query:
         return True
@@ -521,6 +726,7 @@ def _action_evidence(submission: dict[str, Any], action: dict[str, Any]) -> dict
         "raw": _raw_evidence_for_fields(submission.get("raw", {}), source_fields),
         "address_verification": action.get("address_verification"),
         "request_body_normalisations": action.get("request_body_normalisations") or {},
+        "migration_assumptions": action.get("migration_assumptions") or [],
     }
 
 

@@ -151,6 +151,16 @@ def build_parser() -> argparse.ArgumentParser:
     api_court_parser.add_argument("--court-slug", required=True, help="Reviewed court slug.")
     api_court_parser.add_argument("--confirm", action="store_true", help="Required acknowledgement before any write.")
 
+    api_run_parser = subparsers.add_parser(
+        "api-execute-run",
+        help="Sequentially execute unattempted, preflight-safe actions for every importable court.",
+    )
+    api_run_parser.add_argument("--output", required=True, type=Path, help="Importer output root.")
+    api_run_parser.add_argument("--run-id", required=True, help="Archived run identifier.")
+    api_run_parser.add_argument(
+        "--confirm", action="store_true", help="Required acknowledgement before any write."
+    )
+
     return parser
 
 
@@ -364,6 +374,42 @@ def api_execute_court(output_path: Path, run_id: str, court_slug: str, confirm: 
     return 0
 
 
+def api_execute_run(output_path: Path, run_id: str, confirm: bool) -> int:
+    if not confirm:
+        print("Error: --confirm is required before any FaCT API write", file=sys.stderr)
+        return 1
+    try:
+        service = ApiExecutionService(output_path)
+        service.execute_all_safe_actions(run_id)
+        summary = service.get_execution_summary(run_id)
+    except (FileNotFoundError, ValueError, ModuleNotFoundError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    action_counts = summary["action_status_counts"]
+    court_counts = summary["court_status_counts"]
+    print(f"Run ID: {run_id}")
+    print(f"Courts considered: {summary['selected_court_count']}")
+    print(f"Planned actions: {summary['planned_action_count']}")
+    print(f"Completed courts: {court_counts['completed']}")
+    print(f"Courts needing attention: {court_counts['attention_required']}")
+    print(f"Succeeded actions: {action_counts['succeeded']}")
+    print(f"Blocked actions: {action_counts['blocked']}")
+    print(f"Failed actions: {action_counts['failed']}")
+    print(f"Unknown actions: {action_counts['unknown']}")
+    print(f"Execution summary: {output_path / 'execution_summary.json'}")
+    if summary["attention_actions"]:
+        print(f"Actions needing attention: {len(summary['attention_actions'])}")
+        print("Common attention themes:")
+        for theme in summary.get("common_error_themes", []):
+            print(
+                f"- {theme['label']}: {theme['action_count']} actions "
+                f"across {theme['court_count']} courts"
+            )
+        print("See the execution summary JSON or local review UI for the per-court action list.")
+    return 0
+
+
 def _print_api_execution_status(ledger, court_slug: str) -> None:
     court = ledger.courts.get(court_slug)
     if court is None:
@@ -505,6 +551,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "api-execute-court":
         return api_execute_court(args.output, args.run_id, args.court_slug, args.confirm)
+
+    if args.command == "api-execute-run":
+        return api_execute_run(args.output, args.run_id, args.confirm)
 
     parser.error(f"Unknown command: {args.command}")
     return 2

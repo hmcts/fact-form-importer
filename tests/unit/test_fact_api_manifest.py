@@ -85,10 +85,21 @@ def test_manifest_builds_ready_actions_with_preflight_and_source_evidence():
     assert actions["address"].source_fields == ["addresses[1]"]
     assert actions["contact_detail"].body["courtContactDescriptionId"] == "contact-id"
     assert actions["court_opening_hours"].body["openingHourTypeId"] == "opening-id"
-    assert actions["professional_information"].readiness == "pending"
-    assert "videoHearings" in actions["professional_information"].reason
-    assert manifest.summary["api_manifest_ready_action_count"] == 7
-    assert manifest.summary["api_manifest_pending_action_count"] == 1
+    professional_information = actions["professional_information"]
+    assert professional_information.readiness == "ready"
+    assert professional_information.body["professionalInformation"] == {
+        "interviewRooms": True,
+        "interviewRoomCount": 2,
+        "videoHearings": False,
+        "commonPlatform": False,
+        "accessScheme": False,
+    }
+    assert professional_information.migration_assumptions == [
+        "Migration policy: the form does not collect videoHearings, commonPlatform, "
+        "or accessScheme, so this request defaults each field to false."
+    ]
+    assert manifest.summary["api_manifest_ready_action_count"] == 8
+    assert manifest.summary["api_manifest_pending_action_count"] == 0
 
 
 def test_manifest_marks_invalid_api_text_and_missing_court_uuid_as_pending():
@@ -116,6 +127,25 @@ def test_manifest_excludes_non_importable_records():
 
     assert manifest.records == []
     assert manifest.summary["api_manifest_record_count"] == 0
+
+
+def test_manifest_omits_professional_information_without_form_evidence():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="processed",
+        interview_rooms={
+            "has_interview_rooms": None,
+            "room_count": None,
+            "booking_phone": None,
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+
+    assert [action.resource for action in manifest.records[0].actions] == []
 
 
 def test_manifest_keeps_unknown_child_values_pending_and_supports_weekday_times():
@@ -309,6 +339,35 @@ def test_fact_api_contract_validation_covers_remaining_api_constraints():
 
     professional_reason = validate_fact_api_action_body("professional_information", {})
     assert "professionalInformation" in professional_reason
+
+
+def test_professional_information_validation_enforces_interview_room_conditions():
+    missing_count = validate_fact_api_action_body(
+        "professional_information",
+        {
+            "professionalInformation": {
+                "interviewRooms": True,
+                "videoHearings": False,
+                "commonPlatform": False,
+                "accessScheme": False,
+            }
+        },
+    )
+    unexpected_count = validate_fact_api_action_body(
+        "professional_information",
+        {
+            "professionalInformation": {
+                "interviewRooms": False,
+                "interviewRoomCount": 2,
+                "videoHearings": False,
+                "commonPlatform": False,
+                "accessScheme": False,
+            }
+        },
+    )
+
+    assert "interviewRoomCount must be between 1 and 150" in missing_count
+    assert "interviewRoomCount must be omitted or zero" in unexpected_count
 
     invalid_address_reason = validate_fact_api_action_body(
         "address",

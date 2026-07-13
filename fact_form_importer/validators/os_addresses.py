@@ -266,6 +266,9 @@ class AddressVerificationBatch:
     def summary_metrics(self) -> dict[str, int | bool]:
         report = self.as_dict()
         counts = report["counts_by_status"]
+        action_blocking_verifications = [
+            verification for verification in self.verifications if verification.is_action_blocking
+        ]
         return {
             "address_verification_enabled": self.enabled,
             "address_verification_count": len(self.verifications),
@@ -282,6 +285,9 @@ class AddressVerificationBatch:
             ),
             "address_verification_missing_postcode_count": int(counts.get("missing_postcode", 0)),
             "address_verification_action_blocking_count": int(report["action_blocking_count"]),
+            "address_verification_action_blocking_submission_count": len(
+                {verification.source_row_number for verification in action_blocking_verifications}
+            ),
             "address_verification_unavailable_count": int(counts.get("unavailable", 0)),
         }
 
