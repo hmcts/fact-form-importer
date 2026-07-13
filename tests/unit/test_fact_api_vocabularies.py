@@ -45,6 +45,7 @@ def test_load_vocabularies_from_fact_api_fetches_type_endpoints_and_merges_fallb
     assert set(auth_headers) == {"Bearer token"}
     assert vocabularies.version == "fact-data-api"
     assert vocabularies.value_in_vocab("Example Type", "contact_description_types") is True
+    assert vocabularies.normalised_vocab_match("Example Type", "contact_description_types").api_id == "id-1"
     assert vocabularies.value_in_vocab("Free water dispensers", "food_and_drink_options") is True
 
 

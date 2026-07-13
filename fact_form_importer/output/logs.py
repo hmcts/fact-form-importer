@@ -7,18 +7,20 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from fact_form_importer.ingest.workbook_reader import IngestResult
 from fact_form_importer.ingest.workbook_profiler import WorkbookProfile
 from fact_form_importer.models.court_submission import CourtSubmission
 from fact_form_importer.output.fact_json import (
-    build_fact_payload,
+    build_fact_import_payload,
     build_failed_records,
     build_human_review_records,
 )
+from fact_form_importer.validators.fact_api_courts import CourtReference
 from fact_form_importer.validators.base import DUPLICATE_COURT_SLUG
+from fact_form_importer.validators.vocabularies import Vocabularies
 
 
 @dataclass(frozen=True)
@@ -38,11 +40,20 @@ def write_processing_outputs(
     llm_enabled: bool = False,
     llm_requested: bool = False,
     llm_metrics: dict[str, Any] | None = None,
+    api_manifest_metrics: dict[str, int] | None = None,
+    source_name: str | None = None,
+    vocabularies: Vocabularies | None = None,
+    court_lookup: Callable[[str], CourtReference | None] | None = None,
 ) -> OutputResult:
     output_path.mkdir(parents=True, exist_ok=True)
     current_run_id = run_id or _new_run_id()
 
-    fact_payload = build_fact_payload(submissions)
+    fact_import_payload = build_fact_import_payload(
+        submissions,
+        run_id=current_run_id,
+        vocabularies=vocabularies,
+        court_lookup=court_lookup,
+    )
     failed_records = build_failed_records(submissions)
     human_review_records = build_human_review_records(submissions)
     issue_report = build_issue_report(submissions)
@@ -55,9 +66,11 @@ def write_processing_outputs(
         llm_enabled=llm_enabled,
         llm_requested=llm_requested,
         llm_metrics=llm_metrics,
+        api_manifest_metrics=api_manifest_metrics,
+        source_name=source_name,
     )
 
-    _write_json(output_path / "fact_payload.json", fact_payload)
+    _write_json(output_path / "fact_import_payload.json", fact_import_payload)
     _write_json(output_path / "failed_records.json", failed_records)
     _write_json(output_path / "records_needing_human_review.json", human_review_records)
     _write_json(output_path / "issue_report.json", issue_report)
@@ -90,6 +103,8 @@ def build_import_summary(
     llm_enabled: bool = False,
     llm_requested: bool = False,
     llm_metrics: dict[str, Any] | None = None,
+    api_manifest_metrics: dict[str, int] | None = None,
+    source_name: str | None = None,
 ) -> dict[str, Any]:
     status_counts = Counter(submission.status for submission in submissions)
     issue_counts = Counter(
@@ -106,7 +121,7 @@ def build_import_summary(
 
     summary = {
         "run_id": run_id,
-        "source_file": str(workbook_profile.source_path),
+        "source_file": source_name or str(workbook_profile.source_path),
         "vocabulary_source": vocabulary_source,
         "llm_enabled": llm_enabled,
         "llm_requested": llm_requested,
@@ -135,12 +150,20 @@ def build_import_summary(
     )
     if llm_metrics:
         summary.update(llm_metrics)
+    if api_manifest_metrics:
+        summary.update(api_manifest_metrics)
     return summary
 
 
-def _new_run_id() -> str:
+def new_run_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}-{uuid4().hex[:8]}"
+
+
+def _new_run_id() -> str:
+    """Backward-compatible internal alias."""
+
+    return new_run_id()
 
 
 def _write_json(path: Path, payload: Any) -> None:

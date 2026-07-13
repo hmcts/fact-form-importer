@@ -40,7 +40,8 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     assert (output_path / "profile.json").exists()
     assert (output_path / "submissions_raw.json").exists()
     assert (output_path / "submissions_cleaned.json").exists()
-    assert (output_path / "fact_payload.json").exists()
+    assert (output_path / "fact_import_payload.json").exists()
+    assert (output_path / "api_readiness_report.json").exists()
     assert (output_path / "import_summary.json").exists()
     assert (output_path / "nsu_cleaned_review.xlsx").exists()
     assert (output_path / "read_only_approval_users.json").exists()
@@ -117,7 +118,7 @@ def test_run_command_records_llm_metrics_when_explicitly_requested(tmp_path, cap
             metrics=LlmUsageMetrics(calls=1, fields_selected=2, fields_processed=2),
         )
 
-    monkeypatch.setattr("fact_form_importer.cli.normalise_submissions_with_llm", fake_normalise)
+    monkeypatch.setattr("fact_form_importer.processing.normalise_submissions_with_llm", fake_normalise)
 
     exit_code = main(
         [
@@ -217,6 +218,27 @@ def test_run_command_requires_fact_api_bearer_token_by_default(tmp_path, capsys,
 
     assert exit_code == 1
     assert "FACT_DATA_API_BEARER_TOKEN is required for run" in captured.err
+
+
+def test_api_execution_commands_require_explicit_confirmation(tmp_path, capsys):
+    exit_code = main(
+        [
+            "api-execute-action",
+            "--output",
+            str(tmp_path / "out"),
+            "--run-id",
+            "run-1",
+            "--court-slug",
+            "example-court",
+            "--action-id",
+            "example-court-1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "--confirm is required" in captured.err
 
 
 def test_run_command_returns_error_for_missing_file(tmp_path, capsys):

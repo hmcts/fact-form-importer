@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>FaCT API action plan: {{ archive.manifest.run_id }}</h1>
+<nav><a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a></nav>
+<p>Actions are generated from importable records. Before a write, the importer re-resolves the court slug and checks the target section. Any existing section data blocks that action for review.</p>
+<table><thead><tr><th>Court</th><th>Resource</th><th>Method</th><th>Plan status</th><th>Execution status</th><th>Path</th><th>Reason</th></tr></thead><tbody>{% for action in actions %}<tr><td>{{ action.court_slug }}</td><td>{{ action.resource }}</td><td>{{ action.method }}</td><td>{{ action.readiness }}</td><td>{{ action.execution_status }}</td><td>{{ action.path }}</td><td>{{ action.reason }}</td></tr>{% else %}<tr><td colspan="7">No actions match.</td></tr>{% endfor %}</tbody></table>
+{% if pages > 1 %}<p>Page {{ page }} of {{ pages }}</p>{% endif %}
+{% endblock %}

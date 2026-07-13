@@ -9,32 +9,18 @@ from pathlib import Path
 from typing import Optional
 
 from fact_form_importer.config import AppConfig, load_default_field_rules
+from fact_form_importer.execution.service import ApiExecutionService
 from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
 from fact_form_importer.llm.client import (
     build_llm_test_request,
     normalise_fields_with_llm,
-    validate_openai_config,
 )
-from fact_form_importer.llm.pipeline import (
-    LlmUsageMetrics,
-    build_llm_request_review,
-    normalise_submissions_with_llm,
-)
+from fact_form_importer.llm.pipeline import build_llm_request_review
 from fact_form_importer.llm.prompts import SYSTEM_PROMPT
 from fact_form_importer.llm.schemas import LlmNormalisationResponse
 from fact_form_importer.llm.openai_client import check_llm_connection
-from fact_form_importer.output.logs import write_processing_outputs
-from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
-from fact_form_importer.output.submitters import write_submitter_outputs
-from fact_form_importer.validators.fact_api_courts import (
-    court_slug_exists_in_fact_api,
-    suggest_court_slug_in_fact_api,
-)
-from fact_form_importer.validators.fact_api_vocabularies import load_vocabularies_from_fact_api
-from fact_form_importer.validators.business_rules import validate_all_submissions
-from fact_form_importer.validators.base import clear_validation_issues
-from fact_form_importer.validators.vocabularies import load_vocabularies
+from fact_form_importer.processing import load_fact_api_services, process_workbook
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,6 +102,35 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check-llm", help="Check the configured OpenAI-compatible LLM endpoint.")
     subparsers.add_parser("llm-test", help="Send a tiny fake structured LLM normalisation request.")
 
+    serve_parser = subparsers.add_parser("serve", help="Start the localhost review UI.")
+    serve_parser.add_argument("--output", required=True, type=Path, help="Importer output root containing final archives.")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Localhost bind address.")
+    serve_parser.add_argument("--port", default=5000, type=int, help="Localhost TCP port.")
+
+    api_check_parser = subparsers.add_parser(
+        "api-check-court", help="Preflight one reviewed court against existing FaCT API sections."
+    )
+    api_check_parser.add_argument("--output", required=True, type=Path, help="Importer output root.")
+    api_check_parser.add_argument("--run-id", required=True, help="Archived run identifier.")
+    api_check_parser.add_argument("--court-slug", required=True, help="Reviewed court slug.")
+
+    api_action_parser = subparsers.add_parser(
+        "api-execute-action", help="Execute one preflight-safe action for one court."
+    )
+    api_action_parser.add_argument("--output", required=True, type=Path, help="Importer output root.")
+    api_action_parser.add_argument("--run-id", required=True, help="Archived run identifier.")
+    api_action_parser.add_argument("--court-slug", required=True, help="Reviewed court slug.")
+    api_action_parser.add_argument("--action-id", required=True, help="Action identifier from the readiness report.")
+    api_action_parser.add_argument("--confirm", action="store_true", help="Required acknowledgement before any write.")
+
+    api_court_parser = subparsers.add_parser(
+        "api-execute-court", help="Execute all preflight-safe actions for one reviewed court."
+    )
+    api_court_parser.add_argument("--output", required=True, type=Path, help="Importer output root.")
+    api_court_parser.add_argument("--run-id", required=True, help="Archived run identifier.")
+    api_court_parser.add_argument("--court-slug", required=True, help="Reviewed court slug.")
+    api_court_parser.add_argument("--confirm", action="store_true", help="Required acknowledgement before any write.")
+
     return parser
 
 
@@ -126,70 +141,18 @@ def run(
     use_llm: bool = False,
 ) -> int:
     try:
-        config = AppConfig()
-        if use_llm and not config.llm_enabled:
-            raise ValueError("--use-llm requires LLM_ENABLED=true in .env")
-        if use_llm:
-            validate_openai_config(config, command_name="run --use-llm")
-        workbook_profile = profile_workbook(input_path)
-        ingest_result = ingest_workbook(input_path=input_path, output_path=output_path)
-        vocabularies, vocabulary_source, court_slug_exists, court_slug_suggester = _load_fact_api_services_for_run(
-            config=config,
-            allow_local_vocabularies=allow_local_vocabularies
-        )
-        submissions = validate_all_submissions(
-            ingest_result.submissions,
-            vocabularies,
-            court_slug_exists=court_slug_exists,
-            court_slug_suggester=court_slug_suggester,
-        )
-        llm_metrics = LlmUsageMetrics()
-        if use_llm:
-            llm_result = normalise_submissions_with_llm(
-                submissions,
-                field_rules=load_default_field_rules(config),
-                vocabularies=vocabularies,
-                config=config,
-            )
-            submissions = llm_result.submissions
-            llm_metrics = llm_result.metrics
-            clear_validation_issues(submissions)
-            submissions = validate_all_submissions(
-                submissions,
-                vocabularies,
-                court_slug_exists=court_slug_exists,
-                court_slug_suggester=court_slug_suggester,
-            )
-        output_path.mkdir(parents=True, exist_ok=True)
-        (output_path / "profile.json").write_text(
-            profile_to_json(workbook_profile) + "\n",
-            encoding="utf-8",
-        )
-        output_result = write_processing_outputs(
-            submissions=submissions,
-            ingest_result=ingest_result,
-            workbook_profile=workbook_profile,
-            output_path=output_path,
-            vocabulary_source=vocabulary_source,
-            llm_enabled=config.llm_enabled,
-            llm_requested=use_llm,
-            llm_metrics=llm_metrics.as_dict(config.openai_model if use_llm else None),
-        )
-        workbook_path = write_nsu_review_workbook(
-            submissions=submissions,
-            output_path=output_path,
-            summary=output_result.summary,
-        )
-        submitter_result = write_submitter_outputs(
-            submissions=submissions,
-            output_path=output_path,
+        result = process_workbook(
+            input_path=input_path,
+            output_root=output_path,
+            allow_local_vocabularies=allow_local_vocabularies,
+            use_llm=use_llm,
         )
     except (FileNotFoundError, KeyError, ModuleNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    summary = output_result.summary
-    print(f"Run ID: {output_result.run_id}")
+    summary = result.output.summary
+    print(f"Run ID: {result.run_id}")
     print(f"Source file: {input_path}")
     print(f"Workbook rows: {summary['row_count']}")
     print(f"Validated submissions: {summary['submission_count']}")
@@ -203,8 +166,8 @@ def run(
         f"(included in needs human review): {summary['duplicate_slug_affected_record_count']}"
     )
     print(f"Skipped empty rows: {summary['skipped_count']}")
-    print(f"Read-only approval users: {submitter_result.user_count}")
-    print(f"Excluded submitter users: {submitter_result.excluded_user_count}")
+    print(f"Read-only approval users: {result.submitters.user_count}")
+    print(f"Excluded submitter users: {result.submitters.excluded_user_count}")
     print(f"LLM enabled: {summary['llm_enabled']}")
     print(f"LLM requested: {summary['llm_requested']}")
     print(f"LLM calls: {summary['llm_calls']}")
@@ -213,9 +176,12 @@ def run(
     if summary["llm_model"]:
         print(f"LLM model: {summary['llm_model']}")
     print(f"Vocabulary source: {summary['vocabulary_source']}")
-    print(f"Wrote NSU review workbook: {workbook_path}")
-    print(f"Wrote read-only approval users: {submitter_result.json_path}")
-    print(f"Wrote run outputs to: {output_path}")
+    print(f"API readiness ready actions: {summary['api_manifest_ready_action_count']}")
+    print(f"API readiness pending actions: {summary['api_manifest_pending_action_count']}")
+    print(f"Wrote NSU review workbook: {result.review_workbook_path}")
+    print(f"Wrote read-only approval users: {result.submitters.json_path}")
+    print(f"Archived run: {result.archive.archive_path}")
+    print(f"Wrote latest run outputs to: {output_path}")
     return 0
 
 
@@ -229,7 +195,7 @@ def llm_request_review(
     try:
         config = AppConfig()
         ingest_result = ingest_workbook(input_path=input_path)
-        vocabularies, vocabulary_source, _, _ = _load_fact_api_services_for_run(
+        vocabularies, vocabulary_source, _, _ = load_fact_api_services(
             config=config,
             allow_local_vocabularies=allow_local_vocabularies,
         )
@@ -314,6 +280,58 @@ def ingest(input_path: Path, output_path: Path) -> int:
     return 0
 
 
+def api_check_court(output_path: Path, run_id: str, court_slug: str) -> int:
+    try:
+        ledger = ApiExecutionService(output_path).check_court(run_id, court_slug)
+    except (FileNotFoundError, ValueError, ModuleNotFoundError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    _print_api_execution_status(ledger, court_slug)
+    print("No FaCT API write was made.")
+    return 0
+
+
+def api_execute_action(
+    output_path: Path, run_id: str, court_slug: str, action_id: str, confirm: bool
+) -> int:
+    if not confirm:
+        print("Error: --confirm is required before any FaCT API write", file=sys.stderr)
+        return 1
+    try:
+        ledger = ApiExecutionService(output_path).execute_action(run_id, court_slug, action_id)
+    except (FileNotFoundError, ValueError, ModuleNotFoundError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    _print_api_execution_status(ledger, court_slug)
+    return 0
+
+
+def api_execute_court(output_path: Path, run_id: str, court_slug: str, confirm: bool) -> int:
+    if not confirm:
+        print("Error: --confirm is required before any FaCT API write", file=sys.stderr)
+        return 1
+    try:
+        ledger = ApiExecutionService(output_path).execute_safe_court_actions(run_id, court_slug)
+    except (FileNotFoundError, ValueError, ModuleNotFoundError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    _print_api_execution_status(ledger, court_slug)
+    return 0
+
+
+def _print_api_execution_status(ledger, court_slug: str) -> None:
+    court = ledger.courts.get(court_slug)
+    if court is None:
+        print(f"Court: {court_slug}")
+        print("Execution status: not_started")
+        return
+    print(f"Court: {court_slug}")
+    print(f"Execution status: {court.status}")
+    for action_id, action in court.actions.items():
+        suffix = f" ({action.reason})" if action.reason else ""
+        print(f"- {action_id}: {action.status}{suffix}")
+
+
 def check_llm() -> int:
     try:
         config = AppConfig()
@@ -389,69 +407,6 @@ def _display_value(value) -> str:
     return str(value)
 
 
-def _load_fact_api_services_for_run(
-    config: AppConfig | None = None,
-    allow_local_vocabularies: bool = False,
-):
-    config = config or AppConfig()
-    path = config.vocabularies_path
-    local_vocabularies = load_vocabularies(path) if path.exists() else None
-
-    if not config.fact_data_api_base_url:
-        if allow_local_vocabularies:
-            return local_vocabularies, "local_json" if local_vocabularies else "none", None, None
-        raise ValueError(
-            "FACT_DATA_API_BASE_URL is required for run. "
-            "Use --allow-local-vocabularies only for offline/local review."
-        )
-
-    if not config.fact_data_api_bearer_token:
-        if allow_local_vocabularies:
-            return local_vocabularies, "local_json" if local_vocabularies else "none", None, None
-        raise ValueError(
-            "FACT_DATA_API_BEARER_TOKEN is required for run. "
-            "Use --allow-local-vocabularies only for offline/local review."
-        )
-
-    def court_slug_exists(court_slug: str) -> bool:
-        try:
-            return court_slug_exists_in_fact_api(
-                court_slug=court_slug,
-                base_url=config.fact_data_api_base_url or "",
-                bearer_token=config.fact_data_api_bearer_token or "",
-            )
-        except Exception as exc:
-            raise ValueError(f"Unable to validate court slug '{court_slug}' against FaCT API: {exc}") from exc
-
-    def court_slug_suggester(court_slug: str, raw_value: str | None):
-        try:
-            return suggest_court_slug_in_fact_api(
-                court_slug=court_slug,
-                raw_value=raw_value,
-                base_url=config.fact_data_api_base_url or "",
-                bearer_token=config.fact_data_api_bearer_token or "",
-            )
-        except Exception as exc:
-            raise ValueError(f"Unable to suggest court slug for '{court_slug}' against FaCT API: {exc}") from exc
-
-    try:
-        return (
-            load_vocabularies_from_fact_api(
-                base_url=config.fact_data_api_base_url,
-                bearer_token=config.fact_data_api_bearer_token,
-                fallback=local_vocabularies,
-            ),
-            "fact_data_api",
-            court_slug_exists,
-            court_slug_suggester,
-        )
-    except Exception as exc:
-        if not allow_local_vocabularies or local_vocabularies is None:
-            raise ValueError(f"Unable to load FaCT API vocabularies: {exc}") from exc
-        print(f"Warning: using local vocabularies because FaCT API lookup failed: {exc}", file=sys.stderr)
-        return local_vocabularies, "local_json_fallback_after_fact_data_api_error", None, None
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -482,6 +437,27 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             allow_local_vocabularies=args.allow_local_vocabularies,
         )
+
+    if args.command == "serve":
+        try:
+            from fact_form_importer.web.app import run_server
+
+            run_server(args.output, host=args.host, port=args.port)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "api-check-court":
+        return api_check_court(args.output, args.run_id, args.court_slug)
+
+    if args.command == "api-execute-action":
+        return api_execute_action(
+            args.output, args.run_id, args.court_slug, args.action_id, args.confirm
+        )
+
+    if args.command == "api-execute-court":
+        return api_execute_court(args.output, args.run_id, args.court_slug, args.confirm)
 
     parser.error(f"Unknown command: {args.command}")
     return 2

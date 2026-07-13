@@ -1,29 +1,57 @@
-"""Draft FaCT JSON payload generation."""
+"""Build the versioned JSON document for the future FaCT import controller."""
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
 from pydantic import BaseModel
 
 from fact_form_importer.models.court_submission import CourtSubmission
+from fact_form_importer.output.fact_api_manifest import (
+    _accessibility_options_body,
+    _address_body,
+    _building_facilities_body,
+    _contact_body,
+    _counter_service_body,
+    _opening_hours_body,
+    _professional_information_body,
+    _translation_body,
+)
+from fact_form_importer.validators.fact_api_courts import CourtReference
+from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
+IMPORT_PAYLOAD_SCHEMA_VERSION = "1.0"
+
+CourtLookup = Callable[[str], Optional[CourtReference]]
 
 
-def build_fact_payload(submissions: list[CourtSubmission]) -> list[dict[str, Any]]:
-    """Build an inspectable draft payload for records that can be imported.
+def build_fact_import_payload(
+    submissions: list[CourtSubmission],
+    *,
+    run_id: str,
+    vocabularies: Vocabularies | None = None,
+    court_lookup: CourtLookup | None = None,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Build the single request body expected by a future FaCT import controller.
 
-    This is deliberately not the final FaCT API request shape. It keeps the
-    cleaned submission structure visible while later tasks refine mappings into
-    endpoint-specific payloads.
+    This is deliberately a data contract rather than a list of HTTP actions.
+    It contains only records that passed the import status gate and excludes
+    raw spreadsheet values, submitter metadata, and validation issues.
     """
 
-    return [
-        _payload_record(submission)
-        for submission in submissions
-        if submission.status in IMPORTABLE_STATUSES and not _has_blocking_issue(submission)
-    ]
+    return {
+        "schemaVersion": IMPORT_PAYLOAD_SCHEMA_VERSION,
+        "runId": run_id,
+        "generatedAt": (generated_at or datetime.now(timezone.utc)).isoformat(),
+        "records": [
+            _import_record(submission, vocabularies=vocabularies, court_lookup=court_lookup)
+            for submission in submissions
+            if _is_importable(submission)
+        ],
+    }
 
 
 def build_failed_records(submissions: list[CourtSubmission]) -> list[dict[str, Any]]:
@@ -42,21 +70,49 @@ def build_human_review_records(submissions: list[CourtSubmission]) -> list[dict[
     ]
 
 
-def _payload_record(submission: CourtSubmission) -> dict[str, Any]:
+def _import_record(
+    submission: CourtSubmission,
+    *,
+    vocabularies: Vocabularies | None,
+    court_lookup: CourtLookup | None,
+) -> dict[str, Any]:
+    court_reference = court_lookup(submission.court_slug) if court_lookup and submission.court_slug else None
+    professional_information = _professional_information_body(submission).get(
+        "professionalInformation", {}
+    )
+    counter_service, _ = _counter_service_body(submission, vocabularies)
+
     return {
-        "court_slug": submission.court_slug,
-        "source_row_number": submission.source.source_row_number,
-        "status": submission.status,
-        "facilities": submission.facilities,
-        "translation_phone": submission.translation_phone,
-        "translation_email": submission.translation_email,
-        "addresses": [address.model_dump(mode="json") for address in submission.addresses],
-        "counter_service": _json_safe(submission.counter_service),
-        "interview_rooms": _json_safe(submission.interview_rooms),
-        "contacts": [contact.model_dump(mode="json") for contact in submission.contacts],
-        "opening_hours": [hours.model_dump(mode="json") for hours in submission.opening_hours],
-        "issues": [issue.model_dump(mode="json") for issue in submission.issues],
+        "courtId": court_reference.court_id if court_reference else None,
+        "courtSlug": submission.court_slug,
+        "sourceRowNumbers": [submission.source.source_row_number],
+        "buildingFacilities": _building_facilities_body(submission.facilities),
+        "accessibilityOptions": _accessibility_options_body(submission.facilities),
+        "translationServices": _translation_body(submission),
+        "professionalInformation": professional_information,
+        "counterServiceOpeningHours": counter_service,
+        "addresses": [
+            body
+            for address in submission.addresses
+            if (body := _address_body(address, vocabularies)[0])
+        ],
+        "contactDetails": [
+            body
+            for contact in submission.contacts
+            if (body := _contact_body(contact, vocabularies)[0])
+        ],
+        "openingHours": [
+            body
+            for opening_hours in submission.opening_hours
+            if (body := _opening_hours_body(opening_hours, vocabularies)[0])
+        ],
     }
+
+
+def _is_importable(submission: CourtSubmission) -> bool:
+    return submission.status in IMPORTABLE_STATUSES and not any(
+        issue.severity == "error" for issue in submission.issues
+    )
 
 
 def _review_record(submission: CourtSubmission) -> dict[str, Any]:
@@ -71,18 +127,11 @@ def _review_record(submission: CourtSubmission) -> dict[str, Any]:
     }
 
 
-def _has_blocking_issue(submission: CourtSubmission) -> bool:
-    return any(issue.severity == "error" for issue in submission.issues)
-
-
 def _json_safe(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
-
     if isinstance(value, dict):
         return {key: _json_safe(item) for key, item in value.items()}
-
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
-
     return value

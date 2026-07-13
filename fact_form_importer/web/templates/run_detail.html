@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+{% set summary = archive.manifest.summary %}
+<h1>Run {{ archive.manifest.run_id }}</h1>
+<p>{{ archive.manifest.source_name }} · {{ archive.manifest.completed_at }}</p>
+<nav>
+  <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">All records</a>
+  <a href="{{ url_for('records', run_id=archive.manifest.run_id, status='needs_human_review') }}">Needs review</a>
+  <a href="{{ url_for('issues', run_id=archive.manifest.run_id) }}">Issues</a>
+  <a href="{{ url_for('api_actions', run_id=archive.manifest.run_id) }}">Readiness report</a>
+</nav>
+<div class="summary">
+  {% for label, key in [('Processed','processed_count'),('Warnings','processed_with_warnings_count'),('Needs review','needs_human_review_count'),('Failed','failed_count'),('Duplicate records','duplicate_slug_affected_record_count'),('Ready API actions','api_manifest_ready_action_count'),('Pending API actions','api_manifest_pending_action_count'),('LLM calls','llm_calls')] %}
+  <div><strong>{{ label }}</strong><br>{{ summary.get(key, 0) }}</div>
+  {% endfor %}
+</div>
+<h2>Import payload</h2>
+{% if primary_artifacts %}
+<ul>{% for artifact in primary_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>
+{% else %}<p>This legacy run does not contain an import payload.</p>{% endif %}
+<h2>Review reports</h2>
+<ul>{% for artifact in report_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>
+<h2>Other archived files</h2>
+<ul>{% for artifact in other_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>
+{% endblock %}

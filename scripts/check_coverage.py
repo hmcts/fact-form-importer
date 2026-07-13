@@ -22,6 +22,12 @@ CORE_GROUPS = {
         "fact_form_importer/validators/duplicates.py",
         "fact_form_importer/validators/vocabularies.py",
     ),
+    "api_manifest": (
+        "fact_form_importer/processing.py",
+        "fact_form_importer/output/archive.py",
+        "fact_form_importer/output/fact_api_manifest.py",
+    ),
+    "web": ("fact_form_importer/web/",),
 }
 
 

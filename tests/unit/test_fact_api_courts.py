@@ -3,6 +3,7 @@ import pytest
 
 from fact_form_importer.validators.fact_api_courts import (
     court_slug_exists_in_fact_api,
+    lookup_court_by_slug_in_fact_api,
     suggest_court_slug_in_fact_api,
 )
 
@@ -39,6 +40,26 @@ def test_court_slug_exists_in_fact_api_returns_false_for_404():
     )
 
     assert exists is False
+
+
+def test_lookup_court_by_slug_returns_fact_uuid():
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"id": "court-id", "slug": "fleetwood-court", "name": "Fleetwood Court"}
+            )
+        )
+    )
+
+    court = lookup_court_by_slug_in_fact_api(
+        court_slug="fleetwood-court",
+        base_url="https://fact-data-api.example.test",
+        bearer_token="token",
+        client=client,
+    )
+
+    assert court.court_id == "court-id"
+    assert court.name == "Fleetwood Court"
 
 
 def test_court_slug_exists_in_fact_api_raises_for_auth_or_server_errors():

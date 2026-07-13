@@ -46,8 +46,9 @@ python3 scripts/check_coverage.py coverage.json --fail-under 90 --core-fail-unde
 
 Runs the unit suite with the same exact coverage thresholds used before
 pushing. The second command checks the unrounded coverage JSON values: global
-coverage must be at least 90%, and deterministic core groups must be at least
-95%.
+coverage must be at least 90%, and core groups must be at least 95%. Core
+groups include deterministic cleaners, ingestion, validation, API-readiness
+generation, archive publishing, and the local review UI.
 
 ```bash
 python3 -m fact_form_importer profile --input "./input/microsoft-forms-export.xlsx" --output "./out"
@@ -69,8 +70,8 @@ python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" 
 ```
 
 Runs the current end-to-end non-LLM import preparation: profiling, ingestion,
-FaCT API-backed validation, issue/status calculation, draft payload JSON, NSU
-review workbook, and read-only approval user outputs.
+FaCT API-backed validation, issue/status calculation, controller-ready import
+payload JSON, NSU review workbook, and read-only approval user outputs.
 
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --use-llm
@@ -88,6 +89,34 @@ python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" 
 Runs the same pipeline with local vocabulary fixtures when FaCT API access is
 unavailable. Use only for offline/local inspection; normal runs should use
 `vocabulary_source: fact_data_api`.
+
+```bash
+python3 -m fact_form_importer serve --output "./out"
+```
+
+Starts the local review UI at `http://127.0.0.1:5000`. It lists completed
+archived runs, shows raw and cleaned records, issues and API readiness details,
+and can upload one XLSX/CSV for background processing. It only binds to
+localhost because the review views contain contact and submitter data.
+
+```bash
+python3 -m fact_form_importer api-check-court --output "./out" --run-id "<run-id>" --court-slug "<court-slug>"
+```
+
+Re-resolves one existing court by slug and checks each target FaCT section
+without making a write. This records `ready`, `blocked`, or `unknown` action
+states in `out/execution-state/<run-id>.json`; it is the required first step
+before executing any action.
+
+```bash
+python3 -m fact_form_importer api-execute-action --output "./out" --run-id "<run-id>" --court-slug "<court-slug>" --action-id "<action-id>" --confirm
+python3 -m fact_form_importer api-execute-court --output "./out" --run-id "<run-id>" --court-slug "<court-slug>" --confirm
+```
+
+Executes one reviewed API action, or all currently safe actions for one court.
+Both require `FACT_DATA_API_WRITES_ENABLED=true` in `.env` as well as the
+explicit `--confirm` acknowledgement. There is deliberately no all-courts
+write command.
 
 ```bash
 python3 -m fact_form_importer check-llm
@@ -135,8 +164,8 @@ python3 scripts/check_coverage.py coverage.json --fail-under 90 --core-fail-unde
 ```
 
 Coverage is checked against exact unrounded percentages. The global threshold
-is 90%; deterministic core coverage is checked at 95% for cleaners, ingestion
-core, and validators.
+is 90%; core coverage is checked at 95% for cleaners, ingestion, validators,
+API-readiness/archive processing, and the local review UI.
 
 ### 2. Configure local environment
 
@@ -297,7 +326,7 @@ that ingestion behaved as expected.
 
 The full `run` command uses these `CourtSubmission` records for validation,
 vocabulary normalisation, NSU review workbook generation, read-only approval
-user export, and draft `fact_payload.json` creation. With `--use-llm`, selected
+user export, and `fact_import_payload.json` creation. With `--use-llm`, selected
 fields are normalised, safely merged, and then validated again before outputs
 are written.
 
@@ -327,6 +356,16 @@ The `run` command requires `FACT_DATA_API_BASE_URL` and
 If either value is missing, or the API rejects the token, the command fails
 instead of silently validating against stale local data.
 
+The review UI reads `.env` when its server process starts. After refreshing
+`FACT_DATA_API_BEARER_TOKEN`, stop and start `serve` again before uploading or
+executing actions. It uses the fixed local address `http://127.0.0.1:5000`.
+
+Keep `FACT_DATA_API_WRITES_ENABLED=false` in normal use. It is a separate
+circuit breaker for the post-review, per-court API execution commands and UI
+controls. Reading vocabularies, validating slugs, generating an action plan,
+and preflighting a court do not need it. A write requires both
+`FACT_DATA_API_WRITES_ENABLED=true` and explicit confirmation in the CLI or UI.
+
 For local/offline inspection only, you can bypass the API and use the checked-in
 example vocabularies:
 
@@ -334,25 +373,79 @@ example vocabularies:
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --allow-local-vocabularies
 ```
 
-This also writes `profile.json` and the ingest intermediate files listed above.
-It then writes:
+Every successful `run` first writes to a temporary staging directory, then
+publishes an immutable archive at `out/final/<run_id>/`. The existing flat
+files in `out/` are refreshed as a latest-run convenience view, and
+`out/latest_run.json` identifies the immutable archive. Uploaded UI source
+files are deleted after processing; the derived raw JSON remains archived.
+
+Each archive contains:
 
 ```text
-out/fact_payload.json
+out/fact_import_payload.json
 out/failed_records.json
 out/records_needing_human_review.json
 out/issue_report.json
 out/import_summary.json
+out/api_readiness_report.json
+out/run_manifest.json
 out/llm_request_review.json
 out/nsu_cleaned_review.xlsx
 out/read_only_approval_users.json
 out/read_only_approval_users.xlsx
 ```
 
-`fact_payload.json` contains only records with status `processed` or
-`processed_with_warnings`, provided they have no blocking error issues. The
-shape is intentionally inspectable and draft-like; it is not the final FaCT API
-request body yet.
+`submissions_cleaned.json` contains every final validated submission, including
+its final status and issues. It is the all-record source used by the local
+review UI; `submissions_raw.json` remains the unmodified row extraction.
+
+`fact_import_payload.json` is the single, versioned JSON request body for the
+future FaCT import controller. It uses camelCase and contains only records with
+status `processed` or `processed_with_warnings`, provided they have no blocking
+error issues. In a normal FaCT API-backed run, each record has its resolved FaCT
+court UUID and slug, source row number for traceability, and complete API-aligned sections for facilities,
+accessibility, translation, professional information, counter-service opening
+hours, addresses, contacts, and court opening hours. Controlled list values are
+resolved to FaCT UUIDs where the API provides them. It deliberately excludes raw
+spreadsheet values, submitter metadata, issue objects, and records needing
+review. This importer does not send the payload to FaCT; a future controller
+will accept this document as one JSON body.
+
+An offline `--allow-local-vocabularies` run can still generate the same shape
+for inspection, but its `courtId` values are `null` because it deliberately
+does not call FaCT. Do not use an offline-fallback payload as controller input.
+
+`api_readiness_report.json` is the immutable, endpoint-shaped action plan for
+the reviewed run. It is not a new FaCT controller payload and it does not
+create courts. Actions are derived only for importable records and contain the
+existing endpoint, method, target path, request body and source-field evidence.
+Before each write, the execution layer re-resolves the court by slug and checks
+the target API section. Under the current conservative policy, a populated
+target section blocks that action for human review rather than replacing,
+merging, or deleting existing FaCT data.
+
+The action report is generated against the FaCT API contract in use at the
+time of the run. Before a write, the execution layer validates the body again
+with the freshly resolved court UUID. This protects older archives from being
+sent after the contract changes: incomplete actions are shown as `blocked` with
+the missing API fields instead of being retried and receiving a 400 response.
+After updating the importer, create a new `run` before executing actions; do
+not use an older readiness report as a substitute for regeneration.
+
+Execution state is written separately to
+`out/execution-state/<run-id>.json`, never back into the archived action plan.
+Action status is one of `planned`, `ready`, `blocked`, `running`, `succeeded`,
+`failed`, or `unknown`. A court is `completed` only once every planned action
+has succeeded. A timeout is `unknown` and is never automatically retried.
+
+`run_manifest.json` records the source display name, completion time, run
+summary, and SHA-256 hashes of every archived artifact. Use it to identify a
+historic run and verify its files.
+
+`out/execution-state/` is a local, git-ignored execution ledger rather than an
+archive artifact. It lets the UI show whether individual actions have been
+checked, blocked, completed, failed, or have an unknown outcome without
+changing the generated run evidence or its integrity hashes.
 
 `failed_records.json` contains records that cannot progress because required
 data is missing or schema-critical validation failed.
@@ -375,10 +468,11 @@ skipped row count, duplicate slug group count, duplicate slug affected-record
 count, mapping warnings, issue counts by code, `vocabulary_source`, and whether
 LLM processing was enabled. It also records LLM requested state, calls,
 failures, parse retries, selected and processed field counts, affected
-submissions, and model name. In a normal run, `vocabulary_source` should be
+submissions, model name, and API-readiness ready/pending action counts. In a
+normal run, `vocabulary_source` should be
 `fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
 run. Duplicate groups are conservative for now: every affected record is
-excluded from `fact_payload.json` and included in the `needs_human_review`
+excluded from `fact_import_payload.json` and included in the `needs_human_review`
 count. The duplicate count is not an additional status category: a duplicate
 record can also have other review issues, such as invalid opening hours. The
 importer does not pick a winner or merge duplicate rows until explicit
@@ -399,6 +493,32 @@ completion/start/last-modified dates, submitter names and emails, and a
 `candidate_most_recent_row` based on the available form timestamps. This is
 review evidence for NSU/product decisions; the importer still does not
 automatically migrate only the latest duplicate until that rule is confirmed.
+
+### 7. Review archived runs locally
+
+Start the local UI after at least one completed run:
+
+```bash
+python3 -m fact_form_importer serve --output "./out"
+```
+
+The landing page lists every valid `out/final/<run_id>/run_manifest.json` from
+newest to oldest. Select a run to inspect its summary, records, raw submitted
+values, cleaned values, issues, duplicate status and API readiness report. A
+record with an action plan has a FaCT API execution table showing the request
+body, relevant cleaned values, mapped raw source values, preflight outcome and
+current execution state. The UI can check a court, run one action, or run all
+safe actions for that one court. Write buttons appear only when
+`FACT_DATA_API_WRITES_ENABLED=true`; server-side checks enforce the same rule.
+There is no global bulk-write control. Tables support status/court-row filtering
+and pagination; every listed archive artifact can be downloaded. The upload
+form accepts CSV/XLSX only, runs one job at a time, deletes the original upload
+on completion, and offers LLM use only as an explicit checkbox when
+`LLM_ENABLED=true`.
+
+This is an unauthenticated local tool. Do not bind it beyond localhost or share
+its archive directory without adding an authentication and access-control
+design.
 
 `read_only_approval_users.json` and `read_only_approval_users.xlsx` contain the
 unique form submitters who should be considered for the read-only approval role.

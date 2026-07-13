@@ -31,6 +31,15 @@ class CourtSlugSuggestion:
         }
 
 
+@dataclass(frozen=True)
+class CourtReference:
+    """The FaCT court identity required for endpoint-specific import actions."""
+
+    court_id: str
+    slug: str
+    name: str | None = None
+
+
 def court_slug_exists_in_fact_api(
     court_slug: str,
     base_url: str,
@@ -58,6 +67,45 @@ def court_slug_exists_in_fact_api(
             return False
         response.raise_for_status()
         return True
+    finally:
+        if close_client:
+            http_client.close()
+
+
+def lookup_court_by_slug_in_fact_api(
+    court_slug: str,
+    base_url: str,
+    bearer_token: str,
+    timeout_seconds: float = 10.0,
+    client: Optional[httpx.Client] = None,
+) -> CourtReference | None:
+    """Look up the existing FaCT court UUID from a submitted slug without writing data."""
+
+    if not base_url or not base_url.strip():
+        raise ValueError("FaCT Data API base URL must not be blank")
+    if not bearer_token or not bearer_token.strip():
+        raise ValueError("FaCT Data API bearer token must not be blank")
+    if not court_slug or not court_slug.strip():
+        raise ValueError("Court slug must not be blank")
+
+    close_client = client is None
+    http_client = client or httpx.Client(timeout=timeout_seconds)
+    headers = {"Authorization": f"Bearer {bearer_token}"}
+    url = f"{base_url.rstrip('/')}/courts/slug/{quote(court_slug.strip(), safe='')}/v1"
+
+    try:
+        response = http_client.get(url, headers=headers)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not payload.get("id"):
+            raise ValueError("FaCT court lookup response must contain an id")
+        return CourtReference(
+            court_id=str(payload["id"]),
+            slug=str(payload.get("slug") or court_slug),
+            name=str(payload["name"]) if payload.get("name") else None,
+        )
     finally:
         if close_client:
             http_client.close()

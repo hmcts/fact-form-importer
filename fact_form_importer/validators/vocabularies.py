@@ -35,6 +35,7 @@ def _normalise_for_match(value: Any) -> Optional[str]:
 class VocabularyEntry(BaseModel):
     code: str
     name: str
+    api_id: Optional[str] = None
     aliases: List[str] = Field(default_factory=list)
 
     @field_validator("code", "name")

@@ -2,19 +2,20 @@ import json
 
 from fact_form_importer.ingest.workbook_profiler import WorkbookProfile
 from fact_form_importer.ingest.workbook_reader import IngestResult
-from fact_form_importer.models.court_submission import CourtSubmission
-from fact_form_importer.models.court_submission import OpeningTime
+from fact_form_importer.models.court_submission import Address, ContactDetail, CourtSubmission, OpeningHoursSet, OpeningTime
 from fact_form_importer.models.issues import Issue
 from fact_form_importer.models.source import SourceMetadata
 from fact_form_importer.output.fact_json import (
-    build_fact_payload,
+    build_fact_import_payload,
     build_failed_records,
     build_human_review_records,
 )
 from fact_form_importer.output.logs import build_import_summary, write_processing_outputs
+from fact_form_importer.validators.fact_api_courts import CourtReference
+from fact_form_importer.validators.vocabularies import Vocabularies
 
 
-def test_build_fact_payload_excludes_failed_and_human_review_records():
+def test_build_fact_import_payload_excludes_failed_and_human_review_records():
     submissions = [
         _submission("processed-court", "processed"),
         _submission("warning-court", "processed_with_warnings"),
@@ -22,23 +23,110 @@ def test_build_fact_payload_excludes_failed_and_human_review_records():
         _submission("failed-court", "failed"),
     ]
 
-    payload = build_fact_payload(submissions)
+    payload = build_fact_import_payload(submissions, run_id="run-1")
 
-    assert [record["court_slug"] for record in payload] == [
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["runId"] == "run-1"
+    assert [record["courtSlug"] for record in payload["records"]] == [
         "processed-court",
         "warning-court",
     ]
 
 
-def test_build_fact_payload_serialises_nested_models_in_dict_fields():
+def test_build_fact_import_payload_uses_camel_case_controller_sections():
     submission = _submission("processed-court", "processed")
+    submission.facilities = {"parking_available": True, "accessible_parking": False}
     submission.counter_service = {
+        "assists_with": ["Forms"],
         "monday_to_friday": OpeningTime(open="09:00", close="17:00", status="valid_time")
     }
 
-    payload = build_fact_payload([submission])
+    payload = build_fact_import_payload([submission], run_id="run-1")
+    record = payload["records"][0]
 
-    assert payload[0]["counter_service"]["monday_to_friday"]["open"] == "09:00"
+    assert record["courtSlug"] == "processed-court"
+    assert record["sourceRowNumbers"] == [2]
+    assert record["buildingFacilities"] == {"parking": True}
+    assert record["accessibilityOptions"] == {"accessibleParking": False}
+    assert record["counterServiceOpeningHours"]["counterService"] is True
+    assert set(record) == {
+        "courtId",
+        "courtSlug",
+        "sourceRowNumbers",
+        "buildingFacilities",
+        "accessibilityOptions",
+        "translationServices",
+        "professionalInformation",
+        "counterServiceOpeningHours",
+        "addresses",
+        "contactDetails",
+        "openingHours",
+    }
+
+
+def test_build_fact_import_payload_preserves_api_ready_child_sections_without_review_data():
+    submission = _submission("processed-court", "processed_with_warnings")
+    submission.facilities = {
+        "food_and_drink": ["Free water dispensers"],
+        "quiet_room_available": True,
+    }
+    submission.translation_email = "translation@example.test"
+    submission.interview_rooms = {"has_interview_rooms": True, "room_count": "2"}
+    submission.addresses = [
+        Address(
+            index=1,
+            address_type="Visit",
+            line_1="1 Main Street",
+            postcode="SW1A 1AA",
+            areas_of_law=["Civil"],
+            court_types=["County Court"],
+        )
+    ]
+    submission.contacts = [
+        ContactDetail(index=1, description="Enquiries", email="contact@example.test")
+    ]
+    submission.opening_hours = [
+        OpeningHoursSet(
+            index=1,
+            type="Court open",
+            same_monday_to_friday=True,
+            monday_to_friday=OpeningTime(open="09:00", close="17:00", status="valid_time"),
+        )
+    ]
+    submission.raw = {"submitter_email": "person@example.test"}
+    submission.cleaned = {"internal": "not for import"}
+    submission.issues = [
+        Issue(field="court_slug", code="COURT_SLUG_NORMALISED", severity="warning", message="Normalised")
+    ]
+    vocabularies = Vocabularies(
+        version="test",
+        vocabularies={
+            "areas_of_law": [{"code": "civil", "name": "Civil", "api_id": "area-id"}],
+            "court_types": [{"code": "county", "name": "County Court", "api_id": "type-id"}],
+            "contact_description_types": [{"code": "enquiries", "name": "Enquiries", "api_id": "contact-id"}],
+            "opening_hour_types": [{"code": "court_open", "name": "Court open", "api_id": "opening-id"}],
+        },
+    )
+
+    payload = build_fact_import_payload(
+        [submission],
+        run_id="run-1",
+        vocabularies=vocabularies,
+        court_lookup=lambda slug: CourtReference("court-id", slug),
+    )
+    record = payload["records"][0]
+
+    assert record["courtId"] == "court-id"
+    assert record["buildingFacilities"]["freeWaterDispensers"] is True
+    assert record["accessibilityOptions"]["quietRoom"] is True
+    assert record["translationServices"] == {"email": "translation@example.test"}
+    assert record["professionalInformation"] == {"interviewRooms": True, "interviewRoomCount": 2}
+    assert record["addresses"][0]["areasOfLaw"] == ["area-id"]
+    assert record["addresses"][0]["courtTypes"] == ["type-id"]
+    assert record["contactDetails"][0]["courtContactDescriptionId"] == "contact-id"
+    assert record["openingHours"][0]["openingHourTypeId"] == "opening-id"
+    assert record["openingHours"][0]["openingTimesDetails"][0]["dayOfWeek"] == "EVERYDAY"
+    assert "raw" not in record and "issues" not in record and "source" not in record
 
 
 def test_review_output_builders_include_only_matching_statuses():
@@ -53,6 +141,19 @@ def test_review_output_builders_include_only_matching_statuses():
         record["court_slug"]
         for record in build_human_review_records([failed, review, processed])
     ] == ["review-court"]
+
+
+def test_review_output_builders_serialise_nested_cleaned_models():
+    review = _submission("review-court", "needs_human_review")
+    review.cleaned = {
+        "counter_service": {
+            "monday_to_friday": OpeningTime(open="09:00", close="17:00", status="valid_time")
+        }
+    }
+
+    record = build_human_review_records([review])[0]
+
+    assert record["cleaned"]["counter_service"]["monday_to_friday"]["open"] == "09:00"
 
 
 def test_build_import_summary_counts_statuses_and_issues(tmp_path):
@@ -137,15 +238,15 @@ def test_write_processing_outputs_writes_expected_files(tmp_path):
     )
 
     assert result.run_id == "run-1"
-    assert (tmp_path / "fact_payload.json").exists()
+    assert (tmp_path / "fact_import_payload.json").exists()
     assert (tmp_path / "failed_records.json").exists()
     assert (tmp_path / "records_needing_human_review.json").exists()
     assert (tmp_path / "issue_report.json").exists()
     assert (tmp_path / "import_summary.json").exists()
 
-    payload = json.loads((tmp_path / "fact_payload.json").read_text())
+    payload = json.loads((tmp_path / "fact_import_payload.json").read_text())
     summary = json.loads((tmp_path / "import_summary.json").read_text())
-    assert payload[0]["court_slug"] == "processed-court"
+    assert payload["records"][0]["courtSlug"] == "processed-court"
     assert summary["failed_count"] == 1
     assert summary["vocabulary_source"] == "local_json"
 

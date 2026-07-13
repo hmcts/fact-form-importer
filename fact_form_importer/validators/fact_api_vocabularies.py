@@ -60,6 +60,7 @@ def _entries_from_api_items(items: Any) -> list[VocabularyEntry]:
             VocabularyEntry(
                 code=_code_for_name(str(item["name"])),
                 name=str(item["name"]),
+                api_id=str(item["id"]) if item.get("id") else None,
             )
         )
 

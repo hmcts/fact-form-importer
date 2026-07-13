@@ -42,6 +42,12 @@ class AppConfig:
         return os.getenv("FACT_DATA_API_BEARER_TOKEN") or None
 
     @property
+    def fact_data_api_writes_enabled(self) -> bool:
+        """Explicit local circuit breaker for FaCT API mutation requests."""
+
+        return _env_bool("FACT_DATA_API_WRITES_ENABLED", default=False)
+
+    @property
     def llm_enabled(self) -> bool:
         return _env_bool("LLM_ENABLED", default=False)
 
