@@ -42,10 +42,27 @@ class AppConfig:
         return os.getenv("FACT_DATA_API_BEARER_TOKEN") or None
 
     @property
+    def fact_data_api_user_id(self) -> Optional[str]:
+        """Existing FaCT user UUID used to attribute audited write requests."""
+
+        return os.getenv("FACT_DATA_API_USER_ID") or None
+
+    @property
     def fact_data_api_writes_enabled(self) -> bool:
         """Explicit local circuit breaker for FaCT API mutation requests."""
 
         return _env_bool("FACT_DATA_API_WRITES_ENABLED", default=False)
+
+    @property
+    def os_address_min_interval_seconds(self) -> float:
+        """Minimum gap between uncached FaCT/OS postcode lookups."""
+
+        raw = os.getenv("OS_ADDRESS_MIN_INTERVAL_SECONDS", "1.1")
+        try:
+            value = float(raw)
+        except ValueError:
+            return 1.1
+        return value if value >= 1.0 else 1.0
 
     @property
     def llm_enabled(self) -> bool:

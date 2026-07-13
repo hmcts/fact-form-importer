@@ -30,6 +30,7 @@ class JobState:
     state: str
     source_name: str
     use_llm: bool
+    verify_addresses: bool = False
     run_id: str | None = None
     error: str | None = None
 
@@ -39,6 +40,7 @@ class JobState:
             "state": self.state,
             "source_name": self.source_name,
             "use_llm": self.use_llm,
+            "verify_addresses": self.verify_addresses,
             "run_id": self.run_id,
             "error": self.error,
         }
@@ -61,11 +63,22 @@ class LocalJobRunner:
         self.active_job_id: str | None = None
         self._restore_interrupted_jobs()
 
-    def start(self, file: FileStorage, use_llm: bool, llm_enabled: bool) -> JobState:
+    def start(
+        self,
+        file: FileStorage,
+        use_llm: bool,
+        llm_enabled: bool,
+        verify_addresses: bool = False,
+        address_verification_available: bool = True,
+    ) -> JobState:
         if self.active_job_id:
             raise ValueError("An import job is already running")
         if use_llm and not llm_enabled:
             raise ValueError("LLM processing is disabled by LLM_ENABLED")
+        if verify_addresses and not address_verification_available:
+            raise ValueError(
+                "Address verification requires FACT_DATA_API_BASE_URL and FACT_DATA_API_BEARER_TOKEN"
+            )
         source_name = secure_filename(file.filename or "")
         if not source_name or Path(source_name).suffix.lower() not in ALLOWED_EXTENSIONS:
             raise ValueError("Upload a CSV or XLSX file")
@@ -75,7 +88,13 @@ class LocalJobRunner:
         upload_directory.mkdir(parents=True)
         input_path = upload_directory / source_name
         file.save(input_path)
-        job = JobState(job_id=job_id, state="queued", source_name=source_name, use_llm=use_llm)
+        job = JobState(
+            job_id=job_id,
+            state="queued",
+            source_name=source_name,
+            use_llm=use_llm,
+            verify_addresses=verify_addresses,
+        )
         self._write_job(job)
         self.active_job_id = job_id
         self.executor.submit(self._run, job, input_path)
@@ -95,6 +114,7 @@ class LocalJobRunner:
                 input_path=input_path,
                 output_root=self.output_root,
                 use_llm=queued_job.use_llm,
+                verify_addresses=queued_job.verify_addresses,
                 source_name=queued_job.source_name,
             )
             self._write_job(
@@ -103,6 +123,7 @@ class LocalJobRunner:
                     state="completed",
                     source_name=queued_job.source_name,
                     use_llm=queued_job.use_llm,
+                    verify_addresses=queued_job.verify_addresses,
                     run_id=result.run_id,
                 )
             )
@@ -113,6 +134,7 @@ class LocalJobRunner:
                     state="failed",
                     source_name=queued_job.source_name,
                     use_llm=queued_job.use_llm,
+                    verify_addresses=queued_job.verify_addresses,
                     error=_safe_job_error(exc),
                 )
             )
@@ -138,6 +160,7 @@ class LocalJobRunner:
                         state="failed",
                         source_name=job.source_name,
                         use_llm=job.use_llm,
+                        verify_addresses=job.verify_addresses,
                         error="Server restarted before the import job completed",
                     )
                 )
@@ -167,6 +190,7 @@ def create_app(
             "index.html",
             archives=list_run_archives(output_root),
             llm_enabled=app.config["APP_CONFIG"].llm_enabled,
+            address_verification_available=_address_verification_available(app.config["APP_CONFIG"]),
         )
 
     @app.post("/runs")
@@ -179,6 +203,10 @@ def create_app(
                 upload,
                 use_llm=request.form.get("use_llm") == "on",
                 llm_enabled=app.config["APP_CONFIG"].llm_enabled,
+                verify_addresses=request.form.get("verify_addresses") == "on",
+                address_verification_available=_address_verification_available(
+                    app.config["APP_CONFIG"]
+                ),
             )
         except ValueError as exc:
             abort(400, str(exc))
@@ -407,6 +435,8 @@ def _artifact_groups(archive: dict[str, Any]) -> tuple[list[dict[str, Any]], lis
         "api_readiness_report.json": "API readiness report",
         "fact_api_import_manifest.json": "Legacy API readiness report",
         "nsu_cleaned_review.xlsx": "NSU cleaned review workbook",
+        "duplicate_forms_review.xlsx": "Duplicate form decision workbook",
+        "address_verification_report.json": "Address verification report",
         "import_summary.json": "Import summary",
         "issue_report.json": "Issue report",
         "records_needing_human_review.json": "Records needing human review",
@@ -417,6 +447,8 @@ def _artifact_groups(archive: dict[str, Any]) -> tuple[list[dict[str, Any]], lis
         "api_readiness_report.json",
         "fact_api_import_manifest.json",
         "nsu_cleaned_review.xlsx",
+        "duplicate_forms_review.xlsx",
+        "address_verification_report.json",
         "import_summary.json",
         "issue_report.json",
         "records_needing_human_review.json",
@@ -459,6 +491,10 @@ def _safe_job_error(exc: Exception) -> str:
     return f"Processing failed ({type(exc).__name__})"
 
 
+def _address_verification_available(config: AppConfig) -> bool:
+    return bool(config.fact_data_api_base_url and config.fact_data_api_bearer_token)
+
+
 def _paginate(items: list[Any], page_value: str | None) -> tuple[int, int, list[Any]]:
     try:
         page = max(int(page_value or "1"), 1)
@@ -483,6 +519,8 @@ def _action_evidence(submission: dict[str, Any], action: dict[str, Any]) -> dict
     return {
         "cleaned": {field: _value_at_path(submission, field) for field in source_fields},
         "raw": _raw_evidence_for_fields(submission.get("raw", {}), source_fields),
+        "address_verification": action.get("address_verification"),
+        "request_body_normalisations": action.get("request_body_normalisations") or {},
     }
 
 

@@ -44,6 +44,7 @@ def write_processing_outputs(
     source_name: str | None = None,
     vocabularies: Vocabularies | None = None,
     court_lookup: Callable[[str], CourtReference | None] | None = None,
+    address_verification_metrics: dict[str, Any] | None = None,
 ) -> OutputResult:
     output_path.mkdir(parents=True, exist_ok=True)
     current_run_id = run_id or _new_run_id()
@@ -67,6 +68,7 @@ def write_processing_outputs(
         llm_requested=llm_requested,
         llm_metrics=llm_metrics,
         api_manifest_metrics=api_manifest_metrics,
+        address_verification_metrics=address_verification_metrics,
         source_name=source_name,
     )
 
@@ -105,6 +107,7 @@ def build_import_summary(
     llm_metrics: dict[str, Any] | None = None,
     api_manifest_metrics: dict[str, int] | None = None,
     source_name: str | None = None,
+    address_verification_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status_counts = Counter(submission.status for submission in submissions)
     issue_counts = Counter(
@@ -145,13 +148,31 @@ def build_import_summary(
             "llm_fields_selected": 0,
             "llm_fields_processed": 0,
             "llm_submissions_with_selected_fields": 0,
+            "llm_address_candidate_groups_selected": 0,
+            "llm_address_suggestions_recorded": 0,
             "llm_model": None,
+            "address_verification_enabled": False,
+            "address_verification_count": 0,
+            "address_verification_unique_postcode_lookups": 0,
+            "address_verification_cache_hits": 0,
+            "address_verification_rate_limit_retries": 0,
+            "address_verification_auto_normalised_count": 0,
+            "address_verification_verified_count": 0,
+            "address_verification_review_required_count": 0,
+            "address_verification_no_os_result_count": 0,
+            "address_verification_invalid_postcode_count": 0,
+            "address_verification_unsupported_postcode_region_count": 0,
+            "address_verification_missing_postcode_count": 0,
+            "address_verification_action_blocking_count": 0,
+            "address_verification_unavailable_count": 0,
         }
     )
     if llm_metrics:
         summary.update(llm_metrics)
     if api_manifest_metrics:
         summary.update(api_manifest_metrics)
+    if address_verification_metrics:
+        summary.update(address_verification_metrics)
     return summary
 
 

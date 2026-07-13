@@ -28,7 +28,7 @@
       <tr>
         <td><strong>{{ action.resource }}</strong><br><code>{{ action.method }} {{ action.path }}</code></td>
         <td><details><summary>Body</summary><pre>{{ action.body | tojson(indent=2) }}</pre></details></td>
-        <td><details><summary>Cleaned values</summary><pre>{{ action.evidence.cleaned | tojson(indent=2) }}</pre></details><details><summary>Raw source values</summary><pre>{{ action.evidence.raw | tojson(indent=2) }}</pre></details></td>
+        <td><details><summary>Cleaned values</summary><pre>{{ action.evidence.cleaned | tojson(indent=2) }}</pre></details><details><summary>Raw source values</summary><pre>{{ action.evidence.raw | tojson(indent=2) }}</pre></details>{% if action.evidence.address_verification %}<details><summary>Address verification</summary><pre>{{ action.evidence.address_verification | tojson(indent=2) }}</pre></details>{% endif %}{% if action.evidence.request_body_normalisations %}<details><summary>Request-only normalisation</summary><pre>{{ action.evidence.request_body_normalisations | tojson(indent=2) }}</pre></details>{% endif %}</td>
         <td><strong>{{ action.execution.status }}</strong>{% if action.execution.reason %}<br>{{ action.execution.reason }}{% endif %}{% if action.execution.last_response_status %}<br>HTTP {{ action.execution.last_response_status }}{% endif %}</td>
         <td>
           {% if writes_enabled %}

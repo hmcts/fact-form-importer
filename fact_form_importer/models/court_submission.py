@@ -72,3 +72,24 @@ class CourtSubmission(BaseModel):
         "failed",
         "skipped",
     ] = "unprocessed"
+
+
+def sync_cleaned_snapshot(submission: CourtSubmission) -> None:
+    """Refresh the inspectable cleaned-value snapshot after a safe mutation.
+
+    Import stages retain the original spreadsheet values in ``raw``.  This
+    helper keeps the separately exported cleaned snapshot consistent when a
+    later deterministic or LLM-assisted stage updates the structured model.
+    """
+
+    submission.cleaned = {
+        "court_slug": submission.court_slug,
+        "facilities": submission.facilities,
+        "translation_phone": submission.translation_phone,
+        "translation_email": submission.translation_email,
+        "addresses": [address.model_dump(mode="json") for address in submission.addresses],
+        "counter_service": submission.counter_service,
+        "interview_rooms": submission.interview_rooms,
+        "contacts": [contact.model_dump(mode="json") for contact in submission.contacts],
+        "opening_hours": [hours.model_dump(mode="json") for hours in submission.opening_hours],
+    }

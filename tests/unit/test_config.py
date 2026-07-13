@@ -163,11 +163,13 @@ def test_load_field_rules_reads_json_file(tmp_path):
 def test_app_config_reads_fact_data_api_environment(monkeypatch):
     monkeypatch.setenv("FACT_DATA_API_BASE_URL", "https://fact-data-api.example.test")
     monkeypatch.setenv("FACT_DATA_API_BEARER_TOKEN", "token")
+    monkeypatch.setenv("FACT_DATA_API_USER_ID", "00000000-0000-4000-a000-000000000001")
 
     config = AppConfig()
 
     assert config.fact_data_api_base_url == "https://fact-data-api.example.test"
     assert config.fact_data_api_bearer_token == "token"
+    assert config.fact_data_api_user_id == "00000000-0000-4000-a000-000000000001"
 
 
 def test_app_config_reads_openai_environment(monkeypatch):

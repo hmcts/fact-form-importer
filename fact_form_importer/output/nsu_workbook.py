@@ -9,17 +9,22 @@ from typing import Any, Iterable
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
-from openpyxl.utils.datetime import from_excel
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 from pydantic import BaseModel
 
 from fact_form_importer.models.court_submission import CourtSubmission, OpeningTime
+from fact_form_importer.output.duplicate_review import (
+    duplicate_timestamp,
+    format_source_date,
+    group_duplicate_submissions,
+    most_recent_duplicate_submission,
+)
 from fact_form_importer.validators.base import (
     COURT_SLUG_AUTO_REPAIRED,
     COURT_SLUG_SUGGESTED,
-    DUPLICATE_COURT_SLUG,
 )
+from fact_form_importer.validators.os_addresses import AddressVerification
 
 WORKBOOK_NAME = "nsu_cleaned_review.xlsx"
 HEADER_FILL = PatternFill("solid", fgColor="D9EAF7")
@@ -45,6 +50,10 @@ ISSUE_EXPLANATIONS = {
     "OPENING_HOURS_AMBIGUOUS": "Opening hours need review because the time values are invalid or ambiguous.",
     "POSTCODE_TYPO_REPAIRED": "An obvious O/0 typo in a postcode digit position was repaired.",
     "VOCAB_NO_MATCH": "A value does not match the configured controlled list.",
+    "ADDRESS_OS_NORMALISED": "A unique high-confidence Ordnance Survey candidate was used to normalise an address.",
+    "ADDRESS_OS_VERIFIED": "The submitted address matched a unique Ordnance Survey candidate without changes.",
+    "ADDRESS_OS_REVIEW_REQUIRED": "Ordnance Survey returned address candidates, but none was safe to choose automatically.",
+    "ADDRESS_OS_LOOKUP_UNAVAILABLE": "The FaCT/Ordnance Survey lookup was temporarily unavailable; no address change was made.",
 }
 ISSUE_ACTIONS = {
     "COURT_SLUG_NORMALISED": "Check only if the cleaned slug looks wrong.",
@@ -59,6 +68,10 @@ ISSUE_ACTIONS = {
     "OPENING_HOURS_AMBIGUOUS": "Review the opening-hours fields and correct the time values.",
     "POSTCODE_TYPO_REPAIRED": "Check only if the cleaned postcode looks wrong.",
     "VOCAB_NO_MATCH": "Map the value to an allowed option or confirm it needs a new controlled-list value.",
+    "ADDRESS_OS_NORMALISED": "Check the OS-derived address if it looks unexpected.",
+    "ADDRESS_OS_VERIFIED": "No action needed unless the submitted address appears wrong.",
+    "ADDRESS_OS_REVIEW_REQUIRED": "Review the OS candidates and choose or correct the address before sending that address action.",
+    "ADDRESS_OS_LOOKUP_UNAVAILABLE": "Run address verification again after FaCT/Ordnance Survey is available.",
 }
 
 
@@ -66,6 +79,7 @@ def write_nsu_review_workbook(
     submissions: list[CourtSubmission],
     output_path: Path,
     summary: dict[str, Any],
+    address_verifications: list[AddressVerification] | None = None,
 ) -> Path:
     output_path.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
@@ -91,6 +105,7 @@ def write_nsu_review_workbook(
     _add_duplicate_courts_sheet(workbook, submissions)
     _add_court_slug_suggestions_sheet(workbook, submissions)
     _add_addresses_sheet(workbook, submissions)
+    _add_address_verification_sheet(workbook, address_verifications or [])
     _add_contacts_sheet(workbook, submissions)
     _add_opening_hours_sheet(workbook, submissions)
     _add_issues_sheet(workbook, submissions)
@@ -128,6 +143,12 @@ def _add_summary_sheet(
             "Duplicate affected records (included in needs human review)",
             summary.get("duplicate_slug_affected_record_count"),
         ],
+        ["Address verification enabled", summary.get("address_verification_enabled")],
+        ["Addresses checked against OS", summary.get("address_verification_count")],
+        ["Unique postcode lookups", summary.get("address_verification_unique_postcode_lookups")],
+        ["Addresses auto-normalised from OS", summary.get("address_verification_auto_normalised_count")],
+        ["Addresses with ambiguous OS candidates", summary.get("address_verification_review_required_count")],
+        ["Address actions held for review", summary.get("address_verification_action_blocking_count")],
         [],
         ["Issue code", "Count"],
     ]
@@ -187,10 +208,7 @@ def _add_records_sheet(
 
 
 def _add_duplicate_courts_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:
-    by_slug: dict[str, list[CourtSubmission]] = defaultdict(list)
-    for submission in submissions:
-        if any(issue.code == DUPLICATE_COURT_SLUG for issue in submission.issues):
-            by_slug[submission.court_slug or ""].append(submission)
+    by_slug = group_duplicate_submissions(submissions)
 
     rows = [
         [
@@ -210,14 +228,15 @@ def _add_duplicate_courts_sheet(workbook: Workbook, submissions: list[CourtSubmi
         ]
     ]
     for slug, matching_submissions in sorted(by_slug.items()):
-        most_recent = _most_recent_submission(matching_submissions)
+        most_recent = most_recent_duplicate_submission(matching_submissions)
+        candidate_timestamp = duplicate_timestamp(most_recent) if most_recent else None
         rows.append(
             [
                 slug,
                 len(matching_submissions),
                 ", ".join(str(submission.source.source_row_number) for submission in matching_submissions),
                 most_recent.source.source_row_number if most_recent else None,
-                _submission_date_for_duplicate_review(most_recent) if most_recent else None,
+                candidate_timestamp.display_value if candidate_timestamp else None,
                 " | ".join(
                     sorted(
                         {
@@ -238,19 +257,19 @@ def _add_duplicate_courts_sheet(workbook: Workbook, submissions: list[CourtSubmi
                 ),
                 " | ".join(
                     _dedupe_preserving_order(
-                        _format_source_date(submission.source.completion_time)
+                        format_source_date(submission.source.completion_time)
                         for submission in matching_submissions
                     )
                 ),
                 " | ".join(
                     _dedupe_preserving_order(
-                        _format_source_date(submission.source.start_time)
+                        format_source_date(submission.source.start_time)
                         for submission in matching_submissions
                     )
                 ),
                 " | ".join(
                     _dedupe_preserving_order(
-                        _format_source_date(submission.source.last_modified_time)
+                        format_source_date(submission.source.last_modified_time)
                         for submission in matching_submissions
                     )
                 ),
@@ -310,62 +329,11 @@ def _add_court_slug_suggestions_sheet(workbook: Workbook, submissions: list[Cour
     _write_sheet(workbook, "Court slug suggestions", rows)
 
 
-def _most_recent_submission(submissions: list[CourtSubmission]) -> CourtSubmission | None:
-    dated_submissions = [
-        submission
-        for submission in submissions
-        if _submission_date_raw_for_duplicate_review(submission)
-    ]
-    if not dated_submissions:
-        return None
-
-    return max(
-        dated_submissions,
-        key=lambda submission: _source_date_sort_key(
-            _submission_date_raw_for_duplicate_review(submission)
-        ),
-    )
-
-
-def _submission_date_for_duplicate_review(submission: CourtSubmission | None) -> str | None:
-    return _format_source_date(_submission_date_raw_for_duplicate_review(submission))
-
-
-def _submission_date_raw_for_duplicate_review(submission: CourtSubmission | None) -> str | None:
-    if submission is None:
-        return None
-
-    return (
-        submission.source.completion_time
-        or submission.source.last_modified_time
-        or submission.source.start_time
-    )
-
-
 def _duplicate_submission_summary(submission: CourtSubmission) -> str:
-    date = _submission_date_for_duplicate_review(submission) or "no date"
+    timestamp = duplicate_timestamp(submission)
+    date = timestamp.display_value if timestamp else "no date"
     submitter = submission.source.submitter_name or submission.source.submitter_email or "unknown submitter"
     return f"row {submission.source.source_row_number}: {date}, {submitter}"
-
-
-def _format_source_date(value: str | None) -> str | None:
-    if not value:
-        return None
-
-    try:
-        return from_excel(float(value)).isoformat(sep=" ", timespec="minutes")
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _source_date_sort_key(value: str | None) -> tuple[int, float | str]:
-    if not value:
-        return (0, "")
-
-    try:
-        return (1, float(value))
-    except (TypeError, ValueError):
-        return (1, str(value))
 
 
 def _dedupe_preserving_order(values: Iterable[str | None]) -> list[str]:
@@ -416,6 +384,55 @@ def _add_addresses_sheet(workbook: Workbook, submissions: list[CourtSubmission])
             )
 
     _write_sheet(workbook, "Cleaned addresses", rows)
+
+
+def _add_address_verification_sheet(
+    workbook: Workbook,
+    verifications: list[AddressVerification],
+) -> None:
+    rows = [
+        [
+            "source_row_number",
+            "court_slug",
+            "address_index",
+            "verification_status",
+            "message",
+            "match_score",
+            "score_margin",
+            "match_type",
+            "selected_uprn",
+            "original_address",
+            "proposed_address",
+            "llm_suggested_uprn",
+            "llm_confidence",
+            "llm_needs_human_review",
+            "llm_reason",
+            "os_candidates",
+        ]
+    ]
+    for verification in verifications:
+        suggestion = verification.llm_suggestion or {}
+        rows.append(
+            [
+                verification.source_row_number,
+                verification.court_slug,
+                verification.address_index,
+                verification.status,
+                verification.message,
+                verification.match_score,
+                verification.score_margin,
+                verification.match_type,
+                verification.selected_candidate.uprn if verification.selected_candidate else None,
+                _cell_value(verification.original_address),
+                _cell_value(verification.proposed_address),
+                suggestion.get("uprn"),
+                suggestion.get("confidence"),
+                suggestion.get("needs_human_review"),
+                suggestion.get("reason"),
+                _cell_value([candidate.as_dict() for candidate in verification.candidates]),
+            ]
+        )
+    _write_sheet(workbook, "Address verification", rows)
 
 
 def _add_contacts_sheet(workbook: Workbook, submissions: list[CourtSubmission]) -> None:

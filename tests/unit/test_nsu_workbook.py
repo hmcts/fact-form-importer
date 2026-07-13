@@ -10,6 +10,7 @@ from fact_form_importer.models.court_submission import (
 from fact_form_importer.models.issues import Issue
 from fact_form_importer.models.source import SourceMetadata
 from fact_form_importer.output.nsu_workbook import WORKBOOK_NAME, write_nsu_review_workbook
+from fact_form_importer.validators.os_addresses import AddressVerification
 
 
 def test_write_nsu_review_workbook_creates_expected_review_tabs(tmp_path):
@@ -78,6 +79,7 @@ def test_write_nsu_review_workbook_creates_expected_review_tabs(tmp_path):
         "Duplicate courts",
         "Court slug suggestions",
         "Cleaned addresses",
+        "Address verification",
         "Cleaned contacts",
         "Cleaned opening hours",
         "Issues",
@@ -105,6 +107,38 @@ def test_write_nsu_review_workbook_creates_expected_review_tabs(tmp_path):
     assert workbook["Issues"]["D2"].value == "DUPLICATE_COURT_SLUG"
     assert "More than one submitted row" in workbook["Issues"]["G2"].value
     assert "Review all rows" in workbook["Issues"]["H2"].value
+
+
+def test_nsu_workbook_includes_os_address_verification_evidence(tmp_path):
+    submission = _submission(
+        court_slug="review-court",
+        status="processed_with_warnings",
+        row_number=2,
+        addresses=[Address(index=1, line_1="1 Main Street", town_or_city="London", postcode="SW1A 1AA")],
+    )
+    verification = AddressVerification(
+        source_row_number=2,
+        court_slug="review-court",
+        address_index=1,
+        postcode="SW1A 1AA",
+        status="review_required",
+        message="No unique high-confidence OS match was found",
+        original_address=submission.addresses[0].model_dump(mode="json"),
+        llm_suggestion={"uprn": "uprn-1", "confidence": "high", "needs_human_review": True},
+    )
+
+    path = write_nsu_review_workbook(
+        [submission],
+        tmp_path,
+        {"run_id": "run-1", "address_verification_enabled": True},
+        address_verifications=[verification],
+    )
+
+    workbook = load_workbook(path)
+    sheet = workbook["Address verification"]
+    assert sheet["A2"].value == 2
+    assert sheet["D2"].value == "review_required"
+    assert sheet["L2"].value == "uprn-1"
 
 
 def test_nsu_workbook_review_reason_names_vocab_field_and_raw_value(tmp_path):

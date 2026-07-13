@@ -20,7 +20,11 @@ from fact_form_importer.llm.pipeline import build_llm_request_review
 from fact_form_importer.llm.prompts import SYSTEM_PROMPT
 from fact_form_importer.llm.schemas import LlmNormalisationResponse
 from fact_form_importer.llm.openai_client import check_llm_connection
-from fact_form_importer.processing import load_fact_api_services, process_workbook
+from fact_form_importer.processing import (
+    load_fact_api_services,
+    process_workbook,
+    verify_addresses_with_fact_api,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow config/vocabularies.example.json when FaCT Data API vocabulary loading "
             "is unavailable. Intended for local/offline review only."
+        ),
+    )
+    run_parser.add_argument(
+        "--verify-addresses",
+        action="store_true",
+        help=(
+            "Verify populated addresses through FaCT's existing Ordnance Survey search endpoint. "
+            "This is rate-limited to one uncached postcode lookup per second."
         ),
     )
 
@@ -62,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-local-vocabularies",
         action="store_true",
         help="Allow local vocabulary fixtures when FaCT Data API access is unavailable.",
+    )
+    llm_review_parser.add_argument(
+        "--verify-addresses",
+        action="store_true",
+        help=(
+            "Include only unresolved FaCT/Ordnance Survey address candidates in the local request review. "
+            "Makes no model call."
+        ),
     )
     run_parser.add_argument(
         "--use-llm",
@@ -139,6 +159,7 @@ def run(
     output_path: Path,
     allow_local_vocabularies: bool = False,
     use_llm: bool = False,
+    verify_addresses: bool = False,
 ) -> int:
     try:
         result = process_workbook(
@@ -146,6 +167,7 @@ def run(
             output_root=output_path,
             allow_local_vocabularies=allow_local_vocabularies,
             use_llm=use_llm,
+            verify_addresses=verify_addresses,
         )
     except (FileNotFoundError, KeyError, ModuleNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -176,10 +198,17 @@ def run(
     if summary["llm_model"]:
         print(f"LLM model: {summary['llm_model']}")
     print(f"Vocabulary source: {summary['vocabulary_source']}")
+    print(f"Address verification requested: {verify_addresses}")
+    print(f"Addresses checked against OS: {summary['address_verification_count']}")
+    print(f"Unique postcode lookups: {summary['address_verification_unique_postcode_lookups']}")
+    print(f"Addresses auto-normalised from OS: {summary['address_verification_auto_normalised_count']}")
+    print(f"Address actions held for review: {summary['address_verification_action_blocking_count']}")
     print(f"API readiness ready actions: {summary['api_manifest_ready_action_count']}")
     print(f"API readiness pending actions: {summary['api_manifest_pending_action_count']}")
     print(f"Wrote NSU review workbook: {result.review_workbook_path}")
+    print(f"Wrote duplicate form review workbook: {result.duplicate_review_workbook_path}")
     print(f"Wrote read-only approval users: {result.submitters.json_path}")
+    print(f"Wrote address verification report: {result.address_verification_report_path}")
     print(f"Archived run: {result.archive.archive_path}")
     print(f"Wrote latest run outputs to: {output_path}")
     return 0
@@ -189,6 +218,7 @@ def llm_request_review(
     input_path: Path,
     output_path: Path,
     allow_local_vocabularies: bool = False,
+    verify_addresses: bool = False,
 ) -> int:
     """Write exact safe request payloads for inspection without model calls."""
 
@@ -199,10 +229,16 @@ def llm_request_review(
             config=config,
             allow_local_vocabularies=allow_local_vocabularies,
         )
+        address_verifications = (
+            verify_addresses_with_fact_api(ingest_result.submissions, config)
+            if verify_addresses
+            else None
+        )
         requests = build_llm_request_review(
             ingest_result.submissions,
             field_rules=load_default_field_rules(config),
             vocabularies=vocabularies,
+            address_verifications=address_verifications,
         )
         payload = {
             "source_file": str(input_path),
@@ -212,6 +248,10 @@ def llm_request_review(
             "vocabulary_source": vocabulary_source,
             "request_count": len(requests),
             "field_count": sum(len(request.fields) for request in requests),
+            "address_verification_requested": verify_addresses,
+            "address_verification": (
+                address_verifications.summary_metrics() if address_verifications else None
+            ),
             "instructions": SYSTEM_PROMPT,
             "response_schema": LlmNormalisationResponse.model_json_schema(),
             "requests": [request.model_dump(mode="json", exclude_none=True) for request in requests],
@@ -228,6 +268,11 @@ def llm_request_review(
 
     print(f"LLM request review records: {payload['request_count']}")
     print(f"LLM request review fields: {payload['field_count']}")
+    if verify_addresses:
+        print(
+            "Address candidate groups: "
+            f"{payload['address_verification']['address_verification_review_required_count']}"
+        )
     print("LLM calls made: 0")
     print(f"Vocabulary source: {payload['vocabulary_source']}")
     print(f"Wrote LLM request review: {review_path}")
@@ -417,6 +462,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             allow_local_vocabularies=args.allow_local_vocabularies,
             use_llm=args.use_llm,
+            verify_addresses=args.verify_addresses,
         )
 
     if args.command == "profile":
@@ -436,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
             args.input,
             args.output,
             allow_local_vocabularies=args.allow_local_vocabularies,
+            verify_addresses=args.verify_addresses,
         )
 
     if args.command == "serve":

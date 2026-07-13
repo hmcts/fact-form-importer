@@ -14,6 +14,8 @@ Do not infer facts that are not present in the input.
 Do not invent courts, floors, rooms, entrances, routes, services, or availability.
 If a value is unclear, vague, contradictory, or cannot be safely mapped, keep it for human review.
 For controlled vocabularies, return only exact allowed vocabulary values.
+For address candidates, choose only a UPRN supplied in the request, or null.
+Address candidate selections are advisory and must not reconstruct or invent an address.
 """
 
 

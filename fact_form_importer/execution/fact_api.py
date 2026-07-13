@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 
@@ -24,6 +25,7 @@ class FactApiExecutionClient:
             raise ValueError("FACT_DATA_API_BASE_URL and FACT_DATA_API_BEARER_TOKEN are required")
         self.base_url = config.fact_data_api_base_url.rstrip("/")
         self.headers = {"Authorization": f"Bearer {config.fact_data_api_bearer_token}"}
+        self.user_id = config.fact_data_api_user_id
         self._client = client or httpx.Client(timeout=15.0)
         self._owns_client = client is None
 
@@ -52,10 +54,19 @@ class FactApiExecutionClient:
         return ApiResponse(status_code=response.status_code, body=_response_body(response))
 
     def write(self, method: str, path: str, body: dict[str, Any]) -> ApiResponse:
+        if not self.user_id:
+            raise ValueError(
+                "FACT_DATA_API_USER_ID is required for audited FaCT API write requests"
+            )
+        try:
+            UUID(self.user_id)
+        except ValueError as exc:
+            raise ValueError("FACT_DATA_API_USER_ID must be a valid UUID") from exc
+
         response = self._client.request(
             method,
             f"{self.base_url}{path}",
-            headers=self.headers,
+            headers={**self.headers, "X-User-Id": self.user_id},
             json=body,
         )
         return ApiResponse(status_code=response.status_code, body=_response_body(response))

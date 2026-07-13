@@ -5,10 +5,7 @@ from fact_form_importer.llm.pipeline import (
     apply_llm_response,
     normalise_submissions_with_llm,
 )
-from fact_form_importer.llm.schemas import (
-    LlmNormalisedField,
-    LlmNormalisationResponse,
-)
+from fact_form_importer.llm.schemas import LlmAddressMatch, LlmNormalisedField, LlmNormalisationResponse
 from fact_form_importer.llm.schemas import LlmField
 from fact_form_importer.models.court_submission import Address, ContactDetail, CourtSubmission
 from fact_form_importer.models.source import SourceMetadata
@@ -23,6 +20,7 @@ from fact_form_importer.validators.base import (
     clear_validation_issues,
     validate_submission,
 )
+from fact_form_importer.validators.os_addresses import AddressVerification, AddressVerificationBatch, OsAddressCandidate
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 
@@ -254,6 +252,65 @@ def test_revalidation_removes_stale_vocab_issue_after_valid_llm_mapping():
 
     assert not _has_issue(submission, VOCAB_NO_MATCH)
     assert submission.status == "processed"
+
+
+def test_pipeline_can_record_an_advisory_os_candidate_without_mutating_the_address():
+    submission = _submission(description="Enquiries")
+    submission.addresses = [
+        Address(index=1, line_1="1 Main Street", town_or_city="London", postcode="SW1A 1AA")
+    ]
+    verification = AddressVerification(
+        source_row_number=2,
+        court_slug="example-court",
+        address_index=1,
+        postcode="SW1A 1AA",
+        status="review_required",
+        message="No unique high-confidence OS match was found",
+        original_address=submission.addresses[0].model_dump(mode="json"),
+        candidates=[
+            OsAddressCandidate(
+                uprn="uprn-1",
+                address="1 Main Street, London",
+                organisation_name=None,
+                building_number="1",
+                building_name=None,
+                thoroughfare_name="Main Street",
+                post_town="London",
+                postcode="SW1A 1AA",
+            )
+        ],
+    )
+    batch = AddressVerificationBatch(enabled=True, verifications=[verification])
+
+    def normaliser(request, config):
+        assert request.fields == []
+        assert request.address_candidates[0].address_index == 1
+        assert "postcode" not in request.address_candidates[0].submitted_address
+        return LlmNormalisationResponse(
+            record_id=request.record_id,
+            normalised_fields=[],
+            confidence="high",
+            needs_human_review=True,
+            issues=[],
+            address_matches=[
+                LlmAddressMatch(
+                    address_index=1,
+                    uprn="uprn-1",
+                    confidence="high",
+                    needs_human_review=True,
+                    reason="The supplied address best matches this candidate.",
+                )
+            ],
+        )
+
+    result = normalise_submissions_with_llm(
+        [submission], _rules(), _vocabularies(), normaliser=normaliser, address_verifications=batch
+    )
+
+    assert submission.addresses[0].line_1 == "1 Main Street"
+    assert verification.llm_suggestion["uprn"] == "uprn-1"
+    assert result.metrics.address_candidate_groups_selected == 1
+    assert result.metrics.address_suggestions_recorded == 1
 
 
 def _submission(description):

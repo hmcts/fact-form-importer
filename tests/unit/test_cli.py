@@ -11,6 +11,7 @@ from fact_form_importer.llm.pipeline import LlmNormalisationResult, LlmUsageMetr
 def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("FACT_DATA_API_BASE_URL", raising=False)
     monkeypatch.delenv("FACT_DATA_API_BEARER_TOKEN", raising=False)
+    monkeypatch.setenv("LLM_ENABLED", "false")
     input_path = tmp_path / "sample.csv"
     output_path = tmp_path / "out"
     _write_minimal_forms_csv(input_path)
@@ -36,14 +37,18 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     assert "Read-only approval users: 0" in captured.out
     assert "Excluded submitter users: 0" in captured.out
     assert "LLM enabled: False" in captured.out
+    assert "Address verification requested: False" in captured.out
     assert "Vocabulary source: local_json" in captured.out
+    assert "Wrote duplicate form review workbook:" in captured.out
     assert (output_path / "profile.json").exists()
     assert (output_path / "submissions_raw.json").exists()
     assert (output_path / "submissions_cleaned.json").exists()
     assert (output_path / "fact_import_payload.json").exists()
     assert (output_path / "api_readiness_report.json").exists()
+    assert (output_path / "address_verification_report.json").exists()
     assert (output_path / "import_summary.json").exists()
     assert (output_path / "nsu_cleaned_review.xlsx").exists()
+    assert (output_path / "duplicate_forms_review.xlsx").exists()
     assert (output_path / "read_only_approval_users.json").exists()
     assert (output_path / "read_only_approval_users.xlsx").exists()
 
@@ -54,6 +59,27 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     assert summary["llm_enabled"] is False
     assert summary["llm_requested"] is False
     assert summary["llm_calls"] == 0
+    assert summary["address_verification_enabled"] is False
+
+
+def test_run_command_requires_fact_api_configuration_for_address_verification(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("FACT_DATA_API_BASE_URL", raising=False)
+    monkeypatch.delenv("FACT_DATA_API_BEARER_TOKEN", raising=False)
+
+    exit_code = main(
+        [
+            "run",
+            "--input",
+            str(tmp_path / "does-not-need-to-exist.csv"),
+            "--output",
+            str(tmp_path / "out"),
+            "--verify-addresses",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--verify-addresses requires FACT_DATA_API_BASE_URL" in captured.err
 
 
 def test_run_command_rejects_llm_flag_when_env_circuit_breaker_is_disabled(tmp_path, capsys, monkeypatch):

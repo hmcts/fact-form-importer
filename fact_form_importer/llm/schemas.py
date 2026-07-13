@@ -19,6 +19,34 @@ class LlmField(BaseModel):
     cleaned_value: Any = None
 
 
+class LlmAddressCandidate(BaseModel):
+    """One OS candidate the model may select by its supplied UPRN only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    uprn: str
+    organisation_name: Optional[str] = None
+    building_number: Optional[str] = None
+    building_name: Optional[str] = None
+    thoroughfare_name: Optional[str] = None
+    post_town: Optional[str] = None
+
+
+class LlmAddressCandidateRequest(BaseModel):
+    """A minimal unresolved-address comparison request.
+
+    Postcodes, contact data, metadata and court identifiers are deliberately
+    absent. Every candidate already came from the same deterministic postcode
+    lookup.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    address_index: int
+    submitted_address: dict[str, Optional[str]]
+    candidates: list[LlmAddressCandidate]
+
+
 class LlmNormalisationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -28,6 +56,7 @@ class LlmNormalisationRequest(BaseModel):
     fields: list[LlmField]
     allowed_vocabularies: dict[str, list[str]] = Field(default_factory=dict)
     field_rules: dict[str, list[str]] = Field(default_factory=dict)
+    address_candidates: list[LlmAddressCandidateRequest] = Field(default_factory=list)
 
 
 class LlmIssue(BaseModel):
@@ -51,6 +80,18 @@ class LlmNormalisedField(BaseModel):
     reason: str
 
 
+class LlmAddressMatch(BaseModel):
+    """An advisory selection from a supplied OS candidate list."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    address_index: int
+    uprn: Optional[str] = None
+    confidence: Confidence
+    needs_human_review: bool
+    reason: str
+
+
 class LlmNormalisationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -59,3 +100,4 @@ class LlmNormalisationResponse(BaseModel):
     confidence: Confidence
     needs_human_review: bool
     issues: list[LlmIssue]
+    address_matches: list[LlmAddressMatch] = Field(default_factory=list)

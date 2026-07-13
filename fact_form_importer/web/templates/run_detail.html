@@ -10,7 +10,7 @@
   <a href="{{ url_for('api_actions', run_id=archive.manifest.run_id) }}">Readiness report</a>
 </nav>
 <div class="summary">
-  {% for label, key in [('Processed','processed_count'),('Warnings','processed_with_warnings_count'),('Needs review','needs_human_review_count'),('Failed','failed_count'),('Duplicate records','duplicate_slug_affected_record_count'),('Ready API actions','api_manifest_ready_action_count'),('Pending API actions','api_manifest_pending_action_count'),('LLM calls','llm_calls')] %}
+  {% for label, key in [('Processed','processed_count'),('Warnings','processed_with_warnings_count'),('Needs review','needs_human_review_count'),('Failed','failed_count'),('Duplicate records','duplicate_slug_affected_record_count'),('Addresses checked','address_verification_count'),('Address actions held','address_verification_action_blocking_count'),('Ready API actions','api_manifest_ready_action_count'),('Pending API actions','api_manifest_pending_action_count'),('LLM calls','llm_calls')] %}
   <div><strong>{{ label }}</strong><br>{{ summary.get(key, 0) }}</div>
   {% endfor %}
 </div>

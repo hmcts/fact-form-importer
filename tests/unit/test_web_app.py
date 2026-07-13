@@ -38,6 +38,7 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert b"Raw submitted values" in detail.data
     assert client.get(f"/runs/{run_id}/issues").status_code == 200
     assert client.get(f"/runs/{run_id}/api-actions?readiness=ready").status_code == 200
+    assert b"Duplicate form decision workbook" in client.get(f"/runs/{run_id}").data
 
 
 def test_review_ui_allows_only_manifested_artifact_downloads(tmp_path):
@@ -85,6 +86,7 @@ def test_review_ui_rejects_invalid_uploads_and_runs_one_background_job(tmp_path)
     assert status.status_code == 200
     assert status.get_json()["state"] == "completed"
     assert calls[0]["source_name"] == "forms.csv"
+    assert calls[0]["verify_addresses"] is False
     assert not list((tmp_path / "out" / ".uploads").rglob("forms.csv"))
 
 
@@ -100,6 +102,24 @@ def test_review_ui_rejects_llm_upload_when_circuit_breaker_is_off(tmp_path, monk
 
     assert response.status_code == 400
     assert b"LLM processing is disabled" in response.data
+
+
+def test_review_ui_rejects_address_verification_without_fact_api_settings(tmp_path, monkeypatch):
+    monkeypatch.delenv("FACT_DATA_API_BASE_URL", raising=False)
+    monkeypatch.delenv("FACT_DATA_API_BEARER_TOKEN", raising=False)
+    client = create_app(tmp_path / "out", config=AppConfig()).test_client()
+
+    response = client.post(
+        "/runs",
+        data={
+            "source_file": (io.BytesIO(b"a,b\n"), "forms.csv"),
+            "verify_addresses": "on",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert b"Address verification requires" in response.data
 
 
 def test_review_ui_handles_missing_resources_filters_and_pagination(tmp_path):
@@ -294,6 +314,8 @@ def test_action_evidence_projects_cleaned_and_raw_fields(monkeypatch, tmp_path):
     assert evidence["cleaned"]["contacts[1]"]["email"] == "contact@example.test"
     assert evidence["raw"]["R"] == "Yes"
     assert evidence["raw"]["AB"] == "1 Main Street"
+    assert evidence["address_verification"] is None
+    assert evidence["request_body_normalisations"] == {}
     assert _value_at_path({}, "missing.value") is None
     assert _raw_evidence_for_fields({"A": "value"}, ["addresses[bad]"]) == {}
 
@@ -401,6 +423,7 @@ def _archive_at_path(output_root):
     )
     (staging / "fact_import_payload.json").write_text(json.dumps({"records": []}))
     (staging / "nsu_cleaned_review.xlsx").write_bytes(b"review")
+    (staging / "duplicate_forms_review.xlsx").write_bytes(b"duplicates")
     publish_run_archive(output_root, staging, run_id, "forms.csv", summary)
     return output_root, run_id
 

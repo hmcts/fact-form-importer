@@ -7,6 +7,7 @@ live court and target section before it may send any POST or PUT request.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
 
@@ -14,10 +15,27 @@ from pydantic import BaseModel, Field
 
 from fact_form_importer.models.court_submission import CourtSubmission, OpeningTime
 from fact_form_importer.validators.fact_api_courts import CourtReference
+from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "1.1"
+API_MANIFEST_VERSION = "1.3"
+
+# These expressions deliberately mirror the public FaCT Data API request
+# constraints. Keeping them here makes a rejected action reviewable before a
+# mutation request is sent.
+_FACT_API_ADDRESS_PATTERN = re.compile(r"^[A-Za-z0-9 ()':,.-]+$")
+_FACT_API_PHONE_PATTERN = re.compile(r"^(?:\+44)?[0-9 ]{10,20}$")
+_FACT_API_EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$"
+)
+_FACT_API_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_FACT_API_SCOTLAND_POSTCODE_PATTERN = re.compile(
+    r"^(?:ZE|KW|IV|HS|PH|AB|DD|PA|FK|G\d|KY|KA|DG|EH|ML|TD)", re.IGNORECASE
+)
+_FACT_API_CI_IOM_POSTCODE_PATTERN = re.compile(r"^(?:IM|JE|GY)", re.IGNORECASE)
+_ADDRESS_CARE_OF_PATTERN = re.compile(r"\bc\s*/\s*o\b", re.IGNORECASE)
+_FACT_API_OPENING_DAYS = {"EVERYDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"}
 
 CourtLookup = Callable[[str], Optional[CourtReference]]
 
@@ -32,6 +50,10 @@ class FactApiAction(BaseModel):
     reason: Optional[str] = None
     preflight_required: bool = True
     source_fields: list[str] = Field(default_factory=list)
+    # Keep Optional[...] rather than ``dict[...] | None``: the supported local
+    # Python 3.9 environment cannot evaluate the latter inside Pydantic.
+    address_verification: Optional[dict[str, Any]] = None
+    request_body_normalisations: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
 class FactApiRecord(BaseModel):
@@ -65,6 +87,7 @@ def build_fact_api_import_manifest(
     run_id: str,
     vocabularies: Vocabularies | None,
     court_lookup: CourtLookup | None = None,
+    address_verifications: AddressVerificationBatch | None = None,
 ) -> FactApiManifestResult:
     """Build an action plan from importable submissions without executing it."""
 
@@ -72,7 +95,7 @@ def build_fact_api_import_manifest(
     for submission in submissions:
         if not _is_importable(submission):
             continue
-        records.append(_build_record(submission, vocabularies, court_lookup))
+        records.append(_build_record(submission, vocabularies, court_lookup, address_verifications))
 
     actions = [action for record in records for action in record.actions]
     summary = {
@@ -100,6 +123,7 @@ def _build_record(
     submission: CourtSubmission,
     vocabularies: Vocabularies | None,
     court_lookup: CourtLookup | None,
+    address_verifications: AddressVerificationBatch | None,
 ) -> FactApiRecord:
     court_reference = court_lookup(submission.court_slug) if court_lookup and submission.court_slug else None
     court_id = court_reference.court_id if court_reference else None
@@ -113,6 +137,7 @@ def _build_record(
         body: dict[str, Any],
         reason: str | None = None,
         source_fields: list[str] | None = None,
+        address_verification: dict[str, Any] | None = None,
     ) -> None:
         nonlocal action_number
         # FaCT validates the request object before its service layer applies the
@@ -121,6 +146,8 @@ def _build_record(
         # not expose a courtId field.
         if court_id and resource != "professional_information" and body:
             body = {"courtId": court_id, **body}
+        original_body = dict(body)
+        body = normalise_fact_api_action_body(resource, body)
         if not body:
             return
         action_reason = reason
@@ -140,6 +167,8 @@ def _build_record(
                 body=body,
                 reason=action_reason,
                 source_fields=source_fields or [],
+                address_verification=address_verification,
+                request_body_normalisations=_body_normalisations(original_body, body),
             )
         )
         action_number += 1
@@ -205,13 +234,23 @@ def _build_record(
 
     for address in submission.addresses:
         body, reason = _address_body(address, vocabularies)
+        verification_reason = (
+            address_verifications.action_reason_for(submission, address.index)
+            if address_verifications
+            else None
+        )
         add(
             "address",
             "POST",
             "/courts/{court_id}/v1/address",
             body,
-            reason,
+            _combine_reasons(reason, verification_reason),
             source_fields=[f"addresses[{address.index}]"],
+            address_verification=(
+                address_verifications.action_evidence_for(submission, address.index)
+                if address_verifications
+                else None
+            ),
         )
 
     for contact in submission.contacts:
@@ -544,6 +583,14 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
                 "liftSupportPhoneNumber is required by the FaCT API when lift is false; "
                 "the form does not collect this value"
             )
+
+    if resource == "address":
+        errors.extend(_address_validation_errors(body))
+    if resource == "contact_detail":
+        errors.extend(_contact_validation_errors(body))
+    if resource in {"counter_service_opening_hours", "court_opening_hours"}:
+        errors.extend(_opening_times_validation_errors(body))
+
     for field, value in body.items():
         if isinstance(value, str) and len(value) > 255:
             errors.append(f"{field} exceeds the API maximum length")
@@ -553,6 +600,8 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
             errors.append("accessibleToiletDescription contains characters rejected by the FaCT API")
     if resource == "contact_detail":
         explanation = body.get("explanation")
+        if explanation and len(explanation) > 250:
+            errors.append("explanation exceeds the API maximum length")
         if explanation and not re.fullmatch(r"[A-Za-z0-9 '\-()&+]*", explanation):
             errors.append("explanation contains characters rejected by the FaCT API")
     if resource == "professional_information":
@@ -564,6 +613,166 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
                 if professional_information.get(field) is None:
                     errors.append(f"professionalInformation.{field} is required by the FaCT API")
     return "; ".join(errors) if errors else None
+
+
+def normalise_fact_api_action_body(resource: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Apply conservative request-only normalisation required by FaCT.
+
+    Source data remains untouched.  Changes are restricted to conventional
+    equivalents and formatting that the FaCT request validators reject, such
+    as typographic punctuation, ``C/o`` and ampersands.
+    """
+
+    cleaned = dict(body)
+    if resource == "address":
+        for field in ("addressLine1", "addressLine2", "townCity", "county"):
+            value = cleaned.get(field)
+            if isinstance(value, str):
+                cleaned[field] = _normalise_fact_api_address_text(value)
+    elif resource == "accessibility_options":
+        value = cleaned.get("accessibleToiletDescription")
+        if isinstance(value, str):
+            cleaned["accessibleToiletDescription"] = _normalise_fact_api_public_text(value)
+    elif resource == "contact_detail":
+        value = cleaned.get("explanation")
+        if isinstance(value, str):
+            cleaned["explanation"] = _normalise_fact_api_explanation(value)
+    return cleaned
+
+
+def _normalise_fact_api_address_text(value: str) -> str:
+    value = _normalise_fact_api_public_text(value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _normalise_fact_api_public_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = value.translate(
+        str.maketrans(
+            {
+                "\u2018": "'",
+                "\u2019": "'",
+                "\u201c": "'",
+                "\u201d": "'",
+                "\u2013": "-",
+                "\u2014": "-",
+                "\u00a0": " ",
+            }
+        )
+    )
+    value = _ADDRESS_CARE_OF_PATTERN.sub("care of", value)
+    return value.replace("&", " and ")
+
+
+def _normalise_fact_api_explanation(value: str) -> str:
+    """Convert harmless display punctuation into the strict contact API charset."""
+
+    value = _normalise_fact_api_public_text(value)
+    # The contact explanation API accepts words, spaces, apostrophes, hyphens,
+    # brackets, ampersands and plus signs.  Sentence separators carry no data
+    # in this one-line description field, so replace rather than silently drop.
+    value = re.sub(r"[,:;./]+", " ", value)
+    # Replace any remaining disallowed punctuation with a separator rather
+    # than silently joining neighbouring words. The field is an optional short
+    # explanation; this preserves readable prose without inventing content.
+    value = re.sub(r"[^A-Za-z0-9 '\-()&+]", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _body_normalisations(
+    original: dict[str, Any], cleaned: dict[str, Any]
+) -> dict[str, dict[str, str]]:
+    changes: dict[str, dict[str, str]] = {}
+    for field, original_value in original.items():
+        cleaned_value = cleaned.get(field)
+        if isinstance(original_value, str) and isinstance(cleaned_value, str) and original_value != cleaned_value:
+            changes[field] = {"from": original_value, "to": cleaned_value}
+    return changes
+
+
+def _address_validation_errors(body: dict[str, Any]) -> list[str]:
+    errors = []
+    for field in ("addressLine1", "addressLine2", "townCity", "county"):
+        value = body.get(field)
+        if value is not None and (not isinstance(value, str) or not _FACT_API_ADDRESS_PATTERN.fullmatch(value)):
+            errors.append(f"{field} contains characters rejected by the FaCT API")
+
+    for field, maximum in (("townCity", 100), ("county", 100)):
+        value = body.get(field)
+        if isinstance(value, str) and len(value) > maximum:
+            errors.append(f"{field} exceeds the API maximum length")
+
+    postcode = body.get("postcode")
+    if isinstance(postcode, str):
+        postcode_reason = _fact_api_postcode_reason(postcode)
+        if postcode_reason:
+            errors.append(postcode_reason)
+    return errors
+
+
+def _fact_api_postcode_reason(postcode: str) -> str | None:
+    compact = re.sub(r"\s+", "", postcode).upper()
+    if _FACT_API_SCOTLAND_POSTCODE_PATTERN.match(compact):
+        return "postcode is in Scotland, which the FaCT API does not support"
+    if compact.startswith("BT"):
+        return "postcode is in Northern Ireland, which the FaCT API does not support"
+    if _FACT_API_CI_IOM_POSTCODE_PATTERN.match(compact):
+        return "postcode is in a Channel Islands or Isle of Man region the FaCT API does not support"
+    if " " not in postcode.strip():
+        return "postcode must contain a space for the FaCT/Ordnance Survey lookup"
+    return None
+
+
+def _contact_validation_errors(body: dict[str, Any]) -> list[str]:
+    errors = []
+    phone = body.get("phoneNumber")
+    if phone is not None and (not isinstance(phone, str) or not _FACT_API_PHONE_PATTERN.fullmatch(phone)):
+        errors.append("phoneNumber does not match the FaCT API phone format")
+    email = body.get("email")
+    if email is not None and (not isinstance(email, str) or not _FACT_API_EMAIL_PATTERN.fullmatch(email)):
+        errors.append("email does not match the FaCT API email format")
+    return errors
+
+
+def _opening_times_validation_errors(body: dict[str, Any]) -> list[str]:
+    details = body.get("openingTimesDetails")
+    if not isinstance(details, list) or not details:
+        return ["openingTimesDetails must contain at least one valid opening period for the FaCT API"]
+
+    errors = []
+    seen_days = set()
+    every_day = False
+    for detail in details:
+        if not isinstance(detail, dict):
+            errors.append("openingTimesDetails contains an invalid opening period")
+            continue
+        day = detail.get("dayOfWeek")
+        opening = detail.get("openingTime")
+        closing = detail.get("closingTime")
+        if day not in _FACT_API_OPENING_DAYS:
+            errors.append("openingTimesDetails contains an invalid day of week")
+        elif day in seen_days:
+            errors.append("openingTimesDetails contains a duplicate day of week")
+        else:
+            seen_days.add(day)
+            every_day = every_day or day == "EVERYDAY"
+
+        if not isinstance(opening, str) or not _FACT_API_TIME_PATTERN.fullmatch(opening):
+            errors.append("openingTimesDetails contains an invalid opening time")
+        if not isinstance(closing, str) or not _FACT_API_TIME_PATTERN.fullmatch(closing):
+            errors.append("openingTimesDetails contains an invalid closing time")
+        if (
+            isinstance(opening, str)
+            and isinstance(closing, str)
+            and _FACT_API_TIME_PATTERN.fullmatch(opening)
+            and _FACT_API_TIME_PATTERN.fullmatch(closing)
+            and opening >= closing
+        ):
+            errors.append("openingTimesDetails requires each opening time to be before its closing time")
+
+    if every_day and len(details) != 1:
+        errors.append("openingTimesDetails may only contain EVERYDAY as its sole day")
+    return errors
 
 
 def _record_readiness(actions: list[FactApiAction]) -> Literal[

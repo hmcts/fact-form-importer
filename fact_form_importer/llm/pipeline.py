@@ -15,7 +15,7 @@ from fact_form_importer.llm.normalise import (
     vocabulary_name_for_field_path,
 )
 from fact_form_importer.llm.schemas import LlmField, LlmNormalisationRequest, LlmNormalisationResponse
-from fact_form_importer.models.court_submission import CourtSubmission
+from fact_form_importer.models.court_submission import CourtSubmission, sync_cleaned_snapshot
 from fact_form_importer.models.issues import Issue
 from fact_form_importer.validators.base import (
     LLM_LOW_CONFIDENCE,
@@ -28,6 +28,7 @@ from fact_form_importer.validators.base import (
     add_issue_once,
 )
 from fact_form_importer.validators.vocabularies import Vocabularies
+from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 
 LLM_FIELD_NORMALISED = "LLM_FIELD_NORMALISED"
 
@@ -40,6 +41,8 @@ class LlmUsageMetrics:
     fields_selected: int = 0
     fields_processed: int = 0
     submissions_with_selected_fields: int = 0
+    address_candidate_groups_selected: int = 0
+    address_suggestions_recorded: int = 0
 
     def as_dict(self, model: str | None = None) -> dict[str, int | str | None]:
         return {
@@ -49,6 +52,8 @@ class LlmUsageMetrics:
             "llm_fields_selected": self.fields_selected,
             "llm_fields_processed": self.fields_processed,
             "llm_submissions_with_selected_fields": self.submissions_with_selected_fields,
+            "llm_address_candidate_groups_selected": self.address_candidate_groups_selected,
+            "llm_address_suggestions_recorded": self.address_suggestions_recorded,
             "llm_model": model,
         }
 
@@ -68,6 +73,7 @@ def normalise_submissions_with_llm(
     vocabularies: Vocabularies | None,
     config: AppConfig | None = None,
     normaliser: Normaliser = normalise_fields_with_llm,
+    address_verifications: AddressVerificationBatch | None = None,
 ) -> LlmNormalisationResult:
     """Run at most one row-level LLM request, plus one parse retry, per submission."""
 
@@ -76,12 +82,22 @@ def normalise_submissions_with_llm(
 
     for submission in submissions:
         fields = select_llm_fields(submission, field_rules, vocabularies)
-        if not fields:
+        address_candidates = (
+            address_verifications.llm_candidates_for(submission) if address_verifications else []
+        )
+        if not fields and not address_candidates:
             continue
 
         metrics.submissions_with_selected_fields += 1
         metrics.fields_selected += len(fields)
-        request = build_llm_request(submission, fields, field_rules, vocabularies)
+        metrics.address_candidate_groups_selected += len(address_candidates)
+        request = build_llm_request(
+            submission,
+            fields,
+            field_rules,
+            vocabularies,
+            address_candidates=address_candidates,
+        )
 
         try:
             response = _call_with_one_parse_retry(request, app_config, normaliser, metrics)
@@ -105,6 +121,8 @@ def normalise_submissions_with_llm(
             response,
             fields,
             vocabularies,
+            address_verifications=address_verifications,
+            metrics=metrics,
         )
 
     return LlmNormalisationResult(submissions=submissions, metrics=metrics)
@@ -115,6 +133,8 @@ def apply_llm_response(
     response: LlmNormalisationResponse,
     selected_fields: list[LlmField],
     vocabularies: Vocabularies | None,
+    address_verifications: AddressVerificationBatch | None = None,
+    metrics: LlmUsageMetrics | None = None,
 ) -> int:
     """Apply only safe, selected, schema-valid LLM values to a submission."""
 
@@ -229,7 +249,14 @@ def apply_llm_response(
             ),
         )
 
-    _sync_cleaned_snapshot(submission)
+    _record_address_suggestions(
+        submission,
+        response,
+        address_verifications,
+        metrics,
+    )
+
+    sync_cleaned_snapshot(submission)
     return processed
 
 
@@ -260,6 +287,8 @@ def build_llm_request(
     fields: list[LlmField],
     field_rules: FieldRulesConfig,
     vocabularies: Vocabularies | None,
+    *,
+    address_candidates: list[dict[str, object]] | None = None,
 ) -> LlmNormalisationRequest:
     return LlmNormalisationRequest(
         record_id=_record_id(submission),
@@ -270,6 +299,7 @@ def build_llm_request(
         fields=fields,
         allowed_vocabularies=allowed_vocabularies_for_llm_fields(fields, vocabularies),
         field_rules=field_rules_for_llm_fields(fields, field_rules),
+        address_candidates=address_candidates or [],
     )
 
 
@@ -277,14 +307,26 @@ def build_llm_request_review(
     submissions: list[CourtSubmission],
     field_rules: FieldRulesConfig,
     vocabularies: Vocabularies | None,
+    address_verifications: AddressVerificationBatch | None = None,
 ) -> list[LlmNormalisationRequest]:
     """Build inspectable request payloads without calling the model."""
 
     requests: list[LlmNormalisationRequest] = []
     for submission in submissions:
         fields = select_llm_fields(submission, field_rules, vocabularies)
-        if fields:
-            requests.append(build_llm_request(submission, fields, field_rules, vocabularies))
+        address_candidates = (
+            address_verifications.llm_candidates_for(submission) if address_verifications else []
+        )
+        if fields or address_candidates:
+            requests.append(
+                build_llm_request(
+                    submission,
+                    fields,
+                    field_rules,
+                    vocabularies,
+                    address_candidates=address_candidates,
+                )
+            )
     return requests
 
 
@@ -414,6 +456,38 @@ def _set_selected_value(submission: CourtSubmission, path: str, value: str | lis
     return False
 
 
+def _record_address_suggestions(
+    submission: CourtSubmission,
+    response: LlmNormalisationResponse,
+    address_verifications: AddressVerificationBatch | None,
+    metrics: LlmUsageMetrics | None,
+) -> None:
+    """Record advisory OS candidate rankings without changing address fields."""
+
+    if address_verifications is None:
+        return
+    for match in response.address_matches:
+        recorded = address_verifications.record_llm_suggestion(
+            submission,
+            match.address_index,
+            match.uprn,
+            match.confidence,
+            match.needs_human_review,
+            match.reason,
+        )
+        if recorded:
+            if metrics is not None:
+                metrics.address_suggestions_recorded += 1
+            continue
+        _add_llm_issue(
+            submission,
+            f"addresses[{match.address_index}]",
+            LLM_RETURNED_INVALID_VALUE,
+            "LLM returned an address candidate outside the supplied Ordnance Survey candidates",
+            match.uprn,
+        )
+
+
 def _indexed_target(items: list, path: str):
     try:
         index_text, attribute = path.split("].", 1)
@@ -443,17 +517,3 @@ def _add_llm_issue(
             cleaned_value=cleaned_value,
         ),
     )
-
-
-def _sync_cleaned_snapshot(submission: CourtSubmission) -> None:
-    submission.cleaned = {
-        "court_slug": submission.court_slug,
-        "facilities": submission.facilities,
-        "translation_phone": submission.translation_phone,
-        "translation_email": submission.translation_email,
-        "addresses": [address.model_dump(mode="json") for address in submission.addresses],
-        "counter_service": submission.counter_service,
-        "interview_rooms": submission.interview_rooms,
-        "contacts": [contact.model_dump(mode="json") for contact in submission.contacts],
-        "opening_hours": [hours.model_dump(mode="json") for hours in submission.opening_hours],
-    }

@@ -1,1 +1,13 @@
-{% extends "base.html" %}{% block content %}<h1>Import job</h1><p>Source: {{ job.source_name }}</p><p>Status: <strong>{{ job.state }}</strong></p>{% if job.state in ['queued', 'running'] %}<p class="muted">This page refreshes while the local job runs.</p><meta http-equiv="refresh" content="2">{% elif job.state == 'completed' %}<p><a href="{{ url_for('run_detail', run_id=job.run_id) }}">Open completed run {{ job.run_id }}</a></p>{% else %}<p class="error">{{ job.error }}</p>{% endif %}{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<h1>Import job</h1>
+<p>Source: {{ job.source_name }}</p>
+<p>Status: <strong>{{ job.state }}</strong></p>
+<p>Address verification: {{ 'requested' if job.verify_addresses else 'not requested' }}</p>
+<p>LLM normalisation: {{ 'requested' if job.use_llm else 'not requested' }}</p>
+{% if job.state in ['queued', 'running'] %}
+<p class="muted">This page refreshes while the local job runs.</p><meta http-equiv="refresh" content="2">
+{% elif job.state == 'completed' %}
+<p><a href="{{ url_for('run_detail', run_id=job.run_id) }}">Open completed run {{ job.run_id }}</a></p>
+{% else %}<p class="error">{{ job.error }}</p>{% endif %}
+{% endblock %}

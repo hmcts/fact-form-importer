@@ -9,11 +9,13 @@ from pathlib import Path
 from typing import Callable
 
 from fact_form_importer.config import AppConfig, load_default_field_rules
+from fact_form_importer.execution.fact_api import FactApiExecutionClient
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
 from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.llm.client import validate_openai_config
 from fact_form_importer.llm.pipeline import LlmUsageMetrics, normalise_submissions_with_llm
 from fact_form_importer.output.archive import ArchiveResult, publish_run_archive, stage_path
+from fact_form_importer.output.duplicates_workbook import write_duplicate_review_workbook
 from fact_form_importer.output.fact_api_manifest import build_fact_api_import_manifest
 from fact_form_importer.output.logs import OutputResult, new_run_id, write_processing_outputs
 from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
@@ -27,6 +29,10 @@ from fact_form_importer.validators.fact_api_courts import (
     suggest_court_slug_in_fact_api,
 )
 from fact_form_importer.validators.fact_api_vocabularies import load_vocabularies_from_fact_api
+from fact_form_importer.validators.os_addresses import (
+    AddressVerificationBatch,
+    verify_submission_addresses,
+)
 from fact_form_importer.validators.vocabularies import Vocabularies, load_vocabularies
 
 
@@ -36,7 +42,9 @@ class ProcessingResult:
     archive: ArchiveResult
     output: OutputResult
     review_workbook_path: Path
+    duplicate_review_workbook_path: Path
     submitters: SubmitterOutputResult
+    address_verification_report_path: Path
 
 
 def process_workbook(
@@ -45,6 +53,7 @@ def process_workbook(
     *,
     allow_local_vocabularies: bool = False,
     use_llm: bool = False,
+    verify_addresses: bool = False,
     source_name: str | None = None,
     config: AppConfig | None = None,
 ) -> ProcessingResult:
@@ -55,6 +64,10 @@ def process_workbook(
         raise ValueError("--use-llm requires LLM_ENABLED=true in .env")
     if use_llm:
         validate_openai_config(app_config, command_name="run --use-llm")
+    if verify_addresses and (
+        not app_config.fact_data_api_base_url or not app_config.fact_data_api_bearer_token
+    ):
+        raise ValueError("--verify-addresses requires FACT_DATA_API_BASE_URL and FACT_DATA_API_BEARER_TOKEN")
 
     run_id = new_run_id()
     staging = stage_path(output_root, run_id)
@@ -74,16 +87,25 @@ def process_workbook(
             court_slug_exists=court_slug_exists,
             court_slug_suggester=court_slug_suggester,
         )
+        address_verifications = AddressVerificationBatch(enabled=False)
+        if verify_addresses:
+            address_verifications = verify_addresses_with_fact_api(submissions, app_config)
         llm_metrics = LlmUsageMetrics()
         if use_llm:
+            llm_options = {
+                "field_rules": load_default_field_rules(app_config),
+                "vocabularies": vocabularies,
+                "config": app_config,
+            }
+            if verify_addresses:
+                llm_options["address_verifications"] = address_verifications
             llm_result = normalise_submissions_with_llm(
                 submissions,
-                field_rules=load_default_field_rules(app_config),
-                vocabularies=vocabularies,
-                config=app_config,
+                **llm_options,
             )
             submissions = llm_result.submissions
             llm_metrics = llm_result.metrics
+        if use_llm or verify_addresses:
             clear_validation_issues(submissions)
             submissions = validate_all_submissions(
                 submissions,
@@ -104,6 +126,10 @@ def process_workbook(
             encoding="utf-8",
         )
         (staging / "profile.json").write_text(profile_to_json(workbook_profile) + "\n", encoding="utf-8")
+        (staging / "address_verification_report.json").write_text(
+            json.dumps(address_verifications.as_dict(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
         # Local-vocabulary fallback is an inspection mode. Do not make a second
         # API dependency attempt to resolve court UUIDs after that fallback.
         court_lookup = _court_lookup(app_config) if vocabulary_source == "fact_data_api" else None
@@ -112,6 +138,7 @@ def process_workbook(
             run_id=run_id,
             vocabularies=vocabularies,
             court_lookup=court_lookup,
+            address_verifications=address_verifications if verify_addresses else None,
         )
         (staging / "api_readiness_report.json").write_text(
             json.dumps(manifest_result.manifest.model_dump(mode="json"), indent=2, ensure_ascii=False)
@@ -132,8 +159,15 @@ def process_workbook(
             source_name=source_name or input_path.name,
             vocabularies=vocabularies,
             court_lookup=court_lookup,
+            address_verification_metrics=address_verifications.summary_metrics(),
         )
         review_workbook_path = write_nsu_review_workbook(
+            submissions=submissions,
+            output_path=staging,
+            summary=output_result.summary,
+            address_verifications=address_verifications.verifications,
+        )
+        duplicate_review_workbook_path = write_duplicate_review_workbook(
             submissions=submissions,
             output_path=staging,
             summary=output_result.summary,
@@ -151,12 +185,14 @@ def process_workbook(
             archive=archive,
             output=output_result,
             review_workbook_path=archive.archive_path / review_workbook_path.name,
+            duplicate_review_workbook_path=archive.archive_path / duplicate_review_workbook_path.name,
             submitters=SubmitterOutputResult(
                 json_path=archive.archive_path / submitters.json_path.name,
                 workbook_path=archive.archive_path / submitters.workbook_path.name,
                 user_count=submitters.user_count,
                 excluded_user_count=submitters.excluded_user_count,
             ),
+            address_verification_report_path=archive.archive_path / "address_verification_report.json",
         )
     except Exception:
         if staging.exists():
@@ -225,6 +261,30 @@ def load_fact_api_services(
         if not allow_local_vocabularies or local_vocabularies is None:
             raise ValueError(f"Unable to load FaCT API vocabularies: {exc}") from exc
         return local_vocabularies, "local_json_fallback_after_fact_data_api_error", None, None
+
+
+def verify_addresses_with_fact_api(
+    submissions,
+    config: AppConfig,
+) -> AddressVerificationBatch:
+    """Use FaCT's authenticated OS proxy once per unique postcode in this run.
+
+    The importer deliberately does not read an OS credential or call Ordnance
+    Survey directly. FaCT owns that integration and its response is retained
+    as review evidence for the run.
+    """
+
+    from urllib.parse import quote
+
+    client = FactApiExecutionClient(config)
+    try:
+        return verify_submission_addresses(
+            submissions,
+            lambda postcode: client.get(f"/search/address/v1/postcode/{quote(postcode, safe='')}"),
+            min_interval_seconds=config.os_address_min_interval_seconds,
+        )
+    finally:
+        client.close()
 
 
 def _court_lookup(config: AppConfig) -> Callable[[str], CourtReference | None] | None:

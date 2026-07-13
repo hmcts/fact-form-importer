@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 
 from fact_form_importer.config import AppConfig
-from fact_form_importer.execution.fact_api import FactApiExecutionClient
+from fact_form_importer.execution.fact_api import ApiResponse, FactApiExecutionClient
 from fact_form_importer.execution.ledger import ExecutionLedgerStore
 from fact_form_importer.execution.models import (
     ActionAttempt,
@@ -19,7 +22,22 @@ from fact_form_importer.execution.models import (
     utc_now,
 )
 from fact_form_importer.output.archive import load_run_archive
-from fact_form_importer.output.fact_api_manifest import validate_fact_api_action_body
+from fact_form_importer.output.fact_api_manifest import (
+    normalise_fact_api_action_body,
+    validate_fact_api_action_body,
+)
+from fact_form_importer.validators.os_addresses import RateLimitedPostcodeLookup
+
+
+@dataclass(frozen=True)
+class AddressPreflightResult:
+    status: Literal["ready", "blocked", "unknown"]
+    http_status: int | None = None
+    reason: str | None = None
+
+
+def _unconfigured_postcode_lookup(_: str) -> ApiResponse:
+    raise RuntimeError("No FaCT API client is available for address verification")
 
 
 class ApiExecutionService:
@@ -35,6 +53,10 @@ class ApiExecutionService:
         self.config = config or AppConfig()
         self.store = ExecutionLedgerStore(output_root)
         self._client = client
+        self._postcode_lookup = RateLimitedPostcodeLookup(
+            _unconfigured_postcode_lookup,
+            min_interval_seconds=self.config.os_address_min_interval_seconds,
+        )
 
     def get_ledger(self, run_id: str) -> ExecutionLedger:
         return self.store.load(run_id)
@@ -106,6 +128,14 @@ class ApiExecutionService:
     def _require_writes_enabled(self) -> None:
         if not self.config.fact_data_api_writes_enabled:
             raise ValueError("FaCT API writes are disabled by FACT_DATA_API_WRITES_ENABLED")
+        if not self.config.fact_data_api_user_id:
+            raise ValueError(
+                "FACT_DATA_API_USER_ID is required for audited FaCT API write requests"
+            )
+        try:
+            UUID(self.config.fact_data_api_user_id)
+        except ValueError as exc:
+            raise ValueError("FACT_DATA_API_USER_ID must be a valid UUID") from exc
 
     def _preflight_actions(
         self,
@@ -115,18 +145,28 @@ class ApiExecutionService:
         client: FactApiExecutionClient,
     ) -> None:
         court_slug = str(record["court_slug"])
+        self._postcode_lookup.set_lookup(
+            lambda postcode: client.get(f"/search/address/v1/postcode/{quote(postcode, safe='')}")
+        )
         try:
             court = client.lookup_court(court_slug)
         except (httpx.HTTPError, ValueError) as exc:
+            http_status, reason = _preflight_error_details("court lookup", exc)
             for action in actions:
+                # A transient lookup outage must never erase a confirmed write
+                # result or a deliberate earlier block from the ledger.
+                existing = self._action_state(ledger, court_slug, str(action["action_id"]))
+                if existing.status in {"succeeded", "blocked"}:
+                    continue
                 self._set_action(
-                    ledger, court_slug, action, "unknown", "preflight", None,
-                    f"Court lookup could not be completed ({type(exc).__name__})",
+                    ledger, court_slug, action, "unknown", "preflight", http_status, reason
                 )
+            self._update_court_status(self._court_state(ledger, court_slug), actions)
             return
         if court is None:
             for action in actions:
                 self._set_action(ledger, court_slug, action, "blocked", "preflight", 404, "Court does not exist in FaCT")
+            self._update_court_status(self._court_state(ledger, court_slug), actions)
             return
         planned_id = record.get("court_id")
         if planned_id and planned_id != court.court_id:
@@ -135,6 +175,7 @@ class ApiExecutionService:
                     ledger, court_slug, action, "blocked", "preflight", None,
                     "Court UUID no longer matches the reviewed report",
                 )
+            self._update_court_status(self._court_state(ledger, court_slug), actions)
             return
         court_state = self._court_state(ledger, court_slug, court.court_id)
         for action in actions:
@@ -147,9 +188,8 @@ class ApiExecutionService:
             state = self._action_state(ledger, court_slug, action["action_id"])
             if state.status == "succeeded":
                 continue
-            body_reason = validate_fact_api_action_body(
-                str(action.get("resource") or ""), self._execution_body(action, court.court_id)
-            )
+            body = self._execution_body(action, court.court_id)
+            body_reason = validate_fact_api_action_body(str(action.get("resource") or ""), body)
             if body_reason:
                 self._set_action(
                     ledger,
@@ -161,12 +201,24 @@ class ApiExecutionService:
                     f"Action body cannot be sent to FaCT: {body_reason}",
                 )
                 continue
+            address_result = _address_os_preflight_result(action, body, self._postcode_lookup.get)
+            if address_result.status != "ready":
+                self._set_action(
+                    ledger,
+                    court_slug,
+                    action,
+                    address_result.status,
+                    "preflight",
+                    address_result.http_status,
+                    address_result.reason,
+                )
+                continue
             try:
                 target = client.get(_preflight_path(str(action["path"])))
             except httpx.HTTPError as exc:
+                http_status, reason = _preflight_error_details("target section check", exc)
                 self._set_action(
-                    ledger, court_slug, action, "unknown", "preflight", None,
-                    f"Target section could not be checked ({type(exc).__name__})",
+                    ledger, court_slug, action, "unknown", "preflight", http_status, reason
                 )
                 continue
             if _target_has_existing_data(target.status_code, target.body):
@@ -221,7 +273,8 @@ class ApiExecutionService:
             self._set_action(ledger, court_slug, action, "unknown", "execute", None, "Write timed out; outcome is unknown")
             return
         except httpx.HTTPError as exc:
-            self._set_action(ledger, court_slug, action, "failed", "execute", None, f"Write failed ({type(exc).__name__})")
+            http_status, reason = _preflight_error_details("write request", exc)
+            self._set_action(ledger, court_slug, action, "failed", "execute", http_status, reason)
             return
         if 200 <= response.status_code < 300:
             self._set_action(ledger, court_slug, action, "succeeded", "execute", response.status_code, None)
@@ -239,7 +292,7 @@ class ApiExecutionService:
         body = dict(action.get("body") or {})
         if action.get("resource") != "professional_information":
             body["courtId"] = court_id
-        return body
+        return normalise_fact_api_action_body(str(action.get("resource") or ""), body)
 
     def _court_state(self, ledger: ExecutionLedger, slug: str, court_id: str | None = None) -> CourtExecutionState:
         if slug not in ledger.courts:
@@ -314,11 +367,118 @@ def _write_rejection_reason(status_code: int, body: Any) -> str:
     if status_code != 400 or not isinstance(body, dict):
         return prefix
 
-    field_errors = []
-    for field, message in body.items():
-        if field in {"timestamp", "message"} or not isinstance(message, str):
-            continue
-        field_errors.append(f"{field}: {message}")
-        if len(field_errors) == 3:
-            break
+    field_errors = _validation_error_messages(body)
     return f"{prefix}: {'; '.join(field_errors)}" if field_errors else prefix
+
+
+def _validation_error_messages(body: dict[str, Any]) -> list[str]:
+    """Extract a short, safe summary from known FaCT validation response shapes."""
+
+    messages: list[str] = []
+
+    def add(field: str | None, value: Any) -> None:
+        if len(messages) >= 3 or not isinstance(value, str) or not value.strip():
+            return
+        prefix = f"{field}: " if field else ""
+        messages.append(f"{prefix}{value.strip()[:300]}")
+
+    add(None, body.get("message"))
+    for field, value in body.items():
+        if field in {"timestamp", "message", "error", "errors", "fieldErrors", "details"}:
+            continue
+        add(str(field), value)
+
+    for key in ("errors", "fieldErrors", "details"):
+        nested = body.get(key)
+        if isinstance(nested, dict):
+            for field, value in nested.items():
+                add(str(field), value)
+        elif isinstance(nested, list):
+            for item in nested:
+                if isinstance(item, str):
+                    add(None, item)
+                elif isinstance(item, dict):
+                    add(str(item.get("field") or item.get("path") or "error"), item.get("message"))
+    return messages
+
+
+def _address_os_preflight_result(
+    action: dict[str, Any],
+    body: dict[str, Any],
+    lookup: Callable[[str], ApiResponse],
+) -> AddressPreflightResult:
+    """Check an address only when this immutable run has no verified evidence."""
+
+    if action.get("resource") != "address":
+        return AddressPreflightResult("ready")
+    evidence = action.get("address_verification")
+    if isinstance(evidence, dict) and evidence.get("status") in {"auto_normalised", "verified"}:
+        return AddressPreflightResult("ready")
+    postcode = body.get("postcode")
+    if not isinstance(postcode, str) or not postcode:
+        return AddressPreflightResult("ready")
+    try:
+        response = lookup(postcode)
+    except (httpx.HTTPError, RuntimeError) as exc:
+        _, reason = _preflight_error_details("address postcode verification", exc)
+        return AddressPreflightResult("unknown", reason=reason)
+    if response.status_code == 200:
+        return AddressPreflightResult("ready", http_status=200)
+    if response.status_code in {400, 404}:
+        messages = _validation_error_messages(response.body) if isinstance(response.body, dict) else []
+        detail = "; ".join(messages) if messages else "postcode was rejected"
+        return AddressPreflightResult(
+            "blocked",
+            http_status=response.status_code,
+            reason=(
+                "Address cannot be sent because the FaCT/Ordnance Survey postcode lookup failed: "
+                f"{detail}"
+            ),
+        )
+    if response.status_code == 429:
+        return AddressPreflightResult(
+            "unknown",
+            http_status=429,
+            reason="FaCT/Ordnance Survey rate-limited address verification (HTTP 429). Try again later.",
+        )
+    return AddressPreflightResult(
+        "unknown",
+        http_status=response.status_code,
+        reason=(
+            "FaCT/Ordnance Survey address verification returned an unexpected response "
+            f"(HTTP {response.status_code}). Try the preflight again."
+        ),
+    )
+
+
+def _preflight_error_details(operation: str, exc: Exception) -> tuple[int | None, str]:
+    """Describe safe, actionable transport failures without persisting response bodies."""
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        if status_code in {401, 403}:
+            return (
+                status_code,
+                (
+                    f"FaCT API rejected the {operation} (HTTP {status_code}). "
+                    "Refresh FACT_DATA_API_BEARER_TOKEN and restart the importer UI."
+                ),
+            )
+        return status_code, f"FaCT API rejected the {operation} (HTTP {status_code})."
+
+    if isinstance(exc, httpx.ConnectError):
+        return (
+            None,
+            (
+                f"Could not connect to FaCT API for {operation}. "
+                "Confirm the FaCT Data API application is running at FACT_DATA_API_BASE_URL."
+            ),
+        )
+
+    if isinstance(exc, httpx.TimeoutException):
+        return None, f"FaCT API timed out during {operation}. Try the check again."
+
+    if isinstance(exc, ValueError):
+        return None, f"FaCT API returned an invalid response during {operation}: {exc}"
+
+    return None, f"FaCT API request failed during {operation} ({type(exc).__name__})."

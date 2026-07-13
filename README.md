@@ -5,10 +5,11 @@ court information. The importer will convert spreadsheet rows into structured,
 cleaned, validated data for later FaCT API import.
 
 The project is intentionally incremental. The current pipeline performs
-deterministic cleaning, FaCT API-backed validation, review output generation,
-and read-only approval user export. Optional LLM normalisation is available for
-strictly selected public-text and unresolved vocabulary fields, but requires an
-explicit CLI flag and environment circuit breaker.
+deterministic cleaning, FaCT API-backed validation, optional FaCT/Ordnance
+Survey address verification, review output generation, and read-only approval
+user export. Optional LLM normalisation is available for strictly selected
+public-text and unresolved vocabulary fields, but requires an explicit CLI flag
+and environment circuit breaker.
 
 ## Goals
 
@@ -70,8 +71,20 @@ python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" 
 ```
 
 Runs the current end-to-end non-LLM import preparation: profiling, ingestion,
-FaCT API-backed validation, issue/status calculation, controller-ready import
-payload JSON, NSU review workbook, and read-only approval user outputs.
+FaCT API-backed validation, issue/status calculation, API-aligned inspection
+JSON, endpoint action plan, NSU review workbook, and read-only approval user
+outputs.
+
+```bash
+python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --verify-addresses
+```
+
+Adds optional address verification through FaCT's existing authenticated
+`/search/address/v1/postcode/{postcode}` endpoint. The importer never calls
+Ordnance Survey directly or reads an OS key. It makes at most one uncached
+postcode lookup every 1.1 seconds, changes an address only for a unique,
+very-high-confidence match, and records every result in
+`address_verification_report.json` and the review workbook.
 
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --use-llm
@@ -81,6 +94,11 @@ Runs the same pipeline with optional LLM normalisation. This requires
 `LLM_ENABLED=true` and configured OpenAI settings. It makes at most one
 row-level model call for each record with safe selected fields, plus one retry
 only if the structured response cannot be parsed.
+
+`--verify-addresses --use-llm` may additionally send unresolved OS candidate
+comparisons to the same row-level request. It sends no postcode, contact data,
+or court slug. The model can only select a supplied UPRN as an advisory review
+suggestion; it never changes an address itself.
 
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --allow-local-vocabularies
@@ -108,15 +126,22 @@ without making a write. This records `ready`, `blocked`, or `unknown` action
 states in `out/execution-state/<run-id>.json`; it is the required first step
 before executing any action.
 
+If a preflight fails, the record view and ledger now retain a safe diagnostic,
+including the HTTP status where the API supplied one. `HTTP 401` or `HTTP 403`
+means the FaCT bearer token needs refreshing and the review UI must be restarted.
+A connection error means the FaCT **application** is not reachable at
+`FACT_DATA_API_BASE_URL`; a database container by itself is not enough.
+
 ```bash
 python3 -m fact_form_importer api-execute-action --output "./out" --run-id "<run-id>" --court-slug "<court-slug>" --action-id "<action-id>" --confirm
 python3 -m fact_form_importer api-execute-court --output "./out" --run-id "<run-id>" --court-slug "<court-slug>" --confirm
 ```
 
 Executes one reviewed API action, or all currently safe actions for one court.
-Both require `FACT_DATA_API_WRITES_ENABLED=true` in `.env` as well as the
-explicit `--confirm` acknowledgement. There is deliberately no all-courts
-write command.
+Both require `FACT_DATA_API_WRITES_ENABLED=true`, an existing FaCT user UUID in
+`FACT_DATA_API_USER_ID`, and explicit `--confirm` acknowledgement. FaCT uses
+that UUID to attribute its audit records; the importer never creates a user
+automatically. There is deliberately no all-courts write command.
 
 ```bash
 python3 -m fact_form_importer check-llm
@@ -142,6 +167,10 @@ inspect exactly which safe field payloads, relevant vocabularies, field rules,
 system instructions, and response schema would be supplied by `run --use-llm`.
 It works while `LLM_ENABLED=false` and does not include actual court slugs,
 metadata, unselected fields, credentials, or endpoint details.
+
+Add `--verify-addresses` to inspect the equally minimal unresolved address
+candidate payloads. This runs the rate-limited FaCT postcode lookups but still
+makes zero model calls.
 
 ## Workflow
 
@@ -191,6 +220,19 @@ OPENAI_MODEL=<your-deployment-name>
 The OpenAI client will use the newer `from openai import OpenAI` style with
 `base_url`, `api_key`, and `model`; no separate Azure OpenAI API version is
 configured.
+
+Address verification uses the existing FaCT API credential settings, not a
+direct Ordnance Survey integration:
+
+```text
+FACT_DATA_API_BASE_URL=http://127.0.0.1:8989
+FACT_DATA_API_BEARER_TOKEN=<fact-api-token>
+OS_ADDRESS_MIN_INTERVAL_SECONDS=1.1
+```
+
+Keep `OS_ADDRESS_MIN_INTERVAL_SECONDS` at or above `1.0`. `OS_KEY` is present
+in `.env.example` only as a reminder for the separately running FaCT Data API;
+this importer does not read it.
 
 #### LLM field selection
 
@@ -351,6 +393,19 @@ python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" 
 The flag is intentionally explicit: setting `LLM_ENABLED=true` alone does not
 send records to the model.
 
+To add FaCT-backed address verification, use the explicit flag:
+
+```bash
+python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --verify-addresses
+```
+
+The verification stage runs after deterministic cleaning and initial validation.
+It calls FaCT's existing postcode search once for each unique supported
+postcode, at the configured minimum interval. A single, clearly matching OS
+candidate can update the structured address; ambiguous/no-result cases remain
+unchanged with evidence for review. An address issue blocks only that address
+write action, not unrelated safe actions for the same court.
+
 The `run` command requires `FACT_DATA_API_BASE_URL` and
 `FACT_DATA_API_BEARER_TOKEN` so controlled lists come from the FaCT Data API.
 If either value is missing, or the API rejects the token, the command fails
@@ -388,9 +443,11 @@ out/records_needing_human_review.json
 out/issue_report.json
 out/import_summary.json
 out/api_readiness_report.json
+out/address_verification_report.json
 out/run_manifest.json
 out/llm_request_review.json
 out/nsu_cleaned_review.xlsx
+out/duplicate_forms_review.xlsx
 out/read_only_approval_users.json
 out/read_only_approval_users.xlsx
 ```
@@ -399,8 +456,10 @@ out/read_only_approval_users.xlsx
 its final status and issues. It is the all-record source used by the local
 review UI; `submissions_raw.json` remains the unmodified row extraction.
 
-`fact_import_payload.json` is the single, versioned JSON request body for the
-future FaCT import controller. It uses camelCase and contains only records with
+`fact_import_payload.json` is a versioned, API-aligned JSON snapshot for
+inspection and possible future bulk-import work. It is not used by the current
+safe execution workflow, which instead uses the endpoint action plan described
+below. It uses camelCase and contains only records with
 status `processed` or `processed_with_warnings`, provided they have no blocking
 error issues. In a normal FaCT API-backed run, each record has its resolved FaCT
 court UUID and slug, source row number for traceability, and complete API-aligned sections for facilities,
@@ -408,8 +467,7 @@ accessibility, translation, professional information, counter-service opening
 hours, addresses, contacts, and court opening hours. Controlled list values are
 resolved to FaCT UUIDs where the API provides them. It deliberately excludes raw
 spreadsheet values, submitter metadata, issue objects, and records needing
-review. This importer does not send the payload to FaCT; a future controller
-will accept this document as one JSON body.
+review. This importer does not send the payload to FaCT.
 
 An offline `--allow-local-vocabularies` run can still generate the same shape
 for inspection, but its `courtId` values are `null` because it deliberately
@@ -429,14 +487,29 @@ time of the run. Before a write, the execution layer validates the body again
 with the freshly resolved court UUID. This protects older archives from being
 sent after the contract changes: incomplete actions are shown as `blocked` with
 the missing API fields instead of being retried and receiving a 400 response.
-After updating the importer, create a new `run` before executing actions; do
-not use an older readiness report as a substitute for regeneration.
+For address actions, a `--verify-addresses` run records immutable FaCT/OS
+evidence. A verified or safely normalised address reuses that evidence during
+execution; an older or unverified report does a fresh, shared rate-limited
+postcode lookup before the write. A 400/404 postcode response blocks only that
+address action with the API's reason. A 429, timeout, or service outage is
+`unknown` and can be checked again later. The only request-body text repair is
+conventional address notation that FaCT rejects: `C/o` becomes `care of` and
+`&` becomes `and`; the archived raw submission is never changed.
+Invalid API phone/email formats and unrepresentable opening-time data are also
+blocked before a write. A new `run` is still the best way to see these reasons
+in the immutable plan, while the same checks protect historic reports at
+execution time.
 
 Execution state is written separately to
 `out/execution-state/<run-id>.json`, never back into the archived action plan.
 Action status is one of `planned`, `ready`, `blocked`, `running`, `succeeded`,
 `failed`, or `unknown`. A court is `completed` only once every planned action
-has succeeded. A timeout is `unknown` and is never automatically retried.
+has succeeded. `blocked` means no write was attempted for that action because
+the plan or live FaCT preflight identified a review requirement; it is not a
+failed API request. A timeout is `unknown` and is never automatically retried.
+Confirmed `succeeded` and `blocked` states are retained if a later live
+preflight cannot reach FaCT, so a transient token or connectivity problem does
+not erase prior execution evidence.
 
 `run_manifest.json` records the source display name, completion time, run
 summary, and SHA-256 hashes of every archived artifact. Use it to identify a
@@ -449,6 +522,23 @@ changing the generated run evidence or its integrity hashes.
 
 `failed_records.json` contains records that cannot progress because required
 data is missing or schema-critical validation failed.
+
+`duplicate_forms_review.xlsx` is the dedicated decision workbook for duplicate
+court-slug forms. It keeps every competing form together under a duplicate
+group, with one row per form and the relevant Microsoft Forms completion,
+last-modified, and start timestamps. It identifies a date-based candidate using
+completion time, falling back to last-modified then start time only when an
+earlier value is blank. This is a review aid, not an automatic import choice:
+the `Decision log` tab is where NSU/product can record whether to keep a row,
+merge values, or not import the group.
+
+The `Duplicate form data` tab is self-contained: it has one row for each
+competing form, with the duplicate group, source row number, timestamps, the
+original non-empty submitted answers, and readable cleaned summaries of
+facilities, translation services, addresses, counter service, interview rooms,
+contacts, and court opening hours. It is the primary tab for deciding between
+duplicates and does not require `nsu_cleaned_review.xlsx`; the latter can still
+be used for a wider review of validation issues if useful.
 
 `records_needing_human_review.json` contains records blocked from automatic
 import by issues such as duplicate court slugs, invalid populated postcodes,
@@ -468,7 +558,9 @@ skipped row count, duplicate slug group count, duplicate slug affected-record
 count, mapping warnings, issue counts by code, `vocabulary_source`, and whether
 LLM processing was enabled. It also records LLM requested state, calls,
 failures, parse retries, selected and processed field counts, affected
-submissions, model name, and API-readiness ready/pending action counts. In a
+submissions, model name, address-verification enabled/count/cache/review and
+address-action-blocking
+metrics, and API-readiness ready/pending action counts. In a
 normal run, `vocabulary_source` should be
 `fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
 run. Duplicate groups are conservative for now: every affected record is
@@ -484,7 +576,7 @@ NSU/product reviewers inspect what deterministic cleaning and validation did
 without recreating the original 204-column Microsoft Forms export. It contains
 tabs for summary counts, processed records, records needing human review, failed
 records, duplicate courts, cleaned addresses, cleaned contacts, cleaned opening
-hours, flat issues, and submitter users. The record tabs include
+hours, address verification, flat issues, and submitter users. The record tabs include
 `review_reason` and `suggested_next_action` columns. For controlled-list
 failures, `review_reason` identifies the specific field and submitted value that
 did not match, while the `Issues` tab provides one row per issue with raw and
@@ -513,8 +605,8 @@ safe actions for that one court. Write buttons appear only when
 There is no global bulk-write control. Tables support status/court-row filtering
 and pagination; every listed archive artifact can be downloaded. The upload
 form accepts CSV/XLSX only, runs one job at a time, deletes the original upload
-on completion, and offers LLM use only as an explicit checkbox when
-`LLM_ENABLED=true`.
+on completion, and offers optional address verification when FaCT credentials
+are configured and LLM use only as an explicit checkbox when `LLM_ENABLED=true`.
 
 This is an unauthenticated local tool. Do not bind it beyond localhost or share
 its archive directory without adding an authentication and access-control
@@ -608,8 +700,8 @@ truth for FaCT-owned type lists.
 `CourtSubmission` records after deterministic cleaning. During the `run`
 command, FaCT API functions are supplied to validation so court slugs,
 controlled vocabularies, and high-confidence court-slug suggestions can be
-checked against the source of truth. It does not call Ordnance Survey or the
-LLM.
+checked against the source of truth. The base validator does not call Ordnance
+Survey or the LLM.
 
 Current validation checks:
 
@@ -633,10 +725,11 @@ Status is recalculated after validation:
   from a URL/free text, or a very high-confidence court slug auto-repair
 - `processed`: no validation issues
 
-Address existence checks against Ordnance Survey/FaCT API are intentionally not
-part of this step. They should run later as API-backed validation, after syntax
-cleaning and before final import, so possible postcode/address matches can be
-reviewed rather than treated as a simple regex pass/fail.
+`run --verify-addresses` adds the later API-backed address stage after this
+validation. It uses FaCT's OS proxy to produce auditable candidate evidence.
+Only a unique, very-high-confidence match is auto-normalised. Ambiguous or
+unavailable results are never guessed; an ambiguous address blocks its own API
+action and remains visible in the dedicated review report/workbook tab.
 
 ### Issue Codes
 
@@ -672,6 +765,18 @@ Current issue meanings:
 - `INVALID_POSTCODE`: a populated address postcode does not match the expected
   UK postcode format. This blocks automatic import because address data would
   be unreliable.
+- `ADDRESS_OS_NORMALISED`: FaCT/OS returned one unique, very-high-confidence
+  candidate and the importer safely mapped its address fields. The pre-OS
+  cleaned address and the OS candidate remain in the address-verification
+  report for audit; raw spreadsheet evidence remains in `submissions_raw.json`.
+- `ADDRESS_OS_VERIFIED`: the submitted address already matched a unique OS
+  candidate, so it was not changed.
+- `ADDRESS_OS_REVIEW_REQUIRED`: the postcode lookup returned candidates but no
+  unique high-confidence address match. No address data was changed and only
+  that address action is held for review.
+- `ADDRESS_OS_LOOKUP_UNAVAILABLE`: FaCT's OS proxy could not be reached or
+  returned an unexpected response. No address data was changed; retry the
+  check later rather than treating it as a bad address.
 - `INVALID_TIME`: an opening-hours value could not be parsed as a valid `HH:MM`
   time.
 - `MISSING_COURT_IDENTIFIER`: the row has business data but no usable court
