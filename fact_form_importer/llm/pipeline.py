@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from fact_form_importer.config import AppConfig, FieldRulesConfig
@@ -15,7 +15,12 @@ from fact_form_importer.llm.normalise import (
     select_llm_fields,
     vocabulary_name_for_field_path,
 )
-from fact_form_importer.llm.schemas import LlmField, LlmNormalisationRequest, LlmNormalisationResponse
+from fact_form_importer.llm.review import field_review_id
+from fact_form_importer.llm.schemas import (
+    LlmField,
+    LlmNormalisationRequest,
+    LlmNormalisationResponse,
+)
 from fact_form_importer.models.court_submission import CourtSubmission, sync_cleaned_snapshot
 from fact_form_importer.models.issues import Issue
 from fact_form_importer.validators.base import (
@@ -70,6 +75,7 @@ class LlmUsageMetrics:
 class LlmNormalisationResult:
     submissions: list[CourtSubmission]
     metrics: LlmUsageMetrics
+    review_items: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,7 @@ def normalise_submissions_with_llm(
 
     app_config = config or AppConfig()
     metrics = LlmUsageMetrics()
+    review_items: list[dict[str, object]] = []
     prepared_calls: list[_PreparedLlmCall] = []
 
     for submission in submissions:
@@ -137,7 +144,9 @@ def normalise_submissions_with_llm(
         )
 
     if not prepared_calls:
-        return LlmNormalisationResult(submissions=submissions, metrics=metrics)
+        return LlmNormalisationResult(
+            submissions=submissions, metrics=metrics, review_items=review_items
+        )
 
     max_workers = min(app_config.llm_max_concurrency, len(prepared_calls))
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="fact-llm") as executor:
@@ -170,6 +179,18 @@ def normalise_submissions_with_llm(
                     cleaned_value={"error_type": type(outcome.error).__name__},
                 ),
             )
+            for field in prepared.fields:
+                review_items.append(
+                    _field_review_item(
+                        submission,
+                        field,
+                        value=None,
+                        confidence="unavailable",
+                        needs_human_review=True,
+                        reason=f"LLM request failed ({type(outcome.error).__name__})",
+                        outcome="failed",
+                    )
+                )
             continue
 
         if outcome.response is None:
@@ -182,9 +203,12 @@ def normalise_submissions_with_llm(
             vocabularies,
             address_verifications=address_verifications,
             metrics=metrics,
+            review_items=review_items,
         )
 
-    return LlmNormalisationResult(submissions=submissions, metrics=metrics)
+    return LlmNormalisationResult(
+        submissions=submissions, metrics=metrics, review_items=review_items
+    )
 
 
 def apply_llm_response(
@@ -194,6 +218,7 @@ def apply_llm_response(
     vocabularies: Vocabularies | None,
     address_verifications: AddressVerificationBatch | None = None,
     metrics: LlmUsageMetrics | None = None,
+    review_items: list[dict[str, object]] | None = None,
 ) -> int:
     """Apply only safe, selected, schema-valid LLM values to a submission."""
 
@@ -223,6 +248,22 @@ def apply_llm_response(
                 "LLM returned a field that was not selected for normalisation",
                 normalised_field.value,
             )
+            if review_items is not None:
+                review_items.append(
+                    {
+                        "review_id": field_review_id(
+                            submission.source.source_row_number,
+                            normalised_field.field,
+                        ),
+                        "kind": "field",
+                        "source_row_number": submission.source.source_row_number,
+                        "court_slug": submission.court_slug,
+                        "field": normalised_field.field,
+                        "llm_input": None,
+                        "model_result": normalised_field.model_dump(mode="json"),
+                        "outcome": "unexpected_field",
+                    }
+                )
             continue
 
         if normalised_field.value is None:
@@ -236,6 +277,18 @@ def apply_llm_response(
                     "LLM marked this field as requiring human review",
                     normalised_field.reason,
                 )
+            if review_items is not None:
+                review_items.append(
+                    _field_review_item(
+                        submission,
+                        selected,
+                        value=None,
+                        confidence=normalised_field.confidence,
+                        needs_human_review=normalised_field.needs_human_review,
+                        reason=normalised_field.reason,
+                        outcome="no_value",
+                    )
+                )
             continue
 
         value = _safe_value_for_field(
@@ -245,6 +298,18 @@ def apply_llm_response(
             vocabularies,
         )
         if value is _REJECTED:
+            if review_items is not None:
+                review_items.append(
+                    _field_review_item(
+                        submission,
+                        selected,
+                        value=normalised_field.value,
+                        confidence=normalised_field.confidence,
+                        needs_human_review=True,
+                        reason=normalised_field.reason,
+                        outcome="rejected",
+                    )
+                )
             continue
 
         if not _set_selected_value(submission, selected.field, value):
@@ -255,9 +320,33 @@ def apply_llm_response(
                 "LLM field path could not be applied to this submission",
                 normalised_field.value,
             )
+            if review_items is not None:
+                review_items.append(
+                    _field_review_item(
+                        submission,
+                        selected,
+                        value=normalised_field.value,
+                        confidence=normalised_field.confidence,
+                        needs_human_review=True,
+                        reason=normalised_field.reason,
+                        outcome="unapplied",
+                    )
+                )
             continue
 
         processed += 1
+        if review_items is not None:
+            review_items.append(
+                _field_review_item(
+                    submission,
+                    selected,
+                    value=value,
+                    confidence=normalised_field.confidence,
+                    needs_human_review=normalised_field.needs_human_review,
+                    reason=normalised_field.reason,
+                    outcome="accepted",
+                )
+            )
         add_issue_once(
             submission,
             Issue(
@@ -316,6 +405,37 @@ def apply_llm_response(
 
     sync_cleaned_snapshot(submission)
     return processed
+
+
+def _field_review_item(
+    submission: CourtSubmission,
+    selected: LlmField,
+    *,
+    value: object,
+    confidence: str,
+    needs_human_review: bool,
+    reason: str,
+    outcome: str,
+) -> dict[str, object]:
+    row = submission.source.source_row_number
+    return {
+        "review_id": field_review_id(row, selected.field),
+        "kind": "field",
+        "source_row_number": row,
+        "court_slug": submission.court_slug,
+        "field": selected.field,
+        "llm_input": {
+            "raw_value": selected.raw_value,
+            "cleaned_value": selected.cleaned_value,
+        },
+        "model_result": {
+            "value": value,
+            "confidence": confidence,
+            "needs_human_review": needs_human_review,
+            "reason": reason,
+        },
+        "outcome": outcome,
+    }
 
 
 _REJECTED = object()

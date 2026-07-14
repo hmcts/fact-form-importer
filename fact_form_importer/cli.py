@@ -35,8 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="Process a Microsoft Forms export.")
-    run_parser.add_argument("--input", required=True, type=Path, help="Path to the XLSX or CSV export.")
-    run_parser.add_argument("--output", required=True, type=Path, help="Directory for generated outputs.")
+    run_parser.add_argument(
+        "--input", required=True, type=Path, help="Path to the XLSX or CSV export."
+    )
+    run_parser.add_argument(
+        "--output", required=True, type=Path, help="Directory for generated outputs."
+    )
     run_parser.add_argument(
         "--allow-local-vocabularies",
         action="store_true",
@@ -123,33 +127,47 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("llm-test", help="Send a tiny fake structured LLM normalisation request.")
 
     serve_parser = subparsers.add_parser("serve", help="Start the localhost review UI.")
-    serve_parser.add_argument("--output", required=True, type=Path, help="Importer output root containing final archives.")
+    serve_parser.add_argument(
+        "--output", required=True, type=Path, help="Importer output root containing final archives."
+    )
     serve_parser.add_argument("--host", default="127.0.0.1", help="Localhost bind address.")
     serve_parser.add_argument("--port", default=5000, type=int, help="Localhost TCP port.")
 
     api_check_parser = subparsers.add_parser(
         "api-check-court", help="Preflight one reviewed court against existing FaCT API sections."
     )
-    api_check_parser.add_argument("--output", required=True, type=Path, help="Importer output root.")
+    api_check_parser.add_argument(
+        "--output", required=True, type=Path, help="Importer output root."
+    )
     api_check_parser.add_argument("--run-id", required=True, help="Archived run identifier.")
     api_check_parser.add_argument("--court-slug", required=True, help="Reviewed court slug.")
 
     api_action_parser = subparsers.add_parser(
         "api-execute-action", help="Execute one preflight-safe action for one court."
     )
-    api_action_parser.add_argument("--output", required=True, type=Path, help="Importer output root.")
+    api_action_parser.add_argument(
+        "--output", required=True, type=Path, help="Importer output root."
+    )
     api_action_parser.add_argument("--run-id", required=True, help="Archived run identifier.")
     api_action_parser.add_argument("--court-slug", required=True, help="Reviewed court slug.")
-    api_action_parser.add_argument("--action-id", required=True, help="Action identifier from the readiness report.")
-    api_action_parser.add_argument("--confirm", action="store_true", help="Required acknowledgement before any write.")
+    api_action_parser.add_argument(
+        "--action-id", required=True, help="Action identifier from the readiness report."
+    )
+    api_action_parser.add_argument(
+        "--confirm", action="store_true", help="Required acknowledgement before any write."
+    )
 
     api_court_parser = subparsers.add_parser(
         "api-execute-court", help="Execute all preflight-safe actions for one court."
     )
-    api_court_parser.add_argument("--output", required=True, type=Path, help="Importer output root.")
+    api_court_parser.add_argument(
+        "--output", required=True, type=Path, help="Importer output root."
+    )
     api_court_parser.add_argument("--run-id", required=True, help="Archived run identifier.")
     api_court_parser.add_argument("--court-slug", required=True, help="Reviewed court slug.")
-    api_court_parser.add_argument("--confirm", action="store_true", help="Required acknowledgement before any write.")
+    api_court_parser.add_argument(
+        "--confirm", action="store_true", help="Required acknowledgement before any write."
+    )
 
     api_run_parser = subparsers.add_parser(
         "api-execute-run",
@@ -211,8 +229,12 @@ def run(
     print(f"Address verification requested: {verify_addresses}")
     print(f"Addresses checked against OS: {summary['address_verification_count']}")
     print(f"Unique postcode lookups: {summary['address_verification_unique_postcode_lookups']}")
-    print(f"Addresses auto-normalised from OS: {summary['address_verification_auto_normalised_count']}")
-    print(f"Address actions held for review: {summary['address_verification_action_blocking_count']}")
+    print(
+        f"Addresses auto-normalised from OS: {summary['address_verification_auto_normalised_count']}"
+    )
+    print(
+        f"Address actions held for review: {summary['address_verification_action_blocking_count']}"
+    )
     print(f"API readiness ready actions: {summary['api_manifest_ready_action_count']}")
     print(f"API readiness pending actions: {summary['api_manifest_pending_action_count']}")
     print(
@@ -270,7 +292,9 @@ def llm_request_review(
             ),
             "instructions": SYSTEM_PROMPT,
             "response_schema": LlmNormalisationResponse.model_json_schema(),
-            "requests": [request.model_dump(mode="json", exclude_none=True) for request in requests],
+            "requests": [
+                request.model_dump(mode="json", exclude_none=True) for request in requests
+            ],
         }
         output_path.mkdir(parents=True, exist_ok=True)
         review_path = output_path / "llm_request_review.json"
@@ -398,7 +422,10 @@ def api_execute_run(output_path: Path, run_id: str, confirm: bool) -> int:
     print(f"Courts considered: {summary['selected_court_count']}")
     print(f"Planned actions: {summary['planned_action_count']}")
     print(f"Completed courts: {court_counts['completed']}")
+    print(f"Courts awaiting LLM approval: {court_counts.get('awaiting_approval', 0)}")
     print(f"Courts needing attention: {court_counts['attention_required']}")
+    print(f"Actions awaiting LLM approval: {action_counts.get('awaiting_approval', 0)}")
+    print(f"LLM approvals pending: {summary.get('llm_approval_counts', {}).get('pending', 0)}")
     print(f"Succeeded actions: {action_counts['succeeded']}")
     print(f"Blocked actions: {action_counts['blocked']}")
     print(f"Failed actions: {action_counts['failed']}")

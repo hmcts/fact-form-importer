@@ -30,7 +30,11 @@ from fact_form_importer.validators.base import (
     clear_validation_issues,
     validate_submission,
 )
-from fact_form_importer.validators.os_addresses import AddressVerification, AddressVerificationBatch, OsAddressCandidate
+from fact_form_importer.validators.os_addresses import (
+    AddressVerification,
+    AddressVerificationBatch,
+    OsAddressCandidate,
+)
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 
@@ -65,6 +69,8 @@ def test_pipeline_calls_once_per_selected_submission_and_applies_canonical_vocab
     assert result.metrics.fields_selected == 1
     assert result.metrics.fields_processed == 1
     assert _has_issue(submission, LLM_FIELD_NORMALISED)
+    assert result.review_items[0]["outcome"] == "accepted"
+    assert result.review_items[0]["model_result"]["value"] == "Enquiries"
 
 
 def test_pipeline_does_not_call_model_when_all_values_match_vocabularies():
@@ -143,6 +149,7 @@ def test_pipeline_marks_only_the_failing_row_for_human_review():
 
     assert result.metrics.calls == 1
     assert result.metrics.failures == 1
+    assert result.review_items[0]["outcome"] == "failed"
     assert _has_issue(submission, LLM_NORMALISATION_FAILED)
     assert calculate_status(submission) == "needs_human_review"
 
@@ -184,11 +191,15 @@ def test_medium_confidence_result_requires_human_review_after_safe_merge():
 def test_unselected_response_field_is_rejected_without_mutating_submission():
     submission = _submission(description="general enquiries")
     fields = [
-        type("Selected", (), {
-            "field": "contacts[1].description",
-            "raw_value": "general enquiries",
-            "cleaned_value": "general enquiries",
-        })()
+        type(
+            "Selected",
+            (),
+            {
+                "field": "contacts[1].description",
+                "raw_value": "general enquiries",
+                "cleaned_value": "general enquiries",
+            },
+        )()
     ]
     response = _response("source-row-2", "translation_email", "should-not-be-applied")
 
@@ -309,11 +320,13 @@ def test_null_field_with_explicit_review_flag_requires_human_review():
         address_matches=[],
     )
 
-    apply_llm_response(submission, response, fields, _vocabularies())
+    review_items = []
+    apply_llm_response(submission, response, fields, _vocabularies(), review_items=review_items)
 
     assert submission.contacts[0].description == "general enquiries"
     assert _has_issue(submission, "LLM_REVIEW_REQUIRED")
     assert calculate_status(submission) == "needs_human_review"
+    assert review_items[0]["outcome"] == "no_value"
 
 
 def test_model_authored_issue_is_kept_as_a_nonblocking_note():

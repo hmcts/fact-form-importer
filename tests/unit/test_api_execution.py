@@ -5,7 +5,7 @@ import pytest
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.fact_api import ApiResponse, FactApiExecutionClient
-from fact_form_importer.execution.models import CourtExecutionState
+from fact_form_importer.execution.models import ActionExecutionState, CourtExecutionState
 from fact_form_importer.execution.report import (
     EXECUTION_SUMMARY_VERSION,
     _error_theme,
@@ -61,7 +61,9 @@ def test_check_court_blocks_an_existing_target_section(tmp_path, monkeypatch):
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "false")
     client = FakeFactApiClient(target=ApiResponse(200, {"parking": True}))
 
-    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(run_id, "example-court")
+    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(
+        run_id, "example-court"
+    )
 
     action = ledger.courts["example-court"].actions["example-court-1"]
     assert action.status == "blocked"
@@ -87,6 +89,169 @@ def test_execute_action_writes_after_safe_preflight_without_local_approval(tmp_p
     assert (tmp_path / "out" / "execution-state" / f"{run_id}.json").exists()
 
 
+def test_llm_dependent_action_waits_for_every_approval_before_execution(tmp_path, monkeypatch):
+    action = _action("example-court-1")
+    action["llm_review_ids"] = ["review-1", "review-2"]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(tmp_path, run_id, ["review-1", "review-2"])
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(target=ApiResponse(204), write=ApiResponse(201))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    waiting = service.execute_action(run_id, "example-court", "example-court-1")
+
+    assert waiting.courts["example-court"].actions["example-court-1"].status == "awaiting_approval"
+    assert client.writes == []
+    assert service.get_execution_summary(run_id)["action_status_counts"]["awaiting_approval"] == 1
+
+    service.approve_llm_review(run_id, "review-1")
+    still_waiting = service.execute_action(run_id, "example-court", "example-court-1")
+    assert (
+        still_waiting.courts["example-court"].actions["example-court-1"].status
+        == "awaiting_approval"
+    )
+    assert client.writes == []
+
+    service.approve_llm_review(run_id, "review-2")
+    assert client.writes == []  # Approval is deliberately separate from execution.
+    completed = service.execute_action(run_id, "example-court", "example-court-1")
+
+    assert completed.courts["example-court"].actions["example-court-1"].status == "succeeded"
+    assert client.writes
+    summary = service.get_execution_summary(run_id)
+    assert summary["llm_approval_counts"] == {
+        "total": 2,
+        "approved": 2,
+        "manual_approved": 2,
+        "auto_approved": 0,
+        "pending": 0,
+        "already_executed": 0,
+        "not_actionable": 0,
+    }
+    assert summary["court_status_counts"]["completed"] == 1
+
+
+def test_approved_address_uses_os_mapping_and_requires_fresh_uprn(tmp_path, monkeypatch):
+    action = _address_action("example-court-1", "Submitted Court")
+    action["llm_review_ids"] = ["address-review"]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(
+        tmp_path,
+        run_id,
+        ["address-review"],
+        kind="address",
+        api_body_patch={
+            "addressLine1": "OS COURT",
+            "addressLine2": "1 MAIN STREET",
+            "townCity": "LONDON",
+            "county": None,
+            "postcode": "SW1A 1AA",
+        },
+        uprn="uprn-1",
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(
+        target=ApiResponse(204),
+        address_lookup=ApiResponse(200, {"results": [{"DPA": {"UPRN": "uprn-1"}}]}),
+    )
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    service.approve_llm_review(run_id, "address-review")
+
+    ledger = service.execute_action(run_id, "example-court", "example-court-1")
+
+    assert ledger.courts["example-court"].actions["example-court-1"].status == "succeeded"
+    assert client.writes[0][2]["addressLine1"] == "OS COURT"
+    assert client.writes[0][2]["addressLine2"] == "1 MAIN STREET"
+
+    missing_run = _archive(tmp_path / "missing", actions=[action])
+    _write_llm_review(
+        tmp_path / "missing",
+        missing_run,
+        ["address-review"],
+        kind="address",
+        api_body_patch={"addressLine1": "OS COURT", "townCity": "LONDON", "postcode": "SW1A 1AA"},
+        uprn="uprn-1",
+    )
+    missing_client = FakeFactApiClient(
+        target=ApiResponse(204),
+        address_lookup=ApiResponse(200, {"results": [{"DPA": {"UPRN": "different"}}]}),
+    )
+    missing_service = ApiExecutionService(tmp_path / "missing" / "out", AppConfig(), missing_client)
+    missing_service.approve_llm_review(missing_run, "address-review")
+
+    blocked = missing_service.execute_action(missing_run, "example-court", "example-court-1")
+
+    assert blocked.courts["example-court"].actions["example-court-1"].status == "blocked"
+    assert "no longer returned" in blocked.courts["example-court"].actions["example-court-1"].reason
+    assert missing_client.writes == []
+
+
+def test_strict_address_policy_approves_without_executing_and_retains_preflight(
+    tmp_path, monkeypatch
+):
+    action = _address_action("example-court-1", "Submitted Court")
+    action["llm_review_ids"] = ["address-review"]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(
+        tmp_path,
+        run_id,
+        ["address-review"],
+        kind="address",
+        api_body_patch={
+            "addressLine1": "OS COURT",
+            "townCity": "LONDON",
+            "postcode": "SW1A 1AA",
+        },
+        uprn="uprn-1",
+        candidates=[{"uprn": "uprn-1"}],
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(
+        target=ApiResponse(204),
+        address_lookup=ApiResponse(200, {"results": [{"DPA": {"UPRN": "uprn-1"}}]}),
+    )
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    approvals = service.reconcile_automatic_approvals(run_id)
+
+    assert approvals.approvals["address-review"].approval_method == "policy"
+    assert client.writes == []
+    assert service.get_execution_summary(run_id)["llm_approval_counts"]["auto_approved"] == 1
+
+    completed = service.execute_action(run_id, "example-court", "example-court-1")
+
+    assert completed.courts["example-court"].actions["example-court-1"].status == "succeeded"
+    assert client.writes[0][2]["addressLine1"] == "OS COURT"
+
+
+def test_legacy_succeeded_action_is_not_retroactively_held_for_approval(tmp_path):
+    action = _action("example-court-1")
+    action["llm_review_ids"] = ["legacy-review"]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(tmp_path, run_id, ["legacy-review"])
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+    ledger = service.store.load(run_id)
+    ledger.courts["example-court"] = CourtExecutionState(
+        court_slug="example-court",
+        court_id="court-id",
+        status="completed",
+        actions={
+            "example-court-1": ActionExecutionState(action_id="example-court-1", status="succeeded")
+        },
+    )
+    service.store.save(ledger)
+
+    summary = service.get_execution_summary(run_id)
+    review = service.get_llm_actions_review(run_id)
+
+    assert summary["action_status_counts"]["succeeded"] == 1
+    assert summary["llm_approval_counts"]["already_executed"] == 1
+    assert summary["llm_approval_counts"]["pending"] == 0
+    assert review["items"][0]["approval_status"] == "already_executed"
+    with pytest.raises(ValueError, match="already used"):
+        service.approve_llm_review(run_id, "legacy-review")
+
+
 def test_execution_state_ignores_legacy_local_approval_fields():
     state = CourtExecutionState.model_validate(
         {
@@ -98,6 +263,7 @@ def test_execution_state_ignores_legacy_local_approval_fields():
 
     assert state.court_slug == "example-court"
     assert "approval_status" not in state.model_dump()
+
 
 def test_execute_action_requires_write_circuit_breaker(tmp_path, monkeypatch):
     run_id = _archive(tmp_path)
@@ -133,14 +299,18 @@ def test_preflight_blocks_missing_court_and_preserves_archive(tmp_path, monkeypa
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "false")
     client = FakeFactApiClient(court=None)
 
-    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(run_id, "example-court")
+    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(
+        run_id, "example-court"
+    )
 
     assert ledger.courts["example-court"].actions["example-court-1"].status == "blocked"
     assert ledger.courts["example-court"].status == "attention_required"
     assert archive_report.read_text() == original_report
 
 
-def test_preflight_records_status_and_token_guidance_when_court_lookup_is_rejected(tmp_path, monkeypatch):
+def test_preflight_records_status_and_token_guidance_when_court_lookup_is_rejected(
+    tmp_path, monkeypatch
+):
     run_id = _archive(tmp_path)
     request = httpx.Request("GET", "http://fact.example.test/courts/slug/example-court/v1")
     response = httpx.Response(401, request=request)
@@ -166,7 +336,9 @@ def test_preflight_records_status_and_token_guidance_when_court_lookup_is_reject
 def test_preflight_records_connection_guidance_when_fact_api_is_unavailable(tmp_path, monkeypatch):
     run_id = _archive(tmp_path)
     request = httpx.Request("GET", "http://fact.example.test/courts/slug/example-court/v1")
-    client = FakeFactApiClient(lookup_error=httpx.ConnectError("connection refused", request=request))
+    client = FakeFactApiClient(
+        lookup_error=httpx.ConnectError("connection refused", request=request)
+    )
 
     ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(
         run_id, "example-court"
@@ -205,7 +377,9 @@ def test_execution_client_uses_existing_court_routes_and_bearer_token(monkeypatc
     def handler(request):
         requests.append(request)
         if request.url.path == "/courts/slug/example-court/v1":
-            return httpx.Response(200, json={"id": "court-id", "slug": "example-court", "name": "Example"})
+            return httpx.Response(
+                200, json={"id": "court-id", "slug": "example-court", "name": "Example"}
+            )
         if request.method == "GET":
             return httpx.Response(200, json=[])
         return httpx.Response(201, json={"id": "created"})
@@ -258,10 +432,13 @@ def test_execution_client_rejects_write_without_audited_user_id(monkeypatch):
 
 
 def test_execute_safe_actions_marks_failed_and_pending_actions_as_attention(tmp_path, monkeypatch):
-    run_id = _archive(tmp_path, actions=[
-        _action("example-court-1"),
-        {**_action("example-court-2"), "readiness": "pending", "reason": "invalid API body"},
-    ])
+    run_id = _archive(
+        tmp_path,
+        actions=[
+            _action("example-court-1"),
+            {**_action("example-court-2"), "readiness": "pending", "reason": "invalid API body"},
+        ],
+    )
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
     client = FakeFactApiClient(target=ApiResponse(204), write=ApiResponse(400, {"message": "bad"}))
     service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
@@ -275,7 +452,9 @@ def test_execute_safe_actions_marks_failed_and_pending_actions_as_attention(tmp_
     assert len(client.writes) == 1
 
 
-def test_preflight_blocks_historic_action_body_that_no_longer_meets_api_contract(tmp_path, monkeypatch):
+def test_preflight_blocks_historic_action_body_that_no_longer_meets_api_contract(
+    tmp_path, monkeypatch
+):
     run_id = _archive(tmp_path, actions=[_action("example-court-1", body={"parking": True})])
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
     client = FakeFactApiClient(target=ApiResponse(204))
@@ -340,7 +519,9 @@ def test_execution_records_safe_field_feedback_from_an_unexpected_api_400(tmp_pa
     state = ledger.courts["example-court"].actions["example-court-1"]
     assert state.status == "failed"
     assert state.last_response_status == 400
-    assert state.reason == "FaCT API rejected the write request (HTTP 400): courtId: must not be null"
+    assert (
+        state.reason == "FaCT API rejected the write request (HTTP 400): courtId: must not be null"
+    )
 
 
 def test_preflight_blocks_address_when_fact_os_lookup_rejects_postcode(tmp_path, monkeypatch):
@@ -385,13 +566,20 @@ def test_execution_normalises_safe_address_notation_before_writing(tmp_path, mon
     ]
 
 
-def test_preflight_reuses_verified_address_evidence_without_another_os_lookup(tmp_path, monkeypatch):
+def test_preflight_reuses_verified_address_evidence_without_another_os_lookup(
+    tmp_path, monkeypatch
+):
     action = _address_action("example-court-1")
-    action["address_verification"] = {"status": "verified", "selected_candidate": {"uprn": "uprn-1"}}
+    action["address_verification"] = {
+        "status": "verified",
+        "selected_candidate": {"uprn": "uprn-1"},
+    }
     run_id = _archive(tmp_path, actions=[action])
     client = FakeFactApiClient(target=ApiResponse(204))
 
-    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(run_id, "example-court")
+    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(
+        run_id, "example-court"
+    )
 
     assert ledger.courts["example-court"].actions["example-court-1"].status == "ready"
     assert client.get_paths == ["/courts/court-id/v1/address"]
@@ -402,9 +590,13 @@ def test_preflight_caches_same_postcode_and_marks_rate_limiting_as_retriable(tmp
     run_id = _archive(tmp_path, actions=actions)
     client = FakeFactApiClient(target=ApiResponse(204))
 
-    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(run_id, "example-court")
+    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).check_court(
+        run_id, "example-court"
+    )
 
-    assert all(action.status == "ready" for action in ledger.courts["example-court"].actions.values())
+    assert all(
+        action.status == "ready" for action in ledger.courts["example-court"].actions.values()
+    )
     assert client.get_paths.count("/search/address/v1/postcode/SW1A%201AA") == 1
 
     rate_limited_run = _archive(
@@ -438,7 +630,9 @@ def test_execution_reports_nested_api_validation_feedback(tmp_path, monkeypatch)
 
     action = ledger.courts["example-court"].actions["example-court-1"]
     assert action.status == "failed"
-    assert action.reason == "FaCT API rejected the write request (HTTP 400): courtId: must not be null"
+    assert (
+        action.reason == "FaCT API rejected the write request (HTTP 400): courtId: must not be null"
+    )
 
 
 def test_execute_all_safe_actions_runs_in_slug_order_continues_after_failure_and_writes_summary(
@@ -466,7 +660,11 @@ def test_execute_all_safe_actions_runs_in_slug_order_continues_after_failure_and
     class FailFirstWriteClient(FakeFactApiClient):
         def write(self, method, path, body):
             self.writes.append((method, path, body))
-            return ApiResponse(400, {"message": "first action rejected"}) if len(self.writes) == 1 else ApiResponse(201)
+            return (
+                ApiResponse(400, {"message": "first action rejected"})
+                if len(self.writes) == 1
+                else ApiResponse(201)
+            )
 
     client = FailFirstWriteClient(target=ApiResponse(204))
     service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
@@ -483,9 +681,9 @@ def test_execute_all_safe_actions_runs_in_slug_order_continues_after_failure_and
     assert summary["common_error_themes"][0]["code"] == "api_validation"
     assert summary["summary_version"] == EXECUTION_SUMMARY_VERSION
     assert summary["attention_by_request_type"][0]["resource"] == "building_facilities"
-    assert summary["attention_by_request_type"][0]["outcomes"][0][
-        "classification"
-    ] == "api_rejection"
+    assert (
+        summary["attention_by_request_type"][0]["outcomes"][0]["classification"] == "api_rejection"
+    )
     assert (tmp_path / "out" / "execution-state" / f"{run_id}.summary.json").exists()
     assert (tmp_path / "out" / "execution_summary.json").exists()
 
@@ -534,9 +732,9 @@ def test_execute_all_safe_actions_marks_unexpected_court_error_and_continues(tmp
 
     assert ledger.courts["alpha-court"].actions["alpha-court-1"].status == "unknown"
     assert ledger.courts["bravo-court"].actions["bravo-court-1"].status == "succeeded"
-    assert "Unexpected execution error" in ledger.courts["alpha-court"].actions[
-        "alpha-court-1"
-    ].reason
+    assert (
+        "Unexpected execution error" in ledger.courts["alpha-court"].actions["alpha-court-1"].reason
+    )
     assert len(client.writes) == 1
 
 
@@ -574,7 +772,10 @@ def test_execute_all_safe_actions_runs_courts_without_local_approval(tmp_path, m
 @pytest.mark.parametrize(
     ("reason", "expected_code"),
     [
-        ("liftDoorWidth is required by the FaCT API when lift is true", "missing_accessibility_detail"),
+        (
+            "liftDoorWidth is required by the FaCT API when lift is true",
+            "missing_accessibility_detail",
+        ),
         (
             "professionalInformation.interviewRoomCount must be between 1 and 150 when interviewRooms is true",
             "invalid_interview_room_detail",
@@ -710,3 +911,48 @@ def _building_facilities_body(court_id=None):
     if court_id:
         body["courtId"] = court_id
     return body
+
+
+def _write_llm_review(
+    tmp_path,
+    run_id,
+    review_ids,
+    *,
+    kind="field",
+    api_body_patch=None,
+    uprn=None,
+    candidates=None,
+):
+    items = []
+    for review_id in review_ids:
+        item = {
+            "review_id": review_id,
+            "kind": kind,
+            "source_row_number": 2,
+            "court_slug": "example-court",
+            "field": "addresses[1]" if kind == "address" else "facilities.food_and_drink",
+            "outcome": "accepted",
+            "actionable": True,
+            "dependent_action_ids": ["example-court-1"],
+            "model_result": {
+                "value": "Normalised" if kind == "field" else None,
+                "uprn": uprn,
+                "confidence": "high",
+                "needs_human_review": False,
+                "reason": "Test result",
+            },
+            "llm_input": {"candidates": candidates or []},
+            "api_body_patch": api_body_patch,
+        }
+        items.append(item)
+    path = tmp_path / "out" / "final" / run_id / "llm_actions_review.json"
+    path.write_text(
+        json.dumps(
+            {
+                "review_version": "1.0",
+                "item_count": len(items),
+                "actionable_item_count": len(items),
+                "items": items,
+            }
+        )
+    )

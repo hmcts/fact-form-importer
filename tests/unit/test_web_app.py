@@ -54,6 +54,117 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert b"OS-held address rows" in client.get("/").data
 
 
+def test_llm_actions_page_displays_evidence_and_approves_without_executing(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    review_id = "llm-field-2-test"
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.0",
+                "item_count": 1,
+                "field_item_count": 1,
+                "address_item_count": 0,
+                "actionable_item_count": 1,
+                "items": [
+                    {
+                        "review_id": review_id,
+                        "kind": "field",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "facilities.food_and_drink",
+                        "source_raw_values": {"S": "water"},
+                        "llm_input": {"raw_value": "water", "cleaned_value": "water"},
+                        "model_result": {
+                            "value": ["Free water dispensers"],
+                            "confidence": "high",
+                            "needs_human_review": False,
+                            "reason": "Exact vocabulary mapping",
+                        },
+                        "outcome": "accepted",
+                        "dependent_action_ids": ["example-court-1"],
+                        "actionable": True,
+                    }
+                ],
+            }
+        )
+    )
+    execution_client = _FakeExecutionClient()
+    service = ApiExecutionService(output_root, AppConfig(), execution_client)
+    client = create_app(output_root, execution_service=service).test_client()
+
+    page = client.get(f"/runs/{run_id}/llm-actions")
+
+    assert page.status_code == 200
+    assert b"LLM Actions Review" in page.data
+    assert b"Free water dispensers" in page.data
+    assert b"Approve" in page.data
+
+    approved = client.post(f"/runs/{run_id}/llm-actions/{review_id}/approve")
+
+    assert approved.status_code == 302
+    assert execution_client.writes == []
+    refreshed = client.get(f"/runs/{run_id}/llm-actions")
+    assert b"Approved" in refreshed.data
+    assert service.get_execution_summary(run_id)["llm_approval_counts"]["approved"] == 1
+
+
+def test_llm_actions_page_labels_strict_address_policy_approval(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    readiness_path = archive_path / "api_readiness_report.json"
+    readiness = json.loads(readiness_path.read_text())
+    readiness["records"][0]["actions"][0]["resource"] = "address"
+    readiness_path.write_text(json.dumps(readiness))
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.0",
+                "item_count": 1,
+                "field_item_count": 0,
+                "address_item_count": 1,
+                "actionable_item_count": 1,
+                "items": [
+                    {
+                        "review_id": "address-review",
+                        "kind": "address",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "addresses[1]",
+                        "address_index": 1,
+                        "submitted_address": {"line_1": "Submitted Court"},
+                        "source_raw_values": {"Address": "Submitted Court"},
+                        "llm_input": {"candidates": [{"uprn": "uprn-1"}]},
+                        "os_candidates": [{"uprn": "uprn-1"}],
+                        "model_result": {
+                            "uprn": "uprn-1",
+                            "confidence": "high",
+                            "needs_human_review": False,
+                            "reason": "The sole candidate consistently matches.",
+                        },
+                        "outcome": "accepted",
+                        "dependent_action_ids": ["example-court-1"],
+                        "actionable": True,
+                    }
+                ],
+            }
+        )
+    )
+    execution_client = _FakeExecutionClient()
+    service = ApiExecutionService(output_root, AppConfig(), execution_client)
+    client = create_app(output_root, execution_service=service).test_client()
+
+    page = client.get(f"/runs/{run_id}/llm-actions")
+    summary = client.get(f"/runs/{run_id}/execution-summary")
+
+    assert page.status_code == 200
+    assert b"Automatically approved" in page.data
+    assert b"high-single-os-candidate-v1" in page.data
+    assert b"Addresses auto-approved" in summary.data
+    assert service.get_execution_summary(run_id)["llm_approval_counts"]["auto_approved"] == 1
+    assert execution_client.writes == []
+
+
 def test_review_ui_allows_only_manifested_artifact_downloads(tmp_path):
     output_root, run_id = _archive(tmp_path)
     client = create_app(output_root).test_client()
@@ -99,12 +210,16 @@ def test_review_ui_rejects_invalid_uploads_and_runs_one_background_job(tmp_path)
     client = app.test_client()
 
     invalid = client.post(
-        "/runs", data={"source_file": (io.BytesIO(b"bad"), "forms.txt")}, content_type="multipart/form-data"
+        "/runs",
+        data={"source_file": (io.BytesIO(b"bad"), "forms.txt")},
+        content_type="multipart/form-data",
     )
     assert invalid.status_code == 400
 
     started = client.post(
-        "/runs", data={"source_file": (io.BytesIO(b"a,b\n"), "forms.csv")}, content_type="multipart/form-data"
+        "/runs",
+        data={"source_file": (io.BytesIO(b"a,b\n"), "forms.csv")},
+        content_type="multipart/form-data",
     )
     assert started.status_code == 302
     job_id = started.headers["Location"].rsplit("/", 1)[-1]
@@ -199,18 +314,25 @@ def test_local_job_runner_rejects_concurrent_jobs_and_records_processing_failure
     runner.active_job_id = "already-running"
     client = app.test_client()
     response = client.post(
-        "/runs", data={"source_file": (io.BytesIO(b"a"), "forms.csv")}, content_type="multipart/form-data"
+        "/runs",
+        data={"source_file": (io.BytesIO(b"a"), "forms.csv")},
+        content_type="multipart/form-data",
     )
     assert response.status_code == 400
     assert b"already running" in response.data
     runner.active_job_id = None
 
     response = client.post(
-        "/runs", data={"source_file": (io.BytesIO(b"a"), "forms.csv")}, content_type="multipart/form-data"
+        "/runs",
+        data={"source_file": (io.BytesIO(b"a"), "forms.csv")},
+        content_type="multipart/form-data",
     )
     job_id = response.headers["Location"].rsplit("/", 1)[-1]
     runner.executor.shutdown(wait=True)
-    assert client.get(f"/jobs/{job_id}/status").get_json()["error"] == "Processing failed (RuntimeError)"
+    assert (
+        client.get(f"/jobs/{job_id}/status").get_json()["error"]
+        == "Processing failed (RuntimeError)"
+    )
 
 
 def test_review_ui_explains_failing_fact_api_authentication_without_exposing_response_details():
@@ -231,7 +353,9 @@ def test_review_ui_handles_missing_upload_and_json_fallback(tmp_path):
     assert client.get(f"/runs/{run_id}/issues").status_code == 200
 
 
-def test_review_ui_checks_actions_but_refuses_writes_when_circuit_breaker_is_off(tmp_path, monkeypatch):
+def test_review_ui_checks_actions_but_refuses_writes_when_circuit_breaker_is_off(
+    tmp_path, monkeypatch
+):
     output_root, run_id = _archive(tmp_path)
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "false")
     execution = ApiExecutionService(output_root, AppConfig(), _FakeExecutionClient())
@@ -304,16 +428,25 @@ def test_review_ui_executes_all_safe_actions_and_handles_execution_errors(tmp_pa
     failing_client = create_app(
         output_root, config=AppConfig(), execution_service=_FailingExecutionService()
     ).test_client()
-    assert failing_client.post(
-        f"/runs/{run_id}/courts/example-court/api-check", data={"source_row_number": "2"}
-    ).status_code == 400
-    assert failing_client.post(
-        f"/runs/{run_id}/courts/example-court/actions/example-court-1/execute",
-        data={"source_row_number": "2"},
-    ).status_code == 400
-    assert failing_client.post(
-        f"/runs/{run_id}/courts/example-court/execute-safe", data={"source_row_number": "2"}
-    ).status_code == 400
+    assert (
+        failing_client.post(
+            f"/runs/{run_id}/courts/example-court/api-check", data={"source_row_number": "2"}
+        ).status_code
+        == 400
+    )
+    assert (
+        failing_client.post(
+            f"/runs/{run_id}/courts/example-court/actions/example-court-1/execute",
+            data={"source_row_number": "2"},
+        ).status_code
+        == 400
+    )
+    assert (
+        failing_client.post(
+            f"/runs/{run_id}/courts/example-court/execute-safe", data={"source_row_number": "2"}
+        ).status_code
+        == 400
+    )
     assert failing_client.post(f"/runs/{run_id}/execute-safe").status_code == 400
 
 
@@ -344,14 +477,25 @@ def test_action_evidence_projects_cleaned_and_raw_fields(monkeypatch, tmp_path):
         "contacts": [{"index": 1, "email": "contact@example.test"}],
         "opening_hours": [{"index": 1, "type": "Court open"}],
         "raw": {
-            "R": "Yes", "Y": "02079460000", "BS": "Forms", "CU": "Yes",
-            "AA": "Visit", "AB": "1 Main Street", "CX": "Enquiries", "EA": "contact@example.test",
+            "R": "Yes",
+            "Y": "02079460000",
+            "BS": "Forms",
+            "CU": "Yes",
+            "AA": "Visit",
+            "AB": "1 Main Street",
+            "CX": "Enquiries",
+            "EA": "contact@example.test",
             "EU": "Court open",
         },
     }
     fields = [
-        "facilities.parking_available", "translation_phone", "counter_service", "interview_rooms",
-        "addresses[1]", "contacts[1]", "opening_hours[1]",
+        "facilities.parking_available",
+        "translation_phone",
+        "counter_service",
+        "interview_rooms",
+        "addresses[1]",
+        "contacts[1]",
+        "opening_hours[1]",
     ]
 
     evidence = _action_evidence(
@@ -373,7 +517,9 @@ def test_action_evidence_projects_cleaned_and_raw_fields(monkeypatch, tmp_path):
     assert _raw_evidence_for_fields({"A": "value"}, ["addresses[bad]"]) == {}
 
     assert _raw_evidence_for_fields(["not", "a", "mapping"], ["facilities.parking_available"]) == [
-        "not", "a", "mapping"
+        "not",
+        "a",
+        "mapping",
     ]
 
 

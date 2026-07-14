@@ -8,11 +8,20 @@ from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 ActionExecutionStatus = Literal[
-    "planned", "ready", "blocked", "running", "succeeded", "failed", "unknown"
+    "planned",
+    "awaiting_approval",
+    "ready",
+    "blocked",
+    "running",
+    "succeeded",
+    "failed",
+    "unknown",
 ]
 CourtExecutionStatus = Literal[
-    "not_started", "in_progress", "attention_required", "completed"
+    "not_started", "awaiting_approval", "in_progress", "attention_required", "completed"
 ]
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 

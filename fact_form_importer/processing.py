@@ -9,11 +9,19 @@ from pathlib import Path
 from typing import Callable
 
 from fact_form_importer.config import AppConfig, load_default_field_rules
+from fact_form_importer.execution.approvals import (
+    LlmApprovalStore,
+    policy_eligible_address_review_ids,
+)
 from fact_form_importer.execution.fact_api import FactApiExecutionClient
 from fact_form_importer.ingest.workbook_profiler import profile_to_json, profile_workbook
 from fact_form_importer.ingest.workbook_reader import ingest_workbook
 from fact_form_importer.llm.client import validate_openai_config
 from fact_form_importer.llm.pipeline import LlmUsageMetrics, normalise_submissions_with_llm
+from fact_form_importer.llm.review import (
+    LLM_ACTIONS_REVIEW_NAME,
+    build_llm_actions_review,
+)
 from fact_form_importer.output.archive import ArchiveResult, publish_run_archive, stage_path
 from fact_form_importer.output.duplicates_workbook import write_duplicate_review_workbook
 from fact_form_importer.output.fact_api_manifest import build_fact_api_import_manifest
@@ -67,7 +75,9 @@ def process_workbook(
     if verify_addresses and (
         not app_config.fact_data_api_base_url or not app_config.fact_data_api_bearer_token
     ):
-        raise ValueError("--verify-addresses requires FACT_DATA_API_BASE_URL and FACT_DATA_API_BEARER_TOKEN")
+        raise ValueError(
+            "--verify-addresses requires FACT_DATA_API_BASE_URL and FACT_DATA_API_BEARER_TOKEN"
+        )
 
     run_id = new_run_id()
     staging = stage_path(output_root, run_id)
@@ -91,6 +101,7 @@ def process_workbook(
         if verify_addresses:
             address_verifications = verify_addresses_with_fact_api(submissions, app_config)
         llm_metrics = LlmUsageMetrics()
+        llm_review_items: list[dict[str, object]] = []
         if use_llm:
             llm_options = {
                 "field_rules": load_default_field_rules(app_config),
@@ -105,6 +116,7 @@ def process_workbook(
             )
             submissions = llm_result.submissions
             llm_metrics = llm_result.metrics
+            llm_review_items = llm_result.review_items
         if use_llm or verify_addresses:
             clear_validation_issues(submissions)
             submissions = validate_all_submissions(
@@ -125,7 +137,9 @@ def process_workbook(
             + "\n",
             encoding="utf-8",
         )
-        (staging / "profile.json").write_text(profile_to_json(workbook_profile) + "\n", encoding="utf-8")
+        (staging / "profile.json").write_text(
+            profile_to_json(workbook_profile) + "\n", encoding="utf-8"
+        )
         (staging / "address_verification_report.json").write_text(
             json.dumps(address_verifications.as_dict(), indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -139,12 +153,37 @@ def process_workbook(
             vocabularies=vocabularies,
             court_lookup=court_lookup,
             address_verifications=address_verifications if verify_addresses else None,
+            llm_review_items=llm_review_items,
         )
         (staging / "api_readiness_report.json").write_text(
-            json.dumps(manifest_result.manifest.model_dump(mode="json"), indent=2, ensure_ascii=False)
+            json.dumps(
+                manifest_result.manifest.model_dump(mode="json"), indent=2, ensure_ascii=False
+            )
             + "\n",
             encoding="utf-8",
         )
+        llm_actions_review = build_llm_actions_review(
+            submissions,
+            llm_review_items,
+            address_verifications if use_llm else AddressVerificationBatch(enabled=False),
+            manifest_result.manifest.model_dump(mode="json"),
+            mapping_path=app_config.config_dir / "column_mapping.json",
+        )
+        (staging / LLM_ACTIONS_REVIEW_NAME).write_text(
+            json.dumps(llm_actions_review, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        readiness_report = manifest_result.manifest.model_dump(mode="json")
+        policy_approval_count = len(
+            policy_eligible_address_review_ids(llm_actions_review, readiness_report)
+        )
+        api_manifest_metrics = {
+            **manifest_result.metrics,
+            "llm_approval_item_count": int(llm_actions_review["actionable_item_count"]),
+            "llm_approval_auto_approved_count": policy_approval_count,
+            "llm_approval_pending_count": int(llm_actions_review["actionable_item_count"])
+            - policy_approval_count,
+        }
         output_result = write_processing_outputs(
             submissions=submissions,
             ingest_result=ingest_result,
@@ -155,7 +194,7 @@ def process_workbook(
             llm_enabled=app_config.llm_enabled,
             llm_requested=use_llm,
             llm_metrics=llm_metrics.as_dict(app_config.openai_model if use_llm else None),
-            api_manifest_metrics=manifest_result.metrics,
+            api_manifest_metrics=api_manifest_metrics,
             source_name=source_name or input_path.name,
             vocabularies=vocabularies,
             court_lookup=court_lookup,
@@ -180,19 +219,24 @@ def process_workbook(
             source_name=source_name or input_path.name,
             summary=output_result.summary,
         )
+        LlmApprovalStore(output_root).reconcile_address_policy(
+            run_id, llm_actions_review, readiness_report
+        )
         return ProcessingResult(
             run_id=run_id,
             archive=archive,
             output=output_result,
             review_workbook_path=archive.archive_path / review_workbook_path.name,
-            duplicate_review_workbook_path=archive.archive_path / duplicate_review_workbook_path.name,
+            duplicate_review_workbook_path=archive.archive_path
+            / duplicate_review_workbook_path.name,
             submitters=SubmitterOutputResult(
                 json_path=archive.archive_path / submitters.json_path.name,
                 workbook_path=archive.archive_path / submitters.workbook_path.name,
                 user_count=submitters.user_count,
                 excluded_user_count=submitters.excluded_user_count,
             ),
-            address_verification_report_path=archive.archive_path / "address_verification_report.json",
+            address_verification_report_path=archive.archive_path
+            / "address_verification_report.json",
         )
     except Exception:
         if staging.exists():
@@ -233,7 +277,9 @@ def load_fact_api_services(
                 bearer_token=app_config.fact_data_api_bearer_token or "",
             )
         except Exception as exc:
-            raise ValueError(f"Unable to validate court slug '{court_slug}' against FaCT API: {exc}") from exc
+            raise ValueError(
+                f"Unable to validate court slug '{court_slug}' against FaCT API: {exc}"
+            ) from exc
 
     def court_slug_suggester(court_slug: str, raw_value: str | None):
         try:
@@ -244,7 +290,9 @@ def load_fact_api_services(
                 bearer_token=app_config.fact_data_api_bearer_token or "",
             )
         except Exception as exc:
-            raise ValueError(f"Unable to suggest court slug for '{court_slug}' against FaCT API: {exc}") from exc
+            raise ValueError(
+                f"Unable to suggest court slug for '{court_slug}' against FaCT API: {exc}"
+            ) from exc
 
     try:
         return (

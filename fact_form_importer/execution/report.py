@@ -7,11 +7,13 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
+from fact_form_importer.execution.approvals import LlmApprovalLedger
 from fact_form_importer.execution.models import ExecutionLedger
 
 
 _ACTION_STATUSES = (
     "planned",
+    "awaiting_approval",
     "ready",
     "blocked",
     "running",
@@ -19,9 +21,15 @@ _ACTION_STATUSES = (
     "failed",
     "unknown",
 )
-_COURT_STATUSES = ("not_started", "in_progress", "attention_required", "completed")
+_COURT_STATUSES = (
+    "not_started",
+    "awaiting_approval",
+    "in_progress",
+    "attention_required",
+    "completed",
+)
 _ATTENTION_ACTION_STATUSES = {"blocked", "failed", "unknown"}
-EXECUTION_SUMMARY_VERSION = "1.1"
+EXECUTION_SUMMARY_VERSION = "1.4"
 _COURT_UUID_IN_PATH = re.compile(
     r"(?<=/courts/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/)",
     re.IGNORECASE,
@@ -42,6 +50,9 @@ def build_execution_summary(
     run_id: str,
     readiness_report: dict[str, Any],
     ledger: ExecutionLedger,
+    *,
+    review_report: dict[str, Any] | None = None,
+    approvals: LlmApprovalLedger | None = None,
 ) -> dict[str, Any]:
     """Return a review-safe summary of all planned court actions.
 
@@ -54,6 +65,10 @@ def build_execution_summary(
     court_counts: Counter[str] = Counter()
     courts: list[dict[str, Any]] = []
     attention_actions: list[dict[str, Any]] = []
+    succeeded_action_ids: set[str] = set()
+    review_report = review_report or {"items": []}
+    approval_ledger = approvals or LlmApprovalLedger(run_id=run_id)
+    approved_ids = set(approval_ledger.approvals)
 
     records = sorted(
         readiness_report.get("records", []),
@@ -62,15 +77,21 @@ def build_execution_summary(
     for record in records:
         court_slug = str(record.get("court_slug") or "")
         state = ledger.courts.get(court_slug)
-        court_status = state.status if state else "not_started"
-        court_counts[court_status] += 1
         actions: list[dict[str, Any]] = []
 
         for action in record.get("actions", []):
             action_id = str(action.get("action_id") or "")
             action_state = state.actions.get(action_id) if state else None
             action_status = action_state.status if action_state else "planned"
+            if action_status not in {"blocked", "failed", "unknown", "running", "succeeded"}:
+                review_ids = _action_review_ids(action, review_report)
+                if any(review_id not in approved_ids for review_id in review_ids):
+                    action_status = "awaiting_approval"
+                elif action_status == "awaiting_approval":
+                    action_status = "planned"
             action_counts[action_status] += 1
+            if action_status == "succeeded":
+                succeeded_action_ids.add(action_id)
             action_result = {
                 "action_id": action_id,
                 "resource": action.get("resource"),
@@ -91,6 +112,8 @@ def build_execution_summary(
                     }
                 )
 
+        court_status = _summary_court_status(actions)
+        court_counts[court_status] += 1
         courts.append(
             {
                 "court_slug": court_slug,
@@ -110,10 +133,74 @@ def build_execution_summary(
         "court_status_counts": {status: court_counts[status] for status in _COURT_STATUSES},
         "action_status_counts": {status: action_counts[status] for status in _ACTION_STATUSES},
         "attention_action_count": len(attention_actions),
+        "llm_approval_counts": _llm_approval_counts(
+            review_report, approval_ledger, succeeded_action_ids
+        ),
         "common_error_themes": _group_error_themes(attention_actions),
         "attention_by_request_type": _group_attention_by_request_type(attention_actions),
         "attention_actions": attention_actions,
         "courts": courts,
+    }
+
+
+def _action_review_ids(action: dict[str, Any], review_report: dict[str, Any]) -> set[str]:
+    action_id = str(action.get("action_id") or "")
+    explicit = {str(value) for value in action.get("llm_review_ids", []) if value}
+    derived = {
+        str(item["review_id"])
+        for item in review_report.get("items", [])
+        if item.get("actionable")
+        and action_id in item.get("dependent_action_ids", [])
+        and item.get("review_id")
+    }
+    return explicit | derived
+
+
+def _summary_court_status(actions: list[dict[str, Any]]) -> str:
+    statuses = [str(action.get("status") or "planned") for action in actions]
+    if statuses and all(status == "succeeded" for status in statuses):
+        return "completed"
+    if any(status in _ATTENTION_ACTION_STATUSES for status in statuses):
+        return "attention_required"
+    if any(status == "awaiting_approval" for status in statuses):
+        return "awaiting_approval"
+    if any(status != "planned" for status in statuses):
+        return "in_progress"
+    return "not_started"
+
+
+def _llm_approval_counts(
+    review_report: dict[str, Any],
+    approvals: LlmApprovalLedger,
+    succeeded_action_ids: set[str],
+) -> dict[str, int]:
+    actionable = [item for item in review_report.get("items", []) if item.get("actionable")]
+    actionable_ids = {str(item.get("review_id")) for item in actionable}
+    approved_ids = set(approvals.approvals)
+    approved = len(actionable_ids & approved_ids)
+    auto_approved = sum(
+        approval.approval_method == "policy" and review_id in actionable_ids
+        for review_id, approval in approvals.approvals.items()
+    )
+    already_executed = sum(
+        str(item.get("review_id")) not in approved_ids
+        and bool(item.get("dependent_action_ids"))
+        and all(
+            str(action_id) in succeeded_action_ids
+            for action_id in item.get("dependent_action_ids", [])
+        )
+        for item in actionable
+    )
+    return {
+        "total": len(actionable),
+        "approved": approved,
+        "manual_approved": approved - auto_approved,
+        "auto_approved": auto_approved,
+        "pending": len(actionable) - approved - already_executed,
+        "already_executed": already_executed,
+        "not_actionable": sum(
+            not item.get("actionable") for item in review_report.get("items", [])
+        ),
     }
 
 
@@ -140,9 +227,7 @@ def _group_attention_by_request_type(
         outcomes = []
         for (status, http_status, reason), outcome_actions in outcome_groups.items():
             courts = sorted({str(action["court_slug"]) for action in outcome_actions})
-            classification = _attention_classification(
-                resource, status, http_status, reason
-            )
+            classification = _attention_classification(resource, status, http_status, reason)
             outcomes.append(
                 {
                     "classification": classification,
@@ -164,14 +249,20 @@ def _group_attention_by_request_type(
                 }
             )
 
-        status_counts = Counter(str(action.get("status") or "unknown") for action in resource_actions)
+        status_counts = Counter(
+            str(action.get("status") or "unknown") for action in resource_actions
+        )
         courts = {str(action["court_slug"]) for action in resource_actions}
         grouped_resources.append(
             {
                 "resource": resource,
                 "label": _RESOURCE_LABELS.get(resource, resource.replace("_", " ").title()),
                 "methods": sorted(
-                    {str(action.get("method")) for action in resource_actions if action.get("method")}
+                    {
+                        str(action.get("method"))
+                        for action in resource_actions
+                        if action.get("method")
+                    }
                 ),
                 "endpoint_templates": sorted(
                     {
@@ -183,8 +274,7 @@ def _group_attention_by_request_type(
                 "attention_action_count": len(resource_actions),
                 "court_count": len(courts),
                 "status_counts": {
-                    status: status_counts[status]
-                    for status in ("blocked", "failed", "unknown")
+                    status: status_counts[status] for status in ("blocked", "failed", "unknown")
                 },
                 "distinct_outcome_count": len(outcomes),
                 "outcomes": sorted(
@@ -215,9 +305,7 @@ def _normalised_attention_reason(reason: str) -> str:
     return reason or "No diagnostic reason was recorded"
 
 
-def _attention_classification(
-    resource: str, status: str, http_status: Any, reason: str
-) -> str:
+def _attention_classification(resource: str, status: str, http_status: Any, reason: str) -> str:
     if "Target section already contains FaCT data" in reason:
         return "expected_no_overwrite"
     if resource == "address" and "Address verification" in reason:
@@ -283,7 +371,9 @@ def _group_error_themes(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         lambda: {"count": 0, "courts": set(), "example_reason": None}
     )
     for action in actions:
-        code, label = _error_theme(action.get("status"), action.get("http_status"), action.get("reason"))
+        code, label = _error_theme(
+            action.get("status"), action.get("http_status"), action.get("reason")
+        )
         group = groups[code]
         group["count"] += 1
         group["courts"].add(action["court_slug"])
@@ -300,9 +390,7 @@ def _group_error_themes(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "courts": sorted(group["courts"]),
             "example_reason": group["example_reason"],
         }
-        for code, group in sorted(
-            groups.items(), key=lambda item: (-item[1]["count"], item[0])
-        )
+        for code, group in sorted(groups.items(), key=lambda item: (-item[1]["count"], item[0]))
     ]
 
 

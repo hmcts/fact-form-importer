@@ -9,7 +9,9 @@ deterministic cleaning, FaCT API-backed validation, optional FaCT/Ordnance
 Survey address verification, review output generation, and read-only approval
 user export. Optional LLM normalisation is available for strictly selected
 public-text and unresolved vocabulary fields, but requires an explicit CLI flag
-and environment circuit breaker.
+and environment circuit breaker. Model-derived API values are captured in an
+immutable per-run review artifact and gated by a separate mutable approval
+ledger before execution.
 
 ## Goals
 
@@ -22,6 +24,8 @@ and environment circuit breaker.
 - Keep Python responsible for the final FaCT payload shape.
 - Generate import JSON, NSU review workbook, summary logs, issue reports, and
   read-only approval user outputs.
+- Preserve exact LLM/OS decision evidence and require a manual or strict
+  policy-based field approval before a dependent API action can use it.
 
 ## Commands
 
@@ -100,7 +104,11 @@ are never combined.
 `--verify-addresses --use-llm` may additionally send unresolved OS candidate
 comparisons to the same row-level request. It sends no postcode, contact data,
 or court slug. The model can only select a supplied UPRN as an advisory review
-suggestion; it never changes an address itself.
+suggestion; it never changes archived address evidence itself. A plausible
+first-line discrepancy is treated as weaker than consistent building, street,
+and town evidence. Strict automatic approval is limited to an actionable,
+high-confidence selection of the sole supplied OS candidate; all other usable
+selections remain pending for a reviewer.
 
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --allow-local-vocabularies
@@ -116,8 +124,11 @@ python3 -m fact_form_importer serve --output "./out"
 
 Starts the local review UI at `http://127.0.0.1:5000`. It lists completed
 archived runs, shows raw and cleaned records, issues and API readiness details,
-and can upload one XLSX/CSV for background processing. It only binds to
-localhost because the review views contain contact and submitter data.
+and can upload one XLSX/CSV for background processing. From a run summary, use
+`LLM actions review` to inspect exact field/address evidence and approve pending
+results; `LLM review factors` is read-only. Approval never executes an API
+action—use the record, court, or run execution control separately. The UI only
+binds to localhost because the review views contain contact and submitter data.
 
 ```bash
 python3 -m fact_form_importer api-check-court --output "./out" --run-id "<run-id>" --court-slug "<court-slug>"
@@ -576,14 +587,31 @@ Execution state is written separately to
 It records local preflight and write outcomes only; it is not a replacement for
 the existing review and approval workflow in `fact-admin-frontend`. Every write
 still repeats the live preflight and no-overwrite checks.
-Action status is one of `planned`, `ready`, `blocked`, `running`, `succeeded`,
-`failed`, or `unknown`. A court is `completed` only once every planned action
-has succeeded. `blocked` means no write was attempted for that action because
+Action status is one of `planned`, `awaiting_approval`, `ready`, `blocked`,
+`running`, `succeeded`, `failed`, or `unknown`. A court is `completed` only
+once every planned action has succeeded. `blocked` means no write was attempted for that action because
 the plan or live FaCT preflight identified a review requirement; it is not a
 failed API request. A timeout is `unknown` and is never automatically retried.
 Confirmed `succeeded` and `blocked` states are retained if a later live
 preflight cannot reach FaCT, so a transient token or connectivity problem does
 not erase prior execution evidence.
+
+Runs that use the LLM also archive `llm_actions_review.json`. It records each
+field result and unresolved-address comparison, including the exact safe LLM
+input, OS candidates, selected UPRN, proposed address mapping, and dependent API
+actions. Normalised fields and non-policy address selections must be approved
+individually in the local review UI. A strict versioned policy automatically
+approves an address only when the model selected the sole supplied OS candidate
+with high confidence, did not request review, and the result has an actionable
+address dependency. The prompt treats a plausible first-line discrepancy as a
+weaker signal, but still rejects conflicting town/street/building evidence,
+multiple plausible candidates, and matches requiring invented information.
+Approvals are idempotent, do not execute an API request, and are stored outside
+the immutable archive in `out/llm-approval-state/<run-id>.json`, with manual or
+policy provenance. An action with one or more unapproved LLM dependencies
+remains `awaiting_approval`. Approved OS mappings are applied only to the
+eventual request body, and execution confirms that the selected UPRN is still
+returned before writing.
 
 Each check or write also creates
 `out/execution-state/<run-id>.summary.json` and refreshes the latest
@@ -653,7 +681,15 @@ failures, parse retries, selected and processed field counts, affected
 submissions, model name, address-verification enabled/count/cache/review and
 address-action-blocking metrics, direct LLM review-row counts, API-readiness
 ready/pending action counts, and the count of visible request-only migration
-defaults. In a
+defaults. It also records how many API actions and LLM results initially await
+field-level approval; the mutable execution summary reports the current pending
+and approved counts. High-confidence address selections are automatically
+approved only when the model selected the sole supplied OS candidate, did not
+request review, and the result has an actionable address API dependency. The
+versioned approval ledger records these as policy approvals; multi-candidate,
+medium/low-confidence and non-actionable results remain manual or read-only.
+Automatic approval never executes a FaCT request, and address execution still
+performs the fresh-UPRN, target-section and no-overwrite preflights. In a
 normal run, `vocabulary_source` should be
 `fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
 run. Duplicate groups are conservative for now: every affected record is
@@ -711,8 +747,13 @@ The run-level write control prompts for confirmation and uses the same
 no-overwrite preflight as the record controls. Tables support status/court-row
 filtering and pagination. When relevant, the run list and run page show direct
 LLM review rows and OS-held address rows separately, each linking to a paginated
-factor page. LLM factors are model-specific causes of human review; OS factors hold
-only the affected address action. Each run has a single ZIP download containing
+factor page. The per-run LLM actions page separately lists normalised fields and
+addresses, shows raw/request/OS/model evidence, labels automatic and manual
+approvals, and provides one approval button per pending actionable result. Use
+`LLM actions review` for approval controls; `LLM review factors` is a separate
+read-only explanation of why rows need review. LLM factors are model-specific
+causes of human review; OS factors hold only the affected address action. Each
+run has a single ZIP download containing
 its JSON, workbooks, reports, and immutable manifest; individual files remain
 available in a collapsed list. The upload
 form accepts CSV/XLSX only, runs one job at a time, deletes the original upload

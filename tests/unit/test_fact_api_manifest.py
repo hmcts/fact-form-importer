@@ -6,13 +6,18 @@ from fact_form_importer.models.court_submission import (
     OpeningTime,
 )
 from fact_form_importer.models.source import SourceMetadata
+from fact_form_importer.models.issues import Issue
 from fact_form_importer.output.fact_api_manifest import (
     build_fact_api_import_manifest,
     normalise_fact_api_action_body,
     validate_fact_api_action_body,
 )
 from fact_form_importer.validators.fact_api_courts import CourtReference
-from fact_form_importer.validators.os_addresses import AddressVerification, AddressVerificationBatch
+from fact_form_importer.validators.os_addresses import (
+    AddressVerification,
+    AddressVerificationBatch,
+    OsAddressCandidate,
+)
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 
@@ -79,7 +84,10 @@ def test_manifest_builds_ready_actions_with_preflight_and_source_evidence():
     assert actions["building_facilities"].body["quietRoom"] is False
     assert actions["accessibility_options"].body["accessibleEntrancePhoneNumber"] == "020 7946 0000"
     assert actions["counter_service_opening_hours"].body["counterService"] is True
-    assert actions["counter_service_opening_hours"].body["openingTimesDetails"][0]["dayOfWeek"] == "EVERYDAY"
+    assert (
+        actions["counter_service_opening_hours"].body["openingTimesDetails"][0]["dayOfWeek"]
+        == "EVERYDAY"
+    )
     assert actions["address"].readiness == "ready"
     assert actions["address"].preflight_required is True
     assert actions["address"].source_fields == ["addresses[1]"]
@@ -120,13 +128,110 @@ def test_manifest_marks_invalid_api_text_and_missing_court_uuid_as_pending():
 
 def test_manifest_excludes_non_importable_records():
     review = CourtSubmission(
-        source=SourceMetadata(source_row_number=2), court_slug="review-court", status="needs_human_review"
+        source=SourceMetadata(source_row_number=2),
+        court_slug="review-court",
+        status="needs_human_review",
     )
 
     manifest = build_fact_api_import_manifest([review], "run-1", _vocabularies()).manifest
 
     assert manifest.records == []
     assert manifest.summary["api_manifest_record_count"] == 0
+
+
+def test_manifest_includes_llm_only_review_row_and_attaches_field_dependency():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="needs_human_review",
+        facilities={"accessible_toilet_description": "Near reception."},
+        issues=[
+            Issue(
+                field="facilities.accessible_toilet_description",
+                code="LLM_LOW_CONFIDENCE",
+                severity="warning",
+                message="Review",
+            )
+        ],
+    )
+    review_item = {
+        "source_row_number": 2,
+        "field": "facilities.accessible_toilet_description",
+        "outcome": "accepted",
+    }
+
+    manifest = build_fact_api_import_manifest(
+        [submission],
+        "run-1",
+        _vocabularies(),
+        lambda slug: CourtReference("court-id", slug),
+        llm_review_items=[review_item],
+    ).manifest
+
+    action = next(
+        action
+        for action in manifest.records[0].actions
+        if action.resource == "accessibility_options"
+    )
+    assert action.llm_review_ids
+    assert manifest.summary["api_manifest_awaiting_llm_approval_action_count"] == 1
+
+
+def test_manifest_turns_usable_llm_address_selection_into_an_approval_dependency():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="processed_with_warnings",
+        addresses=[
+            Address(
+                index=1,
+                address_type="Visit",
+                line_1="St Mary's Court",
+                line_2="Regents Park Road",
+                town_or_city="London",
+                postcode="N3 1BQ",
+            )
+        ],
+    )
+    candidate = OsAddressCandidate(
+        uprn="200222235",
+        address=None,
+        organisation_name="BARNET COUNTY COURT",
+        building_number=None,
+        building_name="ST. MARYS COURT",
+        thoroughfare_name="REGENTS PARK ROAD",
+        post_town="LONDON",
+        postcode="N3 1BQ",
+    )
+    verification = AddressVerification(
+        source_row_number=2,
+        court_slug="example-court",
+        address_index=1,
+        postcode="N3 1BQ",
+        status="review_required",
+        message="Deterministic match was not high enough",
+        original_address=submission.addresses[0].model_dump(mode="json"),
+        candidates=[candidate],
+        llm_suggestion={
+            "uprn": "200222235",
+            "confidence": "high",
+            "needs_human_review": False,
+            "reason": "One consistent candidate",
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission],
+        "run-1",
+        _vocabularies(),
+        lambda slug: CourtReference("court-id", slug),
+        AddressVerificationBatch(enabled=True, verifications=[verification]),
+    ).manifest
+
+    action = next(action for action in manifest.records[0].actions if action.resource == "address")
+    assert action.readiness == "ready"
+    assert action.reason is None
+    assert action.llm_review_ids
 
 
 def test_manifest_omits_professional_information_without_form_evidence():
@@ -154,7 +259,12 @@ def test_manifest_keeps_unknown_child_values_pending_and_supports_weekday_times(
         court_slug="example-court",
         status="processed_with_warnings",
         addresses=[
-            Address(index=1, address_type="Unknown", line_1="1 Main Street", areas_of_law=["Unknown area"])
+            Address(
+                index=1,
+                address_type="Unknown",
+                line_1="1 Main Street",
+                areas_of_law=["Unknown area"],
+            )
         ],
         contacts=[ContactDetail(index=1, description="Unknown contact", explanation="bad/slash")],
         opening_hours=[
@@ -343,18 +453,21 @@ def test_manifest_uses_review_visible_interview_room_count_defaults():
     ).manifest
     actions = {
         record.court_slug: next(
-            action
-            for action in record.actions
-            if action.resource == "professional_information"
+            action for action in record.actions if action.resource == "professional_information"
         )
         for record in manifest.records
     }
 
     assert actions["rooms-available-court"].readiness == "ready"
-    assert actions["rooms-available-court"].body["professionalInformation"]["interviewRoomCount"] == 1
+    assert (
+        actions["rooms-available-court"].body["professionalInformation"]["interviewRoomCount"] == 1
+    )
     assert "uses 1" in actions["rooms-available-court"].migration_assumptions[1]
     assert actions["rooms-unavailable-court"].readiness == "ready"
-    assert actions["rooms-unavailable-court"].body["professionalInformation"]["interviewRoomCount"] == 0
+    assert (
+        actions["rooms-unavailable-court"].body["professionalInformation"]["interviewRoomCount"]
+        == 0
+    )
     assert "uses a room count of 0" in actions["rooms-unavailable-court"].migration_assumptions[1]
     assert actions["rooms-unknown-court"].readiness == "pending"
     assert "interviewRooms is required" in actions["rooms-unknown-court"].reason
@@ -389,9 +502,12 @@ def test_manifest_normalises_conventional_address_notation_for_fact_api():
 
 
 def test_fact_api_contract_validation_blocks_known_unrepresentable_values():
-    assert normalise_fact_api_action_body(
-        "address", {"addressLine1": "C/o Court & Tribunal"}
-    )["addressLine1"] == "care of Court and Tribunal"
+    assert (
+        normalise_fact_api_action_body("address", {"addressLine1": "C/o Court & Tribunal"})[
+            "addressLine1"
+        ]
+        == "care of Court and Tribunal"
+    )
 
     address_reason = validate_fact_api_action_body(
         "address",
@@ -658,14 +774,20 @@ def test_manifest_normalises_contact_explanation_to_the_fact_api_charset():
         source=SourceMetadata(source_row_number=9),
         court_slug="example-court",
         status="processed",
-        contacts=[ContactDetail(index=1, description="Enquiries", explanation="Civil / family: ask staff.")],
+        contacts=[
+            ContactDetail(
+                index=1, description="Enquiries", explanation="Civil / family: ask staff."
+            )
+        ],
     )
 
     manifest = build_fact_api_import_manifest(
         [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
     ).manifest
 
-    action = next(action for action in manifest.records[0].actions if action.resource == "contact_detail")
+    action = next(
+        action for action in manifest.records[0].actions if action.resource == "contact_detail"
+    )
     assert action.readiness == "ready"
     assert action.body["explanation"] == "Civil family ask staff"
     assert action.request_body_normalisations["explanation"] == {
@@ -680,7 +802,11 @@ def _vocabularies():
         vocabularies={
             "areas_of_law": [{"code": "civil", "name": "Civil", "api_id": "area-id"}],
             "court_types": [{"code": "county", "name": "County Court", "api_id": "type-id"}],
-            "opening_hour_types": [{"code": "court_open", "name": "Court open", "api_id": "opening-id"}],
-            "contact_description_types": [{"code": "enquiries", "name": "Enquiries", "api_id": "contact-id"}],
+            "opening_hour_types": [
+                {"code": "court_open", "name": "Court open", "api_id": "opening-id"}
+            ],
+            "contact_description_types": [
+                {"code": "enquiries", "name": "Enquiries", "api_id": "contact-id"}
+            ],
         },
     )

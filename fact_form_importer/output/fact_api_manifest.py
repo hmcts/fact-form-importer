@@ -13,13 +13,19 @@ from typing import Any, Callable, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from fact_form_importer.llm.review import (
+    accepted_review_ids_for_fields,
+    address_review_id,
+    usable_address_review,
+)
 from fact_form_importer.models.court_submission import CourtSubmission, OpeningTime
+from fact_form_importer.validators.base import HUMAN_REVIEW_ISSUE_CODES
 from fact_form_importer.validators.fact_api_courts import CourtReference
 from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "1.5"
+API_MANIFEST_VERSION = "1.6"
 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
@@ -59,6 +65,7 @@ class FactApiAction(BaseModel):
     address_verification: Optional[dict[str, Any]] = None
     request_body_normalisations: dict[str, dict[str, str]] = Field(default_factory=dict)
     migration_assumptions: list[str] = Field(default_factory=list)
+    llm_review_ids: list[str] = Field(default_factory=list)
 
 
 class FactApiRecord(BaseModel):
@@ -93,14 +100,28 @@ def build_fact_api_import_manifest(
     vocabularies: Vocabularies | None,
     court_lookup: CourtLookup | None = None,
     address_verifications: AddressVerificationBatch | None = None,
+    llm_review_items: list[dict[str, Any]] | None = None,
 ) -> FactApiManifestResult:
     """Build an action plan from importable submissions without executing it."""
 
     records = []
     for submission in submissions:
-        if not _is_importable(submission):
+        submission_review_items = [
+            item
+            for item in (llm_review_items or [])
+            if item.get("source_row_number") == submission.source.source_row_number
+        ]
+        if not _is_importable(submission, submission_review_items):
             continue
-        records.append(_build_record(submission, vocabularies, court_lookup, address_verifications))
+        records.append(
+            _build_record(
+                submission,
+                vocabularies,
+                court_lookup,
+                address_verifications,
+                submission_review_items,
+            )
+        )
 
     actions = [action for record in records for action in record.actions]
     review_required_default_actions = [
@@ -114,12 +135,16 @@ def build_fact_api_import_manifest(
     summary = {
         "api_manifest_record_count": len(records),
         "api_manifest_ready_action_count": sum(action.readiness == "ready" for action in actions),
-        "api_manifest_pending_action_count": sum(action.readiness == "pending" for action in actions),
+        "api_manifest_pending_action_count": sum(
+            action.readiness == "pending" for action in actions
+        ),
         "api_manifest_ready_record_count": sum(record.readiness == "ready" for record in records),
         "api_manifest_partially_ready_record_count": sum(
             record.readiness == "partially_ready" for record in records
         ),
-        "api_manifest_pending_record_count": sum(record.readiness == "pending" for record in records),
+        "api_manifest_pending_record_count": sum(
+            record.readiness == "pending" for record in records
+        ),
         "api_manifest_review_required_default_count": sum(
             sum(
                 assumption.startswith(_REVIEW_REQUIRED_MIGRATION_DEFAULT_PREFIX)
@@ -128,15 +153,38 @@ def build_fact_api_import_manifest(
             for action in actions
         ),
         "api_manifest_review_required_default_action_count": len(review_required_default_actions),
+        "api_manifest_awaiting_llm_approval_action_count": sum(
+            bool(action.llm_review_ids) for action in actions
+        ),
     }
     return FactApiManifestResult(
         manifest=FactApiImportManifest(run_id=run_id, records=records, summary=summary)
     )
 
 
-def _is_importable(submission: CourtSubmission) -> bool:
-    return submission.status in IMPORTABLE_STATUSES and not any(
-        issue.severity == "error" for issue in submission.issues
+def _is_importable(
+    submission: CourtSubmission,
+    llm_review_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    if any(issue.severity == "error" for issue in submission.issues):
+        return False
+    if submission.status in IMPORTABLE_STATUSES:
+        return True
+    if submission.status != "needs_human_review":
+        return False
+
+    accepted_fields = {
+        str(item.get("field"))
+        for item in (llm_review_items or [])
+        if item.get("outcome") == "accepted"
+    }
+    human_review_issues = [
+        issue for issue in submission.issues if issue.code in HUMAN_REVIEW_ISSUE_CODES
+    ]
+    return bool(human_review_issues) and all(
+        issue.code in {"LLM_LOW_CONFIDENCE", "LLM_REVIEW_REQUIRED"}
+        and issue.field in accepted_fields
+        for issue in human_review_issues
     )
 
 
@@ -145,8 +193,11 @@ def _build_record(
     vocabularies: Vocabularies | None,
     court_lookup: CourtLookup | None,
     address_verifications: AddressVerificationBatch | None,
+    llm_review_items: list[dict[str, Any]],
 ) -> FactApiRecord:
-    court_reference = court_lookup(submission.court_slug) if court_lookup and submission.court_slug else None
+    court_reference = (
+        court_lookup(submission.court_slug) if court_lookup and submission.court_slug else None
+    )
     court_id = court_reference.court_id if court_reference else None
     actions: list[FactApiAction] = []
     action_number = 1
@@ -160,6 +211,7 @@ def _build_record(
         source_fields: list[str] | None = None,
         address_verification: dict[str, Any] | None = None,
         migration_assumptions: list[str] | None = None,
+        extra_llm_review_ids: list[str] | None = None,
     ) -> None:
         nonlocal action_number
         # FaCT validates the request object before its service layer applies the
@@ -192,6 +244,12 @@ def _build_record(
                 address_verification=address_verification,
                 request_body_normalisations=_body_normalisations(original_body, body),
                 migration_assumptions=migration_assumptions or [],
+                llm_review_ids=sorted(
+                    set(
+                        accepted_review_ids_for_fields(llm_review_items, source_fields or [])
+                        + (extra_llm_review_ids or [])
+                    )
+                ),
             )
         )
         action_number += 1
@@ -259,10 +317,14 @@ def _build_record(
 
     for address in submission.addresses:
         body, reason = _address_body(address, vocabularies)
-        verification_reason = (
-            address_verifications.action_reason_for(submission, address.index)
+        verification = (
+            address_verifications.for_address(submission, address.index)
             if address_verifications
             else None
+        )
+        usable_llm_address = usable_address_review(verification) if verification else None
+        verification_reason = (
+            None if usable_llm_address else verification.action_reason() if verification else None
         )
         add(
             "address",
@@ -271,10 +333,11 @@ def _build_record(
             body,
             _combine_reasons(reason, verification_reason),
             source_fields=[f"addresses[{address.index}]"],
-            address_verification=(
-                address_verifications.action_evidence_for(submission, address.index)
-                if address_verifications
-                else None
+            address_verification=(verification.as_dict() if verification else None),
+            extra_llm_review_ids=(
+                [address_review_id(submission.source.source_row_number, address.index)]
+                if usable_llm_address
+                else []
             ),
         )
 
@@ -317,10 +380,18 @@ def _building_facilities_body(facilities: dict[str, Any]) -> dict[str, Any]:
         {
             "parking": facilities.get("parking_available"),
             "quietRoom": facilities.get("quiet_room_available_2"),
-            "freeWaterDispensers": "Free water dispensers" in food_options if food_value is not None else None,
-            "snackVendingMachines": "Snack vending machines" in food_options if food_value is not None else None,
-            "drinkVendingMachines": "Drink vending machines" in food_options if food_value is not None else None,
-            "cafeteria": "A cafeteria serving hot and cold food" in food_options if food_value is not None else None,
+            "freeWaterDispensers": "Free water dispensers" in food_options
+            if food_value is not None
+            else None,
+            "snackVendingMachines": "Snack vending machines" in food_options
+            if food_value is not None
+            else None,
+            "drinkVendingMachines": "Drink vending machines" in food_options
+            if food_value is not None
+            else None,
+            "cafeteria": "A cafeteria serving hot and cold food" in food_options
+            if food_value is not None
+            else None,
             "waitingArea": facilities.get("separate_waiting_areas"),
             "waitingAreaChildren": facilities.get("child_waiting_area"),
             "babyChanging": facilities.get("baby_changing"),
@@ -429,7 +500,9 @@ def _professional_information_assumptions(submission: CourtSubmission) -> list[s
             "Review-required migration default: interview rooms are marked available but the source has no "
             "room count, so this FaCT request uses 1. It does not amend the source or cleaned data."
         )
-    elif rooms.get("has_interview_rooms") is False and _positive_int(rooms.get("room_count")) not in {
+    elif rooms.get("has_interview_rooms") is False and _positive_int(
+        rooms.get("room_count")
+    ) not in {
         None,
         0,
     }:
@@ -521,7 +594,9 @@ def _contact_body(contact, vocabularies: Vocabularies | None) -> tuple[dict[str,
     )
 
 
-def _opening_hours_body(opening_hours, vocabularies: Vocabularies | None) -> tuple[dict[str, Any], str | None]:
+def _opening_hours_body(
+    opening_hours, vocabularies: Vocabularies | None
+) -> tuple[dict[str, Any], str | None]:
     type_id, reason = _vocabulary_id(opening_hours.type, "opening_hour_types", vocabularies)
     times = _opening_times(opening_hours)
     if opening_hours.type and type_id is None:
@@ -652,7 +727,11 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
         if body.get(field) is None:
             errors.append(f"{field} is required by the FaCT API")
 
-    if resource == "building_facilities" and body.get("waitingArea") is True and body.get("waitingAreaChildren") is None:
+    if (
+        resource == "building_facilities"
+        and body.get("waitingArea") is True
+        and body.get("waitingAreaChildren") is None
+    ):
         errors.append("waitingAreaChildren is required by the FaCT API when waitingArea is true")
     if resource == "accessibility_options":
         for field in (
@@ -665,7 +744,9 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
                 not isinstance(phone, str) or not _FACT_API_PHONE_PATTERN.fullmatch(phone)
             ):
                 errors.append(f"{field} does not match the FaCT API phone format")
-        if body.get("accessibleEntrance") is False and not body.get("accessibleEntrancePhoneNumber"):
+        if body.get("accessibleEntrance") is False and not body.get(
+            "accessibleEntrancePhoneNumber"
+        ):
             errors.append(
                 "accessibleEntrancePhoneNumber is required by the FaCT API when accessibleEntrance is false"
             )
@@ -692,7 +773,9 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
     if resource == "accessibility_options":
         description = body.get("accessibleToiletDescription")
         if description and not re.fullmatch(r"[A-Za-z0-9 ()':,\-;.]+", description):
-            errors.append("accessibleToiletDescription contains characters rejected by the FaCT API")
+            errors.append(
+                "accessibleToiletDescription contains characters rejected by the FaCT API"
+            )
     if resource == "contact_detail":
         explanation = body.get("explanation")
         if explanation and len(explanation) > 250:
@@ -794,7 +877,11 @@ def _body_normalisations(
     changes: dict[str, dict[str, str]] = {}
     for field, original_value in original.items():
         cleaned_value = cleaned.get(field)
-        if isinstance(original_value, str) and isinstance(cleaned_value, str) and original_value != cleaned_value:
+        if (
+            isinstance(original_value, str)
+            and isinstance(cleaned_value, str)
+            and original_value != cleaned_value
+        ):
             changes[field] = {"from": original_value, "to": cleaned_value}
     return changes
 
@@ -803,7 +890,9 @@ def _address_validation_errors(body: dict[str, Any]) -> list[str]:
     errors = []
     for field in ("addressLine1", "addressLine2", "townCity", "county"):
         value = body.get(field)
-        if value is not None and (not isinstance(value, str) or not _FACT_API_ADDRESS_PATTERN.fullmatch(value)):
+        if value is not None and (
+            not isinstance(value, str) or not _FACT_API_ADDRESS_PATTERN.fullmatch(value)
+        ):
             errors.append(f"{field} contains characters rejected by the FaCT API")
 
     for field, maximum in (("townCity", 100), ("county", 100)):
@@ -826,7 +915,9 @@ def _fact_api_postcode_reason(postcode: str) -> str | None:
     if compact.startswith("BT"):
         return "postcode is in Northern Ireland, which the FaCT API does not support"
     if _FACT_API_CI_IOM_POSTCODE_PATTERN.match(compact):
-        return "postcode is in a Channel Islands or Isle of Man region the FaCT API does not support"
+        return (
+            "postcode is in a Channel Islands or Isle of Man region the FaCT API does not support"
+        )
     if " " not in postcode.strip():
         return "postcode must contain a space for the FaCT/Ordnance Survey lookup"
     return None
@@ -835,10 +926,14 @@ def _fact_api_postcode_reason(postcode: str) -> str | None:
 def _contact_validation_errors(body: dict[str, Any]) -> list[str]:
     errors = []
     phone = body.get("phoneNumber")
-    if phone is not None and (not isinstance(phone, str) or not _FACT_API_PHONE_PATTERN.fullmatch(phone)):
+    if phone is not None and (
+        not isinstance(phone, str) or not _FACT_API_PHONE_PATTERN.fullmatch(phone)
+    ):
         errors.append("phoneNumber does not match the FaCT API phone format")
     email = body.get("email")
-    if email is not None and (not isinstance(email, str) or not _FACT_API_EMAIL_PATTERN.fullmatch(email)):
+    if email is not None and (
+        not isinstance(email, str) or not _FACT_API_EMAIL_PATTERN.fullmatch(email)
+    ):
         errors.append("email does not match the FaCT API email format")
     return errors
 
@@ -846,7 +941,9 @@ def _contact_validation_errors(body: dict[str, Any]) -> list[str]:
 def _opening_times_validation_errors(body: dict[str, Any]) -> list[str]:
     details = body.get("openingTimesDetails")
     if not isinstance(details, list) or not details:
-        return ["openingTimesDetails must contain at least one valid opening period for the FaCT API"]
+        return [
+            "openingTimesDetails must contain at least one valid opening period for the FaCT API"
+        ]
 
     errors = []
     seen_days = set()
@@ -877,16 +974,18 @@ def _opening_times_validation_errors(body: dict[str, Any]) -> list[str]:
             and _FACT_API_TIME_PATTERN.fullmatch(closing)
             and opening >= closing
         ):
-            errors.append("openingTimesDetails requires each opening time to be before its closing time")
+            errors.append(
+                "openingTimesDetails requires each opening time to be before its closing time"
+            )
 
     if every_day and len(details) != 1:
         errors.append("openingTimesDetails may only contain EVERYDAY as its sole day")
     return errors
 
 
-def _record_readiness(actions: list[FactApiAction]) -> Literal[
-    "ready", "partially_ready", "pending", "not_applicable"
-]:
+def _record_readiness(
+    actions: list[FactApiAction],
+) -> Literal["ready", "partially_ready", "pending", "not_applicable"]:
     if not actions:
         return "not_applicable"
     ready = sum(action.readiness == "ready" for action in actions)

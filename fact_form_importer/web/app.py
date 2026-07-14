@@ -166,9 +166,7 @@ class LocalJobRunner:
     def _write_job(self, job: JobState) -> None:
         path = self.jobs_path / f"{job.job_id}.json"
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(job.as_dict(), indent=2) + "\n", encoding="utf-8"
-        )
+        temporary.write_text(json.dumps(job.as_dict(), indent=2) + "\n", encoding="utf-8")
         temporary.replace(path)
 
     def _restore_interrupted_jobs(self) -> None:
@@ -214,7 +212,9 @@ def create_app(
             "index.html",
             archives=archives,
             llm_enabled=app.config["APP_CONFIG"].llm_enabled,
-            address_verification_available=_address_verification_available(app.config["APP_CONFIG"]),
+            address_verification_available=_address_verification_available(
+                app.config["APP_CONFIG"]
+            ),
             has_llm_review_factors=any(
                 archive["factor_summary"]["llm_review_submission_count"] > 0 for archive in archives
             ),
@@ -372,6 +372,54 @@ def create_app(
             pages=pages,
         )
 
+    @app.get("/runs/<run_id>/llm-actions")
+    def llm_actions_review(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        payload = app.config["EXECUTION_SERVICE"].get_llm_actions_review(run_id)
+        status = request.args.get("status")
+        query = (request.args.get("q") or "").strip().casefold()
+        items = [
+            item
+            for item in payload.get("items", [])
+            if (not status or item.get("approval_status") == status)
+            and (
+                not query
+                or query in str(item.get("court_slug") or "").casefold()
+                or query in str(item.get("source_row_number") or "").casefold()
+                or query in str(item.get("field") or "").casefold()
+            )
+        ]
+        field_items = [item for item in items if item.get("kind") == "field"]
+        address_items = [item for item in items if item.get("kind") == "address"]
+        field_page, field_pages, field_page_items = _paginate(
+            field_items, request.args.get("field_page")
+        )
+        address_page, address_pages, address_page_items = _paginate(
+            address_items, request.args.get("address_page")
+        )
+        return render_template(
+            "llm_actions_review.html",
+            archive=archive,
+            review=payload,
+            fields=field_page_items,
+            addresses=address_page_items,
+            status=status,
+            query=request.args.get("q") or "",
+            field_page=field_page,
+            field_pages=field_pages,
+            address_page=address_page,
+            address_pages=address_pages,
+        )
+
+    @app.post("/runs/<run_id>/llm-actions/<review_id>/approve")
+    def approve_llm_action(run_id: str, review_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            app.config["EXECUTION_SERVICE"].approve_llm_review(run_id, review_id)
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(url_for("llm_actions_review", run_id=run_id))
+
     @app.get("/runs/<run_id>/os-address-factors")
     def os_address_factors(run_id: str):
         archive = _archive_or_404(output_root, run_id)
@@ -434,9 +482,7 @@ def create_app(
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
             mimetype="application/json",
             headers={
-                "Content-Disposition": (
-                    f'attachment; filename="{run_id}-execution-summary.json"'
-                )
+                "Content-Disposition": (f'attachment; filename="{run_id}-execution-summary.json"')
             },
         )
 
@@ -447,7 +493,11 @@ def create_app(
             app.config["EXECUTION_SERVICE"].check_court(run_id, court_slug)
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(url_for("record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]))
+        return redirect(
+            url_for(
+                "record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]
+            )
+        )
 
     @app.post("/runs/<run_id>/courts/<court_slug>/actions/<action_id>/execute")
     def api_execute_action(run_id: str, court_slug: str, action_id: str):
@@ -458,7 +508,11 @@ def create_app(
             app.config["EXECUTION_SERVICE"].execute_action(run_id, court_slug, action_id)
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(url_for("record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]))
+        return redirect(
+            url_for(
+                "record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]
+            )
+        )
 
     @app.post("/runs/<run_id>/courts/<court_slug>/execute-safe")
     def api_execute_court(run_id: str, court_slug: str):
@@ -469,7 +523,11 @@ def create_app(
             app.config["EXECUTION_SERVICE"].execute_safe_court_actions(run_id, court_slug)
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(url_for("record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]))
+        return redirect(
+            url_for(
+                "record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]
+            )
+        )
 
     @app.post("/runs/<run_id>/execute-safe")
     def api_execute_run(run_id: str):
@@ -534,7 +592,9 @@ def _load_readiness_report(archive_path: Path) -> dict[str, Any]:
     return _load_json(archive_path / "fact_api_import_manifest.json", {})
 
 
-def _artifact_groups(archive: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def _artifact_groups(
+    archive: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     labels = {
         "fact_import_payload.json": "Import payload",
         "fact_payload.json": "Legacy import payload",
@@ -543,6 +603,7 @@ def _artifact_groups(archive: dict[str, Any]) -> tuple[list[dict[str, Any]], lis
         "nsu_cleaned_review.xlsx": "NSU cleaned review workbook",
         "duplicate_forms_review.xlsx": "Duplicate form decision workbook",
         "address_verification_report.json": "Address verification report",
+        "llm_actions_review.json": "LLM actions review report",
         "import_summary.json": "Import summary",
         "issue_report.json": "Issue report",
         "records_needing_human_review.json": "Records needing human review",
@@ -555,6 +616,7 @@ def _artifact_groups(archive: dict[str, Any]) -> tuple[list[dict[str, Any]], lis
         "nsu_cleaned_review.xlsx",
         "duplicate_forms_review.xlsx",
         "address_verification_report.json",
+        "llm_actions_review.json",
         "import_summary.json",
         "issue_report.json",
         "records_needing_human_review.json",
@@ -582,11 +644,13 @@ def _run_factor_summary(archive: dict[str, Any]) -> dict[str, int]:
     os_factors = _os_address_factors(archive)
     return {
         "unique_court_slug_count": len(
-            {submission.get("court_slug") for submission in submissions if submission.get("court_slug")}
+            {
+                submission.get("court_slug")
+                for submission in submissions
+                if submission.get("court_slug")
+            }
         ),
-        "llm_review_submission_count": len(
-            {factor["source_row_number"] for factor in llm_factors}
-        ),
+        "llm_review_submission_count": len({factor["source_row_number"] for factor in llm_factors}),
         "llm_review_issue_count": len(llm_factors),
         "os_action_blocking_submission_count": len(
             {factor["source_row_number"] for factor in os_factors}
@@ -739,7 +803,11 @@ def _value_at_path(value: Any, path: str) -> Any:
             current = current.get(part)
         elif isinstance(current, list) and part.isdigit():
             current = next(
-                (item for item in current if isinstance(item, dict) and item.get("index") == int(part)),
+                (
+                    item
+                    for item in current
+                    if isinstance(item, dict) and item.get("index") == int(part)
+                ),
                 None,
             )
         else:
