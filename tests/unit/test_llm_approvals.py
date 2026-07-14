@@ -5,6 +5,7 @@ from fact_form_importer.execution.approvals import (
     APPROVAL_LEDGER_VERSION,
     LlmApprovalStore,
     policy_eligible_address_review_ids,
+    policy_eligible_unchanged_field_review_ids,
 )
 
 
@@ -81,6 +82,60 @@ def test_legacy_approval_ledger_defaults_existing_entries_to_manual(tmp_path):
     assert ledger.approvals["review-1"].approval_method == "manual"
 
 
+def test_unchanged_field_policy_requires_exact_high_confidence_safe_set():
+    exact = _field_item("exact")
+    changed = _field_item("changed", value="Different")
+    format_only = _field_item("format", cleaned="Ground floor", value="ground floor")
+    medium = _field_item("medium", confidence="medium")
+    review = _field_item("review", needs_human_review=True)
+    cleared = _field_item("cleared", operation="clear", value=None)
+    unresolved = _field_item("unresolved", operation="unresolved", value=None)
+    type_changed = _field_item("type", cleaned=True, value="True")
+    blocked = _field_item("blocked", actionable=False)
+
+    selected = policy_eligible_unchanged_field_review_ids(
+        {
+            "items": [
+                exact,
+                changed,
+                format_only,
+                medium,
+                review,
+                cleared,
+                unresolved,
+                type_changed,
+                blocked,
+            ]
+        }
+    )
+
+    assert selected == {"exact", "blocked"}
+
+
+def test_address_override_records_hash_and_policy_decision_history(tmp_path):
+    store = LlmApprovalStore(tmp_path / "out")
+    store.reconcile_policies("run-1", {"items": [_item("address")]}, _readiness())
+
+    ledger = store.approve_address(
+        "run-1",
+        "address",
+        {
+            "addressLine1": "Reviewed Court",
+            "addressLine2": None,
+            "townCity": "London",
+            "county": None,
+            "postcode": "SW1A 1AA",
+        },
+    )
+
+    approval = ledger.approvals["address"]
+    assert approval.approval_method == "manual"
+    assert approval.approved_address_patch["addressLine1"] == "Reviewed Court"
+    assert approval.approved_value_hash
+    assert approval.decision_history[0].approval_method == "policy"
+    assert approval.decision_history[0].policy_version == ADDRESS_AUTO_APPROVAL_POLICY_VERSION
+
+
 def _item(
     review_id,
     *,
@@ -98,6 +153,32 @@ def _item(
         "llm_input": {"candidates": candidates or [{"uprn": "uprn-1"}]},
         "model_result": {
             "uprn": "uprn-1",
+            "confidence": confidence,
+            "needs_human_review": needs_human_review,
+        },
+    }
+
+
+def _field_item(
+    review_id,
+    *,
+    cleaned="Available on the ground floor.",
+    value="Available on the ground floor.",
+    confidence="high",
+    needs_human_review=False,
+    operation="set",
+    actionable=True,
+):
+    return {
+        "review_id": review_id,
+        "kind": "field",
+        "outcome": "accepted",
+        "actionable": actionable,
+        "dependent_action_ids": ["court-1"] if actionable else [],
+        "llm_input": {"cleaned_value": cleaned},
+        "model_result": {
+            "operation": operation,
+            "value": value,
             "confidence": confidence,
             "needs_human_review": needs_human_review,
         },

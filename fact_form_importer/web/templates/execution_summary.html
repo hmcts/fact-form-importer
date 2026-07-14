@@ -7,8 +7,21 @@
   <a href="#request-types">By request type</a>
   <a href="#attention-actions">Per-court attention list</a>
 </nav>
+{% if execution_job %}
+<section id="execution-job" data-job-id="{{ execution_job.job_id }}" data-job-state="{{ execution_job.state }}">
+  <h2>Execution job</h2>
+  <p><strong>{{ execution_job.scope | capitalize }}</strong> job · <strong>{{ execution_job.state }}</strong>{% if execution_job.court_slug %} · {{ execution_job.court_slug }}{% endif %}{% if execution_job.action_id %} · <code>{{ execution_job.action_id }}</code>{% endif %}</p>
+  <p class="muted">Queued {{ execution_job.created_at }}{% if execution_job.started_at %} · Started {{ execution_job.started_at }}{% endif %}{% if execution_job.completed_at %} · Finished {{ execution_job.completed_at }}{% endif %}</p>
+  {% if execution_job.error %}<p class="error">{{ execution_job.error }}</p>{% endif %}
+</section>
+{% endif %}
+{% if writes_enabled %}
+<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every safe and fully approved section action?');">
+  <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Execution in progress…{% else %}Run all safe actions{% endif %}</button>
+</form>
+{% endif %}
 <div class="summary">
-  {% for label, value in [('Courts considered', execution_summary.selected_court_count), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('LLM results already executed', execution_summary.llm_approval_counts.already_executed), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  {% for label, value in [('Courts considered', execution_summary.selected_court_count), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('Unchanged fields auto-approved', execution_summary.llm_approval_counts.auto_approved_unchanged_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Target replacements pending', execution_summary.replacement_approval_counts.pending), ('Duplicate courts needing source selection', execution_summary.duplicate_source_selection_counts.pending_courts), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
@@ -60,4 +73,12 @@
     <tr><td>{{ court.court_slug }}</td><td>{{ court.source_row_numbers | join(', ') }}</td><td>{{ court.status }}</td><td>{% for action in court.actions %}{{ action.resource }}: {{ action.status }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td></tr>
   {% else %}<tr><td colspan="4">No importable courts have an API action plan.</td></tr>{% endfor %}</tbody>
 </table>
+{% if execution_job and execution_job.state in ['queued', 'running'] %}
+<script>
+window.setTimeout(async function refreshExecution() {
+  const response = await fetch("{{ url_for('execution_job_status', job_id=execution_job.job_id) }}", {cache: "no-store"});
+  if (response.ok) window.location.reload();
+}, 1200);
+</script>
+{% endif %}
 {% endblock %}

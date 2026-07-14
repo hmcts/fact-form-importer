@@ -7,11 +7,13 @@
 <nav>
   <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">All records</a>
   <a href="{{ url_for('records', run_id=archive.manifest.run_id, status='needs_human_review') }}">Needs review</a>
+  <a href="{{ url_for('review_overview', run_id=archive.manifest.run_id) }}">Review overview</a>
   <a href="{{ url_for('issues', run_id=archive.manifest.run_id) }}">Issues</a>
   {% if factor_summary.llm_review_submission_count %}<a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id) }}">LLM review factors</a>{% endif %}
   {% if execution_summary.llm_approval_counts.total or summary.get('llm_requested') %}<a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id) }}">LLM actions review</a>{% endif %}
   {% if factor_summary.os_action_blocking_submission_count %}<a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id) }}">OS-held addresses</a>{% endif %}
   <a href="{{ url_for('api_actions', run_id=archive.manifest.run_id) }}">Readiness report</a>
+  <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">API changes review</a>
   <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Execution summary</a>
 </nav>
 <div class="summary">
@@ -30,13 +32,13 @@
 {% endif %}
 <h2>API execution</h2>
 <div class="summary">
-  {% for label, value in [('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('LLM results already executed', execution_summary.llm_approval_counts.already_executed), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  {% for label, value in [('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Target replacements pending', execution_summary.replacement_approval_counts.pending), ('Duplicate courts needing source selection', execution_summary.duplicate_source_selection_counts.pending_courts), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
 {% if writes_enabled %}
-<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe action in this archived run? Existing FaCT data will remain blocked.');">
-  <button type="submit">Run all safe actions</button>
+<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe and fully approved action? Approved existing sections may be replaced, including removal of surplus collection entries.');">
+  <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Execution in progress…{% else %}Run all safe actions{% endif %}</button>
 </form>
 {% else %}
 <p class="muted">Run-level writes are disabled. Set <code>FACT_DATA_API_WRITES_ENABLED=true</code> only when ready to make FaCT changes.</p>

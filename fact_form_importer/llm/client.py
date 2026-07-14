@@ -186,6 +186,9 @@ def build_llm_test_request() -> LlmNormalisationRequest:
                 "Make the text suitable for public display.",
                 "Preserve factual location information.",
                 "Preserve accessible toilet information.",
+                "For a simple floor location, begin with 'Available on'.",
+                "'Ground floor' becomes 'Available on the ground floor.'.",
+                "Use 'Available on the ground, first and third floors.' for the UCD multi-floor style.",
                 "Do not invent floors, rooms, entrances, routes or availability.",
                 "If the answer is vague, contradictory, or only says to ask staff/security, flag for human review.",
             ],
@@ -227,6 +230,9 @@ def build_llm_test_request() -> LlmNormalisationRequest:
             "contact.explanation": [
                 "Make the text suitable for public display.",
                 "Preserve the factual meaning.",
+                "Remove days and opening/closing times represented by structured opening hours.",
+                "Use operation 'clear' with value null if only a generic contact-centre label remains.",
+                "For example, 'National Contact Centre for Civil and Family Court, Monday to Thursday 9am to 5pm, Friday 9am to 4:30pm' must be cleared.",
                 "Do not invent extra service details.",
             ],
             "opening_hours.type": [

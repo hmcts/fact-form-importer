@@ -72,6 +72,9 @@ class LlmNormalisedField(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     field: str
+    # Required rather than defaulted because Azure structured outputs requires
+    # every response property to be present in the generated JSON schema.
+    operation: Literal["set", "clear", "unresolved"]
     # Some approved fields are Microsoft Forms multi-select values, so an LLM
     # may safely return either one canonical value or a canonical value list.
     value: Optional[Union[str, List[str]]]

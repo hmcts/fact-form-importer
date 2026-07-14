@@ -23,3 +23,17 @@ summary { cursor: pointer; font-weight: bold; }
 .muted { color: #505a5f; }
 pre { background: #f3f2f1; padding: 1rem; overflow: auto; white-space: pre-wrap; }
 .error { color: #b10e1e; font-weight: bold; }
+.success { color: #005a30; background: #cce2d8; border-left: 4px solid #00703c; padding: 0.75rem; }
+.review-row { scroll-margin-top: 1rem; }
+.review-row:target { outline: 4px solid #ffdd00; outline-offset: 2px; }
+.review-row input { box-sizing: border-box; width: 100%; }
+.before-after { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+.before-after div { border-left: 4px solid #b1b4b6; padding: 0.4rem; overflow-wrap: anywhere; }
+.before-after div:last-child { border-color: #00703c; }
+.tag { display: inline-block; border-radius: 0.2rem; background: #f3f2f1; padding: 0.2rem 0.4rem; font-weight: bold; }
+.tag-changed, .tag-cleared, .tag-multiple_candidates { background: #ffdd00; }
+.tag-no_selection { background: #f499be; }
+.tag-unchanged, .tag-format_only { background: #cce2d8; }
+table.compact { font-size: 0.82rem; }
+mark.diff-removed { background: #f6d7d2; color: #942514; text-decoration: line-through; }
+mark.diff-added { background: #cce2d8; color: #005a30; }

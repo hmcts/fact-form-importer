@@ -56,7 +56,7 @@ class FakeFactApiClient:
         return self.write_response
 
 
-def test_check_court_blocks_an_existing_target_section(tmp_path, monkeypatch):
+def test_check_court_requires_approval_for_an_existing_target_section(tmp_path, monkeypatch):
     run_id = _archive(tmp_path)
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "false")
     client = FakeFactApiClient(target=ApiResponse(200, {"parking": True}))
@@ -66,10 +66,292 @@ def test_check_court_blocks_an_existing_target_section(tmp_path, monkeypatch):
     )
 
     action = ledger.courts["example-court"].actions["example-court-1"]
-    assert action.status == "blocked"
-    assert "already contains" in action.reason
-    assert ledger.courts["example-court"].status == "attention_required"
+    assert action.status == "awaiting_approval"
+    assert "replacement requires approval" in action.reason
+    assert ledger.courts["example-court"].status == "awaiting_approval"
     assert client.writes == []
+
+
+def test_exact_target_replacement_approval_is_separate_and_hash_bound(tmp_path, monkeypatch):
+    run_id = _archive(tmp_path)
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(target=ApiResponse(200, {"parking": False}))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    comparison = service.refresh_target_comparison(
+        run_id, "example-court", "example-court-1"
+    )
+    service.approve_target_change(run_id, comparison.change_id)
+
+    assert client.writes == []
+    completed = service.execute_action(run_id, "example-court", "example-court-1")
+    assert completed.courts["example-court"].actions["example-court-1"].status == "succeeded"
+    assert client.writes
+
+    changed_root = tmp_path / "changed"
+    changed_run = _archive(changed_root)
+    changed_client = FakeFactApiClient(target=ApiResponse(200, {"parking": False}))
+    changed_service = ApiExecutionService(changed_root / "out", AppConfig(), changed_client)
+    changed_comparison = changed_service.refresh_target_comparison(
+        changed_run, "example-court", "example-court-1"
+    )
+    changed_service.approve_target_change(changed_run, changed_comparison.change_id)
+    changed_client.target = ApiResponse(200, {"parking": None})
+
+    held = changed_service.execute_action(
+        changed_run, "example-court", "example-court-1"
+    )
+
+    assert held.courts["example-court"].actions["example-court-1"].status == "awaiting_approval"
+    assert changed_client.writes == []
+
+
+def test_collection_replacement_updates_and_creates_before_surplus_deletion(
+    tmp_path, monkeypatch
+):
+    contact_type = "00000000-0000-0000-0000-000000000001"
+    new_type = "00000000-0000-0000-0000-000000000002"
+    old_type = "00000000-0000-0000-0000-000000000003"
+    proposed = [
+        {
+            "courtId": "court-id",
+            "courtContactDescriptionId": contact_type,
+            "explanation": "Updated",
+        },
+        {
+            "courtId": "court-id",
+            "courtContactDescriptionId": new_type,
+            "phoneNumber": "020 7000 0000",
+        },
+    ]
+    action = {
+        "action_id": "example-contact-section",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/court-id/v1/contact-details",
+        "readiness": "ready",
+        "body": proposed[0],
+        "proposed_items": proposed,
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    current = [
+        {
+            "id": "current-contact",
+            "courtContactDescriptionId": contact_type,
+            "explanation": "Old",
+        },
+        {
+            "id": "surplus-contact",
+            "courtContactDescriptionId": old_type,
+            "explanation": "Remove",
+        },
+    ]
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(target=ApiResponse(200, current))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    comparison = service.refresh_target_comparison(
+        run_id, "example-court", "example-contact-section"
+    )
+    service.approve_target_change(run_id, comparison.change_id)
+
+    completed = service.execute_action(
+        run_id, "example-court", "example-contact-section"
+    )
+
+    assert completed.courts["example-court"].actions[
+        "example-contact-section"
+    ].status == "succeeded"
+    assert [method for method, _, _ in client.writes] == ["PUT", "POST", "DELETE"]
+    assert client.writes[-1][1].endswith("/surplus-contact")
+
+
+def test_partial_collection_failure_stops_deletion_and_refreshes_live_state(
+    tmp_path, monkeypatch
+):
+    contact_type = "00000000-0000-0000-0000-000000000001"
+    new_type = "00000000-0000-0000-0000-000000000002"
+    old_type = "00000000-0000-0000-0000-000000000003"
+    proposed = [
+        {
+            "courtId": "court-id",
+            "courtContactDescriptionId": contact_type,
+            "explanation": "Updated",
+        },
+        {
+            "courtId": "court-id",
+            "courtContactDescriptionId": new_type,
+            "phoneNumber": "020 7000 0000",
+        },
+    ]
+    action = {
+        "action_id": "example-contact-section",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/court-id/v1/contact-details",
+        "readiness": "ready",
+        "body": proposed[0],
+        "proposed_items": proposed,
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    current = [
+        {
+            "id": "current-contact",
+            "courtContactDescriptionId": contact_type,
+            "explanation": "Old",
+        },
+        {
+            "id": "surplus-contact",
+            "courtContactDescriptionId": old_type,
+            "explanation": "Remove",
+        },
+    ]
+
+    class PartialFailureClient(FakeFactApiClient):
+        def write(self, method, path, body):
+            self.writes.append((method, path, body))
+            if len(self.writes) == 1:
+                self.target = ApiResponse(
+                    200,
+                    [
+                        {"id": "current-contact", **proposed[0]},
+                        current[1],
+                    ],
+                )
+                return ApiResponse(200)
+            return ApiResponse(400, {"message": "create rejected"})
+
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = PartialFailureClient(target=ApiResponse(200, current))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    comparison = service.refresh_target_comparison(
+        run_id, "example-court", "example-contact-section"
+    )
+    service.approve_target_change(run_id, comparison.change_id)
+
+    failed = service.execute_action(run_id, "example-court", "example-contact-section")
+    state = failed.courts["example-court"].actions["example-contact-section"]
+
+    assert state.status == "failed"
+    assert [method for method, _, _ in client.writes] == ["PUT", "POST"]
+    assert "re-read" in state.reason
+    assert comparison.change_id not in service.get_execution_review(run_id).target_approvals
+
+
+def test_refresh_all_comparisons_skips_unselected_duplicates_and_reports_failures(tmp_path):
+    normal = _action("normal-action")
+    duplicate = {
+        **_action("duplicate-action"),
+        "source_selection_required": True,
+        "source_row_number": 3,
+    }
+    run_id = _archive(
+        tmp_path,
+        records=[
+            {
+                "court_slug": "example-court",
+                "court_id": "court-id",
+                "source_row_numbers": [2],
+                "actions": [normal],
+            },
+            {
+                "court_slug": "duplicate-court",
+                "court_id": "duplicate-id",
+                "source_row_numbers": [3, 4],
+                "actions": [duplicate],
+            },
+        ],
+    )
+    service = ApiExecutionService(
+        tmp_path / "out", AppConfig(), FakeFactApiClient(target=ApiResponse(204))
+    )
+
+    service.refresh_all_target_comparisons(run_id)
+
+    assert len(service.get_execution_review(run_id).comparisons) == 1
+
+    failing_root = tmp_path / "failing"
+    failing_run = _archive(failing_root)
+    failing = ApiExecutionService(
+        failing_root / "out", AppConfig(), FakeFactApiClient(target=ApiResponse(500))
+    )
+    with pytest.raises(ValueError, match="1 court error"):
+        failing.refresh_all_target_comparisons(failing_run)
+
+
+def test_preflight_blocks_changed_court_uuid_and_marks_unexpected_target_unknown(tmp_path):
+    changed_run = _archive(
+        tmp_path,
+        records=[
+            {
+                "court_slug": "example-court",
+                "court_id": "reviewed-old-id",
+                "source_row_numbers": [2],
+                "actions": [_action("changed-court-action")],
+            }
+        ],
+    )
+    changed_service = ApiExecutionService(
+        tmp_path / "out", AppConfig(), FakeFactApiClient()
+    )
+
+    changed = changed_service.check_court(changed_run, "example-court")
+
+    assert changed.courts["example-court"].actions[
+        "changed-court-action"
+    ].status == "blocked"
+    assert "UUID no longer matches" in changed.courts["example-court"].actions[
+        "changed-court-action"
+    ].reason
+
+    unknown_root = tmp_path / "unknown"
+    unknown_run = _archive(unknown_root)
+    unknown_service = ApiExecutionService(
+        unknown_root / "out", AppConfig(), FakeFactApiClient(target=ApiResponse(500))
+    )
+
+    unknown = unknown_service.check_court(unknown_run, "example-court")
+
+    assert unknown.courts["example-court"].actions["example-court-1"].status == "unknown"
+    assert "unexpected response" in unknown.courts["example-court"].actions[
+        "example-court-1"
+    ].reason
+
+
+def test_duplicate_preflight_checks_only_the_selected_source_proposal(tmp_path):
+    actions = [
+        {
+            **_action("row-2-action"),
+            "source_selection_required": True,
+            "source_row_number": 2,
+        },
+        {
+            **_action("row-3-action"),
+            "source_selection_required": True,
+            "source_row_number": 3,
+        },
+    ]
+    run_id = _archive(
+        tmp_path,
+        records=[
+            {
+                "court_slug": "example-court",
+                "court_id": "court-id",
+                "source_row_numbers": [2, 3],
+                "actions": actions,
+            }
+        ],
+    )
+    service = ApiExecutionService(
+        tmp_path / "out", AppConfig(), FakeFactApiClient(target=ApiResponse(204))
+    )
+
+    waiting = service.check_court(run_id, "example-court")
+    assert waiting.courts["example-court"].actions["row-2-action"].status == "awaiting_approval"
+    service.select_source_row(run_id, "example-court", 2)
+    checked = service.check_court(run_id, "example-court")
+
+    assert checked.courts["example-court"].actions["row-2-action"].status == "ready"
+    assert checked.courts["example-court"].actions["row-3-action"].status == "awaiting_approval"
 
 
 def test_execute_action_writes_after_safe_preflight_without_local_approval(tmp_path, monkeypatch):
@@ -124,6 +406,9 @@ def test_llm_dependent_action_waits_for_every_approval_before_execution(tmp_path
         "approved": 2,
         "manual_approved": 2,
         "auto_approved": 0,
+        "auto_approved_total": 0,
+        "auto_approved_addresses": 0,
+        "auto_approved_unchanged_fields": 0,
         "pending": 0,
         "already_executed": 0,
         "not_actionable": 0,
@@ -184,6 +469,141 @@ def test_approved_address_uses_os_mapping_and_requires_fresh_uprn(tmp_path, monk
     assert blocked.courts["example-court"].actions["example-court-1"].status == "blocked"
     assert "no longer returned" in blocked.courts["example-court"].actions["example-court-1"].reason
     assert missing_client.writes == []
+
+
+def test_reviewer_edited_address_is_stored_invalidates_comparison_and_is_executed(
+    tmp_path, monkeypatch
+):
+    action = _address_action("example-court-1", "Submitted Court")
+    action["llm_review_ids"] = ["address-review"]
+    action["proposed_items"] = [dict(action["body"])]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(
+        tmp_path,
+        run_id,
+        ["address-review"],
+        kind="address",
+        api_body_patch={
+            "addressLine1": "OS Court",
+            "addressLine2": None,
+            "townCity": "London",
+            "county": None,
+            "postcode": "SW1A 1AA",
+        },
+        uprn="uprn-1",
+        candidates=[{"uprn": "uprn-1"}, {"uprn": "uprn-2"}],
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(
+        target=ApiResponse(
+            200,
+            [
+                {
+                    "id": "address-id",
+                    "addressLine1": "Existing Court",
+                    "townCity": "London",
+                    "postcode": "SW1A 1AA",
+                    "addressType": "VISIT_US",
+                }
+            ],
+        ),
+        address_lookup=ApiResponse(200, {"results": [{"DPA": {"UPRN": "uprn-1"}}]}),
+    )
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    service.approve_llm_review(run_id, "address-review")
+    comparison = service.refresh_target_comparison(
+        run_id, "example-court", "example-court-1"
+    )
+    service.approve_target_change(run_id, comparison.change_id)
+
+    approvals = service.approve_llm_review(
+        run_id,
+        "address-review",
+        address_patch={
+            "addressLine1": "Reviewer Court",
+            "addressLine2": "PO Box 12",
+            "townCity": "London",
+            "county": "Greater London",
+            "postcode": "SW1A 1AA",
+        },
+    )
+
+    approval = approvals.approvals["address-review"]
+    assert approval.approval_method == "manual"
+    assert approval.approved_address_patch["addressLine1"] == "Reviewer Court"
+    assert approval.decision_history
+    review_state = service.get_execution_review(run_id)
+    assert comparison.change_id not in review_state.comparisons
+    assert comparison.change_id not in review_state.target_approvals
+
+    refreshed = service.refresh_target_comparison(
+        run_id, "example-court", "example-court-1"
+    )
+    service.approve_target_change(run_id, refreshed.change_id)
+    completed = service.execute_action(run_id, "example-court", "example-court-1")
+
+    assert completed.courts["example-court"].actions["example-court-1"].status == "succeeded"
+    assert client.writes[0][2]["addressLine1"] == "Reviewer Court"
+    assert client.writes[0][2]["addressLine2"] == "PO Box 12"
+
+
+def test_reviewer_address_validation_and_execution_state_restrictions(tmp_path):
+    action = _address_action("example-court-1", "Submitted Court")
+    action["llm_review_ids"] = ["address-review"]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(
+        tmp_path,
+        run_id,
+        ["address-review"],
+        kind="address",
+        api_body_patch={
+            "addressLine1": "OS Court",
+            "townCity": "London",
+            "postcode": "SW1A 1AA",
+        },
+        uprn="uprn-1",
+        candidates=[{"uprn": "uprn-1"}, {"uprn": "uprn-2"}],
+    )
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+
+    with pytest.raises(ValueError, match="address line 1"):
+        service.approve_llm_review(
+            run_id,
+            "address-review",
+            address_patch={"addressLine1": "", "townCity": "London", "postcode": "SW1A 1AA"},
+        )
+    with pytest.raises(ValueError, match="active execution job"):
+        service.approve_llm_review(
+            run_id,
+            "address-review",
+            address_patch={
+                "addressLine1": "Court",
+                "townCity": "London",
+                "postcode": "SW1A 1AA",
+            },
+            execution_job_active=True,
+        )
+
+    ledger = service.store.load(run_id)
+    ledger.courts["example-court"] = CourtExecutionState(
+        court_slug="example-court",
+        actions={
+            "example-court-1": ActionExecutionState(
+                action_id="example-court-1", status="unknown"
+            )
+        },
+    )
+    service.store.save(ledger)
+    with pytest.raises(ValueError, match="becomes uncertain"):
+        service.approve_llm_review(
+            run_id,
+            "address-review",
+            address_patch={
+                "addressLine1": "Court",
+                "townCity": "London",
+                "postcode": "SW1A 1AA",
+            },
+        )
 
 
 def test_strict_address_policy_approves_without_executing_and_retains_preflight(
@@ -250,6 +670,32 @@ def test_legacy_succeeded_action_is_not_retroactively_held_for_approval(tmp_path
     assert review["items"][0]["approval_status"] == "already_executed"
     with pytest.raises(ValueError, match="already used"):
         service.approve_llm_review(run_id, "legacy-review")
+
+
+def test_legacy_po_box_only_approval_dependency_is_ignored(tmp_path, monkeypatch):
+    action = _address_action("example-court-1", "PO Box 12")
+    action["llm_review_ids"] = ["legacy-po-box-review"]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(
+        tmp_path,
+        run_id,
+        ["legacy-po-box-review"],
+        kind="address",
+    )
+    path = tmp_path / "out" / "final" / run_id / "llm_actions_review.json"
+    report = json.loads(path.read_text())
+    report["items"][0]["address_mode"] = "po_box"
+    path.write_text(json.dumps(report))
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(target=ApiResponse(204), write=ApiResponse(201))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    assert service.get_llm_actions_review(run_id)["items"] == []
+    completed = service.execute_action(run_id, "example-court", "example-court-1")
+
+    state = completed.courts["example-court"].actions["example-court-1"]
+    assert state.status == "succeeded"
+    assert client.writes[0][2]["addressLine1"] == "PO Box 12"
 
 
 def test_execution_state_ignores_legacy_local_approval_fields():

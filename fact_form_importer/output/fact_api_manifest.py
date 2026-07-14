@@ -19,13 +19,13 @@ from fact_form_importer.llm.review import (
     usable_address_review,
 )
 from fact_form_importer.models.court_submission import CourtSubmission, OpeningTime
-from fact_form_importer.validators.base import HUMAN_REVIEW_ISSUE_CODES
+from fact_form_importer.validators.base import COURT_SLUG_NOT_FOUND
 from fact_form_importer.validators.fact_api_courts import CourtReference
 from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "1.6"
+API_MANIFEST_VERSION = "1.7"
 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
@@ -66,6 +66,11 @@ class FactApiAction(BaseModel):
     request_body_normalisations: dict[str, dict[str, str]] = Field(default_factory=dict)
     migration_assumptions: list[str] = Field(default_factory=list)
     llm_review_ids: list[str] = Field(default_factory=list)
+    source_row_number: Optional[int] = None
+    source_selection_required: bool = False
+    section_id: Optional[str] = None
+    proposed_items: list[dict[str, Any]] = Field(default_factory=list)
+    address_verifications: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class FactApiRecord(BaseModel):
@@ -123,6 +128,9 @@ def build_fact_api_import_manifest(
             )
         )
 
+    # Rows without a complete section remain visible in the source-review
+    # report, but do not need an empty API-plan record.
+    records = _merge_duplicate_records([record for record in records if record.actions])
     actions = [action for record in records for action in record.actions]
     review_required_default_actions = [
         action
@@ -166,26 +174,10 @@ def _is_importable(
     submission: CourtSubmission,
     llm_review_items: list[dict[str, Any]] | None = None,
 ) -> bool:
-    if any(issue.severity == "error" for issue in submission.issues):
+    del llm_review_items
+    if not submission.court_slug:
         return False
-    if submission.status in IMPORTABLE_STATUSES:
-        return True
-    if submission.status != "needs_human_review":
-        return False
-
-    accepted_fields = {
-        str(item.get("field"))
-        for item in (llm_review_items or [])
-        if item.get("outcome") == "accepted"
-    }
-    human_review_issues = [
-        issue for issue in submission.issues if issue.code in HUMAN_REVIEW_ISSUE_CODES
-    ]
-    return bool(human_review_issues) and all(
-        issue.code in {"LLM_LOW_CONFIDENCE", "LLM_REVIEW_REQUIRED"}
-        and issue.field in accepted_fields
-        for issue in human_review_issues
-    )
+    return not any(issue.code == COURT_SLUG_NOT_FOUND for issue in submission.issues)
 
 
 def _build_record(
@@ -218,15 +210,13 @@ def _build_record(
         # court UUID from the path, so all entity request bodies must carry it.
         # Professional information uses a DTO rather than an entity and does
         # not expose a courtId field.
-        if court_id and resource != "professional_information" and body:
-            body = {"courtId": court_id, **body}
+        if resource != "professional_information" and body:
+            body = {"courtId": court_id or "{court_id}", **body}
         original_body = dict(body)
         body = normalise_fact_api_action_body(resource, body)
         if not body:
             return
         action_reason = reason
-        if court_id is None:
-            action_reason = _combine_reasons(action_reason, "FaCT court UUID could not be resolved")
         validation_reason = validate_fact_api_action_body(resource, body)
         action_reason = _combine_reasons(action_reason, validation_reason)
         readiness: Literal["ready", "pending"] = "pending" if action_reason else "ready"
@@ -250,6 +240,12 @@ def _build_record(
                         + (extra_llm_review_ids or [])
                     )
                 ),
+                source_row_number=submission.source.source_row_number,
+                section_id=(
+                    f"{submission.court_slug}:{resource}:{submission.source.source_row_number}"
+                ),
+                proposed_items=[body],
+                address_verifications=[address_verification] if address_verification else [],
             )
         )
         action_number += 1
@@ -324,7 +320,11 @@ def _build_record(
         )
         usable_llm_address = usable_address_review(verification) if verification else None
         verification_reason = (
-            None if usable_llm_address else verification.action_reason() if verification else None
+            None
+            if usable_llm_address
+            else verification.action_reason()
+            if verification
+            else None
         )
         add(
             "address",
@@ -363,6 +363,7 @@ def _build_record(
             source_fields=[f"opening_hours[{opening_hours.index}]"],
         )
 
+    actions = _group_collection_actions(actions)
     return FactApiRecord(
         court_slug=submission.court_slug or "unknown-court",
         court_id=court_id,
@@ -371,6 +372,72 @@ def _build_record(
         readiness=_record_readiness(actions),
         actions=actions,
     )
+
+
+_COLLECTION_RESOURCES = {"address", "contact_detail", "court_opening_hours"}
+
+
+def _group_collection_actions(actions: list[FactApiAction]) -> list[FactApiAction]:
+    """Represent a replaceable collection as one logical section action."""
+
+    grouped: list[FactApiAction] = []
+    by_resource: dict[str, FactApiAction] = {}
+    for action in actions:
+        if action.resource not in _COLLECTION_RESOURCES:
+            grouped.append(action)
+            continue
+        existing = by_resource.get(action.resource)
+        if existing is None:
+            by_resource[action.resource] = action
+            grouped.append(action)
+            continue
+        existing.proposed_items.extend(action.proposed_items or [action.body])
+        existing.source_fields = sorted(set(existing.source_fields + action.source_fields))
+        existing.llm_review_ids = sorted(set(existing.llm_review_ids + action.llm_review_ids))
+        existing.address_verifications.extend(action.address_verifications)
+        existing.request_body_normalisations.update(action.request_body_normalisations)
+        existing.migration_assumptions.extend(action.migration_assumptions)
+        existing.reason = _combine_reasons(existing.reason, action.reason)
+        if action.readiness == "pending":
+            existing.readiness = "pending"
+    return grouped
+
+
+def _merge_duplicate_records(records: list[FactApiRecord]) -> list[FactApiRecord]:
+    """Keep duplicate submissions reviewable while requiring one source owner."""
+
+    grouped: dict[str, list[FactApiRecord]] = {}
+    order: list[str] = []
+    for record in records:
+        if record.court_slug not in grouped:
+            grouped[record.court_slug] = []
+            order.append(record.court_slug)
+        grouped[record.court_slug].append(record)
+
+    merged: list[FactApiRecord] = []
+    for slug in order:
+        candidates = grouped[slug]
+        if len(candidates) == 1:
+            merged.append(candidates[0])
+            continue
+        rows = sorted(row for candidate in candidates for row in candidate.source_row_numbers)
+        actions: list[FactApiAction] = []
+        for candidate in candidates:
+            for action in candidate.actions:
+                action.source_selection_required = True
+                action.action_id = f"{slug}-row-{action.source_row_number}-{action.resource}"
+                actions.append(action)
+        merged.append(
+            FactApiRecord(
+                court_slug=slug,
+                court_id=next((candidate.court_id for candidate in candidates if candidate.court_id), None),
+                source_row_numbers=rows,
+                status="needs_human_review",
+                readiness=_record_readiness(actions),
+                actions=actions,
+            )
+        )
+    return merged
 
 
 def _building_facilities_body(facilities: dict[str, Any]) -> dict[str, Any]:

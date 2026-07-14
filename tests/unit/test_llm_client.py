@@ -69,9 +69,10 @@ def test_normalise_fields_with_llm_uses_structured_json_output(monkeypatch):
                     {
                         "record_id": "llm-test-record",
                         "normalised_fields": [
-                            {
-                                "field": "facilities.accessible_toilet_description",
-                                "value": "Disabled toilet near reception. Ask security for access.",
+                                {
+                                    "field": "facilities.accessible_toilet_description",
+                                    "operation": "set",
+                                    "value": "Disabled toilet near reception. Ask security for access.",
                                 "confidence": "medium",
                                 "needs_human_review": True,
                                 "reason": "Mentions asking security, so review is required.",
@@ -109,6 +110,11 @@ def test_normalise_fields_with_llm_uses_structured_json_output(monkeypatch):
     assert "temperature" not in calls[0]
     assert calls[0]["text"]["format"]["type"] == "json_schema"
     assert "accessible_toilet_description" in calls[0]["input"]
+    prompt = str(calls[0]["input"])
+    assert "Available on the ground floor." in prompt
+    assert "Available on the ground, first and third floors." in prompt
+    assert "National Contact Centre for Civil and Family Court" in prompt
+    assert "operation 'clear'" in prompt
 
 
 def test_llm_response_schema_requires_every_object_property_for_azure():
@@ -117,6 +123,8 @@ def test_llm_response_schema_requires_every_object_property_for_azure():
     assert set(schema["properties"]) == set(schema["required"])
     address_match = schema["$defs"]["LlmAddressMatch"]
     assert set(address_match["properties"]) == set(address_match["required"])
+    normalised_field = schema["$defs"]["LlmNormalisedField"]
+    assert "operation" in normalised_field["required"]
 
 
 def test_normalise_fields_with_llm_requires_openai_config(monkeypatch):

@@ -27,11 +27,14 @@
       "llm": {
         "enabled": true,
         "purpose": "public_text_normalisation",
-        "rules": [
-          "Make the text suitable for public display.",
-          "Preserve factual location information.",
-          "Preserve accessible toilet information.",
-          "Do not invent floors, rooms, entrances, routes or availability.",
+      "rules": [
+        "Make the text suitable for public display.",
+        "Preserve factual location information.",
+        "Preserve accessible toilet information.",
+        "For a simple floor location, begin with 'Available on'. For example, 'Ground floor' becomes 'Available on the ground floor.'.",
+        "Use the UCD multi-floor style: 'Available on the ground, first and third floors.'.",
+        "Do not prefix the result with 'Accessible toilets are' when the field label already supplies that context.",
+        "Do not invent floors, rooms, entrances, routes or availability.",
           "If the answer is vague, contradictory, or only says to ask staff/security, flag for human review."
         ]
       }
@@ -308,10 +311,14 @@
       "llm": {
         "enabled": true,
         "purpose": "public_text_normalisation",
-        "rules": [
-          "Make the text suitable for public display.",
-          "Preserve the meaning of the contact explanation.",
-          "Do not invent services, eligibility, phone numbers or email addresses.",
+      "rules": [
+        "Make the text suitable for public display.",
+        "Preserve the meaning of the contact explanation.",
+        "Remove days, opening times and closing times because those belong in the structured opening-hours fields.",
+        "If removing the schedule leaves only a generic contact-centre label or no useful public explanation, use operation 'clear' with value null.",
+        "For example, 'National Contact Centre for Civil and Family Court, Monday to Thursday 9am to 5pm, Friday 9am to 4:30pm' must be cleared because no useful explanation remains.",
+        "This optional field is explicitly allowed to use operation 'clear'.",
+        "Do not invent services, eligibility, phone numbers or email addresses.",
           "Flag vague or contradictory text for human review."
         ]
       }

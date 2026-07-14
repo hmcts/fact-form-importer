@@ -219,7 +219,7 @@ def process_workbook(
             source_name=source_name or input_path.name,
             summary=output_result.summary,
         )
-        LlmApprovalStore(output_root).reconcile_address_policy(
+        LlmApprovalStore(output_root).reconcile_policies(
             run_id, llm_actions_review, readiness_report
         )
         return ProcessingResult(

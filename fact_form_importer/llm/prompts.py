@@ -23,8 +23,12 @@ submitted address fields consistently identify one supplied candidate. Still
 return null or require review when non-line_1 details conflict, more than one
 candidate remains plausible, or a match would require inventing information.
 Return one normalised_fields item for every selected field. If no safe value can
-be returned, set that field's value to null and set its needs_human_review flag
-appropriately. Put field uncertainty on that field, not only on the aggregate
+be returned, use operation "unresolved", set that field's value to null, and
+set its needs_human_review flag appropriately. Use operation "set" for a
+non-null replacement. Operation "clear" is allowed only where the supplied
+field rules explicitly permit removing an optional value; it must have a null
+value and must mean the source value should deliberately become not supplied.
+Put field uncertainty on that field, not only on the aggregate
 response. Address-candidate ambiguity belongs in address_matches, not in the
 aggregate response-level review flag.
 """

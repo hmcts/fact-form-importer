@@ -1,20 +1,35 @@
 {% extends "base.html" %}
 {% block content %}
+{% macro review_context() -%}
+  <input type="hidden" name="review_status" value="{{ status or '' }}">
+  <input type="hidden" name="review_confidence" value="{{ confidence or '' }}">
+  <input type="hidden" name="review_query" value="{{ query }}">
+  <input type="hidden" name="review_queue" value="{{ queue or '' }}">
+  <input type="hidden" name="field_page" value="{{ field_page }}">
+  <input type="hidden" name="address_page" value="{{ address_page }}">
+{%- endmacro %}
+{% macro blockers(item) -%}
+  {% for blocker in item.planning_blockers %}<p class="error">{{ blocker.message }}</p><details><summary>Technical details</summary><pre>{{ blocker.technical_detail }}</pre></details>{% endfor %}
+{%- endmacro %}
 <h1>LLM Actions Review: {{ archive.manifest.run_id }}</h1>
 <nav>
   <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
   <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">All records</a>
   <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Execution summary</a>
+  <a href="{{ url_for('review_overview', run_id=archive.manifest.run_id) }}">Review overview</a>
+  <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">API changes review</a>
 </nav>
 <p>Approve each usable model-derived value before a dependent FaCT API action can run. Approval records the decision only; it never sends an API request.</p>
+{% if approval_complete %}<p class="success" tabindex="-1" autofocus>All matching review decisions are complete.</p>{% endif %}
 {% if review.derived_from_legacy_archive %}<p class="muted">This page was reconstructed from a legacy archive. Some model confidence and reason details were not stored by that run.</p>{% endif %}
 <div class="summary">
-  {% for label, value in [('Actionable results', review.approval_counts.total), ('Pending approval', review.approval_counts.pending), ('Automatically approved addresses', review.approval_counts.auto_approved), ('Manually approved results', review.approval_counts.manual_approved), ('Already executed', review.approval_counts.already_executed), ('Read-only outcomes', review.approval_counts.not_actionable)] %}
+  {% for label, value in [('Reviewable results', review.approval_counts.reviewable_total), ('Review decisions pending', review.approval_counts.review_pending), ('Execution dependencies pending', review.approval_counts.pending), ('Automatically approved results', review.approval_counts.auto_approved_total), ('Automatically approved addresses', review.approval_counts.auto_approved_addresses), ('Automatically approved unchanged fields', review.approval_counts.auto_approved_unchanged_fields), ('Manually approved results', review.approval_counts.manual_approved), ('Already executed', review.approval_counts.already_executed)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
 
 <form method="get">
+  {% if queue %}<input type="hidden" name="queue" value="{{ queue }}"><p><strong>Work queue:</strong> LLM approvals · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status=status) }}">Clear queue</a></p>{% endif %}
   <label for="q">Court, row, or field</label>
   <input id="q" name="q" value="{{ query }}">
   <label for="status">Approval status</label>
@@ -25,6 +40,14 @@
     <option value="already_executed"{% if status == 'already_executed' %} selected{% endif %}>Already executed</option>
     <option value="not_actionable"{% if status == 'not_actionable' %} selected{% endif %}>Read-only</option>
   </select>
+  <label for="confidence">Confidence</label>
+  <select id="confidence" name="confidence">
+    <option value=""{% if not confidence %} selected{% endif %}>All confidence levels</option>
+    <option value="high"{% if confidence == 'high' %} selected{% endif %}>High</option>
+    <option value="medium"{% if confidence == 'medium' %} selected{% endif %}>Medium</option>
+    <option value="low"{% if confidence == 'low' %} selected{% endif %}>Low</option>
+    <option value="unavailable"{% if confidence == 'unavailable' %} selected{% endif %}>Unavailable</option>
+  </select>
   <button type="submit" class="secondary">Filter</button>
 </form>
 
@@ -32,31 +55,31 @@
 <table>
   <thead><tr><th>Record</th><th>Field and input</th><th>LLM outcome</th><th>Dependent API actions</th><th>Approval</th></tr></thead>
   <tbody>{% for item in fields %}
-    <tr>
+    <tr id="review-{{ item.review_id }}" class="review-row">
       <td><a href="{{ url_for('record_detail', run_id=archive.manifest.run_id, source_row_number=item.source_row_number) }}">Row {{ item.source_row_number }}</a><br>{{ item.court_slug }}</td>
-      <td><code>{{ item.field }}</code><details><summary>Raw source values</summary><pre>{{ item.source_raw_values | tojson(indent=2) }}</pre></details><details><summary>Exact LLM input</summary><pre>{{ item.llm_input | tojson(indent=2) }}</pre></details></td>
-      <td><code>{{ item.outcome }}</code><br>Confidence: {{ item.model_result.confidence }}{% if item.model_result.needs_human_review %}<br><strong>Model requested review</strong>{% endif %}<details open><summary>Result</summary><pre>{{ item.model_result.value | tojson(indent=2) }}</pre></details><p>{{ item.model_result.reason }}</p></td>
-      <td>{% for action in item.dependent_actions %}<code>{{ action.action_id }}</code><br>{{ action.resource }} · <strong>{{ action.status }}</strong>{% if not loop.last %}<hr>{% endif %}{% else %}<span class="muted">No API action was planned because the record has other blockers or no request body.</span>{% endfor %}</td>
-      <td>{% if item.approval_status == 'approved' %}<strong>{% if item.approval_method == 'policy' %}Automatically approved{% else %}Manually approved{% endif %}</strong><br><small>{{ item.approved_at }}</small>{% if item.approval_method == 'policy' %}<br><small>{{ item.approval_policy_version }}<br>{{ item.approval_rationale }}</small>{% endif %}{% elif item.approval_status == 'already_executed' %}<span class="muted">Action already succeeded before this approval gate.</span>{% elif item.approval_status == 'pending' %}<form method="post" action="{{ url_for('approve_llm_action', run_id=archive.manifest.run_id, review_id=item.review_id) }}" onsubmit="return confirm('Approve this LLM result for its dependent API action? This does not execute the action.');"><button type="submit">Approve</button></form>{% else %}<span class="muted">Read-only</span>{% endif %}</td>
+      <td><code>{{ item.field }}</code><p><span class="tag tag-{{ item.comparison_summary.tag }}">{{ item.comparison_summary.tag | replace('_', ' ') }}</span></p><div class="before-after"><div><strong>Submitted</strong><br>{% if item.comparison_summary.before is none %}Not supplied{% else %}{% for part in item.comparison_summary.before_parts %}{% if part.changed %}<mark class="diff-removed">{{ part.text }}</mark>{% else %}{{ part.text }}{% endif %}{% endfor %}{% endif %}</div><div><strong>Proposed</strong><br>{% if item.comparison_summary.after is none %}Not supplied{% else %}{% for part in item.comparison_summary.after_parts %}{% if part.changed %}<mark class="diff-added">{{ part.text }}</mark>{% else %}{{ part.text }}{% endif %}{% endfor %}{% endif %}</div></div><details><summary>Raw source values</summary><pre>{{ item.source_raw_values | tojson(indent=2) }}</pre></details><details><summary>Exact LLM input</summary><pre>{{ (item.llm_request or item.llm_input) | tojson(indent=2) }}</pre></details></td>
+      <td><code>{{ item.outcome }}</code><br>Operation: <strong>{{ item.model_result.operation or 'legacy set/unresolved' }}</strong><br>Confidence: {{ item.model_result.confidence }}{% if item.model_result.needs_human_review %}<br><strong>Model requested review</strong>{% endif %}<details open><summary>Result</summary><pre>{{ item.model_result.value | tojson(indent=2) }}</pre></details><p>{{ item.model_result.reason }}</p></td>
+      <td>{% for action in item.dependent_actions %}<code>{{ action.action_id }}</code><br>{{ action.resource }} · <strong>{{ action.status }}</strong>{% if action.reason %}<p>{{ action.reason }}</p>{% endif %}{% if not loop.last %}<hr>{% endif %}{% else %}{{ blockers(item) }}{% endfor %}</td>
+      <td>{% if item.approval_status == 'approved' %}<strong>{% if item.approval_method == 'policy' %}Automatically approved{% else %}Manually approved{% endif %}</strong><br><small>{{ item.approved_at }}</small>{% if item.approval_method == 'policy' %}<br><small>{{ item.approval_policy_version }}<br>{{ item.approval_rationale }}</small>{% endif %}{% elif item.approval_status == 'already_executed' %}<span class="muted">Action already succeeded before this approval gate.</span>{% elif item.approval_status == 'pending' %}<form method="post" action="{{ url_for('approve_llm_action', run_id=archive.manifest.run_id, review_id=item.review_id) }}">{{ review_context() }}<button type="submit">Approve and continue</button></form>{% else %}<span class="muted">Read-only</span>{% endif %}</td>
     </tr>
   {% else %}<tr><td colspan="5">No field results match this filter.</td></tr>{% endfor %}</tbody>
 </table>
-{% if field_pages > 1 %}<p>Field page {{ field_page }} of {{ field_pages }}{% if field_page > 1 %} · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=query, status=status, field_page=field_page-1, address_page=address_page) }}">Previous fields</a>{% endif %}{% if field_page < field_pages %} · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=query, status=status, field_page=field_page+1, address_page=address_page) }}">Next fields</a>{% endif %}</p>{% endif %}
+{% if field_pages > 1 %}<p>Field page {{ field_page }} of {{ field_pages }}{% if field_page > 1 %} · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=query, status=status, confidence=confidence, queue=queue, field_page=field_page-1, address_page=address_page) }}">Previous fields</a>{% endif %}{% if field_page < field_pages %} · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=query, status=status, confidence=confidence, queue=queue, field_page=field_page+1, address_page=address_page) }}">Next fields</a>{% endif %}</p>{% endif %}
 
 <h2>Addresses</h2>
-<p class="muted">The submitted first address line is treated as a weaker signal. Approval uses the displayed OS-to-FaCT mapping, not the submitted address, and execution rechecks the selected UPRN.</p>
+<p class="muted">The submitted first address line is treated as a weaker signal. Address approval uses the displayed OS-to-FaCT mapping and execution rechecks the selected UPRN. PO Box addresses follow these same rules.</p>
 <table>
   <thead><tr><th>Record</th><th>Submitted address</th><th>OS values supplied to the LLM</th><th>LLM choice and proposed address</th><th>API action</th><th>Approval</th></tr></thead>
   <tbody>{% for item in addresses %}
-    <tr>
+    <tr id="review-{{ item.review_id }}" class="review-row">
       <td><a href="{{ url_for('record_detail', run_id=archive.manifest.run_id, source_row_number=item.source_row_number) }}">Row {{ item.source_row_number }}</a><br>{{ item.court_slug }}<br>Address {{ item.address_index }}</td>
       <td><details open><summary>Structured submitted value</summary><pre>{{ item.submitted_address | tojson(indent=2) }}</pre></details><details><summary>Raw source values</summary><pre>{{ item.source_raw_values | tojson(indent=2) }}</pre></details></td>
-      <td><details open><summary>{{ item.llm_input.candidates | length }} candidate(s)</summary><pre>{{ item.llm_input.candidates | tojson(indent=2) }}</pre></details><details><summary>Full OS evidence</summary><pre>{{ item.os_candidates | tojson(indent=2) }}</pre></details></td>
-      <td><code>{{ item.outcome }}</code><br>UPRN: {{ item.model_result.uprn or 'No selection' }}<br>Confidence: {{ item.model_result.confidence }}{% if item.model_result.needs_human_review %}<br><strong>Model requested review</strong>{% endif %}<p>{{ item.model_result.reason }}</p>{% if item.selected_candidate %}<details><summary>Selected OS candidate</summary><pre>{{ item.selected_candidate | tojson(indent=2) }}</pre></details>{% endif %}{% if item.proposed_address %}<details open><summary>Address that approval will send</summary><pre>{{ item.proposed_address | tojson(indent=2) }}</pre></details>{% endif %}</td>
-      <td>{% for action in item.dependent_actions %}<code>{{ action.action_id }}</code><br>{{ action.resource }} · <strong>{{ action.status }}</strong>{% else %}<span class="muted">No address action was planned because the record has other blockers.</span>{% endfor %}</td>
-      <td>{% if item.approval_status == 'approved' %}<strong>{% if item.approval_method == 'policy' %}Automatically approved{% else %}Manually approved{% endif %}</strong><br><small>{{ item.approved_at }}</small>{% if item.approval_method == 'policy' %}<br><small>{{ item.approval_policy_version }}<br>{{ item.approval_rationale }}</small>{% endif %}{% elif item.approval_status == 'already_executed' %}<span class="muted">Action already succeeded before this approval gate.</span>{% elif item.approval_status == 'pending' %}<form method="post" action="{{ url_for('approve_llm_action', run_id=archive.manifest.run_id, review_id=item.review_id) }}" onsubmit="return confirm('Approve this OS address mapping? This does not execute the API action.');"><button type="submit">Approve</button></form>{% else %}<span class="muted">Read-only</span>{% endif %}</td>
+      <td><details open><summary>{{ item.llm_input.candidates | length }} candidate(s)</summary><pre>{{ item.llm_input.candidates | tojson(indent=2) }}</pre></details><details><summary>Full OS evidence</summary><pre>{{ item.os_candidates | tojson(indent=2) }}</pre></details>{% if item.llm_request %}<details><summary>Exact LLM request</summary><pre>{{ item.llm_request | tojson(indent=2) }}</pre></details>{% endif %}</td>
+      <td><span class="tag tag-{{ item.comparison_summary.tag }}">{{ item.comparison_summary.tag | replace('_', ' ') }}</span><br><code>{{ item.outcome }}</code><br>UPRN: {{ item.model_result.uprn or 'No selection' }}<br>Confidence: {{ item.model_result.confidence }}{% if item.model_result.needs_human_review %}<br><strong>Model requested review</strong>{% endif %}<p>{{ item.model_result.reason }}</p>{% if item.comparison_summary.components %}<table class="compact"><thead><tr><th>Component</th><th>Submitted</th><th>Proposed</th></tr></thead><tbody>{% for difference in item.comparison_summary.components %}<tr><td>{{ difference.field }}{% if difference.weaker_signal %}<br><span class="muted">weaker matching signal</span>{% endif %}</td><td>{{ difference.before or 'Not supplied' }}</td><td>{{ difference.after or 'Not supplied' }}</td></tr>{% endfor %}</tbody></table>{% endif %}{% if item.selected_candidate %}<details><summary>Selected OS candidate</summary><pre>{{ item.selected_candidate | tojson(indent=2) }}</pre></details>{% endif %}{% if item.proposed_address %}<details open><summary>Address that approval will send</summary>{% if item.address_editable %}<label for="line1-{{ item.review_id }}">Address line 1</label><input id="line1-{{ item.review_id }}" form="approve-{{ item.review_id }}" name="addressLine1" value="{{ item.api_body_patch.addressLine1 or '' }}" required><label for="line2-{{ item.review_id }}">Address line 2</label><input id="line2-{{ item.review_id }}" form="approve-{{ item.review_id }}" name="addressLine2" value="{{ item.api_body_patch.addressLine2 or '' }}"><label for="town-{{ item.review_id }}">Town or city</label><input id="town-{{ item.review_id }}" form="approve-{{ item.review_id }}" name="townCity" value="{{ item.api_body_patch.townCity or '' }}" required><label for="county-{{ item.review_id }}">County</label><input id="county-{{ item.review_id }}" form="approve-{{ item.review_id }}" name="county" value="{{ item.api_body_patch.county or '' }}"><label for="postcode-{{ item.review_id }}">Postcode</label><input id="postcode-{{ item.review_id }}" form="approve-{{ item.review_id }}" name="postcode" value="{{ item.api_body_patch.postcode or '' }}" required><p class="muted">Address type, areas of law, court types and the selected UPRN remain unchanged.</p>{% else %}<pre>{{ item.proposed_address | tojson(indent=2) }}</pre>{% endif %}</details>{% endif %}</td>
+      <td>{% for action in item.dependent_actions %}<code>{{ action.action_id }}</code><br>{{ action.resource }} · <strong>{{ action.status }}</strong>{% if action.reason %}<p>{{ action.reason }}</p>{% endif %}{% else %}{{ blockers(item) }}{% endfor %}</td>
+      <td>{% if item.approval_status == 'already_executed' %}<span class="muted">Action already succeeded before this approval gate.</span>{% elif item.address_editable %}<form id="approve-{{ item.review_id }}" method="post" action="{{ url_for('approve_llm_action', run_id=archive.manifest.run_id, review_id=item.review_id) }}">{{ review_context() }}{% if item.approval_status == 'approved' %}<strong>{% if item.approval_method == 'policy' %}Automatically approved{% else %}Manually approved{% endif %}</strong><br><small>{{ item.approved_at }}</small>{% if item.approval_method == 'policy' %}<br><small>{{ item.approval_policy_version }}<br>{{ item.approval_rationale }}</small>{% endif %}<button type="submit">Save address and continue</button>{% else %}<button type="submit">Approve address and continue</button>{% endif %}</form>{% elif item.approval_status == 'approved' %}<strong>{% if item.approval_method == 'policy' %}Automatically approved{% else %}Manually approved{% endif %}</strong><br><small>{{ item.approved_at }}</small>{% if item.approval_method == 'policy' %}<br><small>{{ item.approval_policy_version }}<br>{{ item.approval_rationale }}</small>{% endif %}{% if active_execution_job %}<p class="muted">Address editing is disabled while an execution job is active.</p>{% endif %}{% else %}<span class="muted">Read-only</span>{% endif %}</td>
     </tr>
   {% else %}<tr><td colspan="6">No address results match this filter.</td></tr>{% endfor %}</tbody>
 </table>
-{% if address_pages > 1 %}<p>Address page {{ address_page }} of {{ address_pages }}{% if address_page > 1 %} · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=query, status=status, field_page=field_page, address_page=address_page-1) }}">Previous addresses</a>{% endif %}{% if address_page < address_pages %} · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=query, status=status, field_page=field_page, address_page=address_page+1) }}">Next addresses</a>{% endif %}</p>{% endif %}
+{% if address_pages > 1 %}<p>Address page {{ address_page }} of {{ address_pages }}{% if address_page > 1 %} · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=query, status=status, confidence=confidence, queue=queue, field_page=field_page, address_page=address_page-1) }}">Previous addresses</a>{% endif %}{% if address_page < address_pages %} · <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=query, status=status, confidence=confidence, queue=queue, field_page=field_page, address_page=address_page+1) }}">Next addresses</a>{% endif %}</p>{% endif %}
 {% endblock %}

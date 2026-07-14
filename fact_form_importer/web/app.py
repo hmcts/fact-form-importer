@@ -29,10 +29,14 @@ from werkzeug.utils import secure_filename
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.service import ApiExecutionService
+from fact_form_importer.execution.jobs import ExecutionJobRunner
 from fact_form_importer.ingest.column_mapping import load_column_mapping
 from fact_form_importer.output.archive import load_run_archive, list_run_archives
 from fact_form_importer.processing import ProcessingResult, process_workbook
-from fact_form_importer.validators.base import LLM_HUMAN_REVIEW_ISSUE_CODES
+from fact_form_importer.validators.base import (
+    HUMAN_REVIEW_ISSUE_CODES,
+    LLM_HUMAN_REVIEW_ISSUE_CODES,
+)
 
 PAGE_SIZE = 50
 ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
@@ -201,6 +205,9 @@ def create_app(
     app.config["EXECUTION_SERVICE"] = execution_service or ApiExecutionService(
         output_root, app.config["APP_CONFIG"]
     )
+    app.config["EXECUTION_JOB_RUNNER"] = ExecutionJobRunner(
+        output_root, app.config["EXECUTION_SERVICE"]
+    )
     app.config["JOB_RUNNER"] = LocalJobRunner(output_root, processor)
 
     @app.get("/")
@@ -270,6 +277,8 @@ def create_app(
             factor_summary=_run_factor_summary(archive),
             execution_summary=app.config["EXECUTION_SERVICE"].get_execution_summary(run_id),
             writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
+            execution_job=app.config["EXECUTION_JOB_RUNNER"].latest_for_run(run_id),
+            active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
         )
 
     @app.get("/runs/<run_id>/records")
@@ -277,11 +286,13 @@ def create_app(
         archive = _archive_or_404(output_root, run_id)
         submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
         status = request.args.get("status")
+        category = request.args.get("category")
         query = (request.args.get("q") or "").strip().casefold()
         filtered = [
             submission
             for submission in submissions
             if (not status or submission.get("status") == status)
+            and (not category or _submission_has_review_category(submission, category))
             and _matches_record_query(submission, query)
         ]
         ledger = app.config["EXECUTION_SERVICE"].get_ledger(run_id)
@@ -294,6 +305,7 @@ def create_app(
             archive=archive,
             records=records_page,
             status=status,
+            category=category,
             query=query,
             page=page,
             pages=pages,
@@ -313,7 +325,7 @@ def create_app(
         )
         if submission is None:
             abort(404)
-        manifest = _load_readiness_report(archive["path"])
+        manifest = app.config["EXECUTION_SERVICE"].get_readiness_report(run_id)
         actions = next(
             (
                 item.get("actions", [])
@@ -336,6 +348,7 @@ def create_app(
                 "evidence": _action_evidence(submission, action),
             }
             for action in actions
+            if action.get("source_row_number") in {None, source_row_number}
         ]
         return render_template(
             "record_detail.html",
@@ -344,6 +357,7 @@ def create_app(
             actions=actions,
             court_execution=court_execution,
             writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
+            active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
         )
 
     @app.get("/runs/<run_id>/issues")
@@ -372,23 +386,59 @@ def create_app(
             pages=pages,
         )
 
+    @app.get("/runs/<run_id>/review")
+    def review_overview(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        return render_template(
+            "review_overview.html",
+            archive=archive,
+            overview=_review_overview(
+                archive, app.config["EXECUTION_SERVICE"]
+            ),
+        )
+
     @app.get("/runs/<run_id>/llm-actions")
     def llm_actions_review(run_id: str):
         archive = _archive_or_404(output_root, run_id)
         payload = app.config["EXECUTION_SERVICE"].get_llm_actions_review(run_id)
         status = request.args.get("status")
+        queue = request.args.get("queue")
+        confidence = request.args.get("confidence")
+        if confidence not in {None, "", "high", "medium", "low", "unavailable"}:
+            confidence = None
         query = (request.args.get("q") or "").strip().casefold()
-        items = [
+        items = sorted(
+            [
             item
             for item in payload.get("items", [])
             if (not status or item.get("approval_status") == status)
+            and (not queue or queue == "llm")
+            and (
+                not confidence
+                or _review_confidence(item) == confidence
+            )
             and (
                 not query
                 or query in str(item.get("court_slug") or "").casefold()
                 or query in str(item.get("source_row_number") or "").casefold()
                 or query in str(item.get("field") or "").casefold()
+                or query in str(item.get("review_id") or "").casefold()
             )
-        ]
+            ],
+            key=_llm_review_sort_key,
+        )
+        active_job = app.config["EXECUTION_JOB_RUNNER"].active()
+        for item in items:
+            item["address_editable"] = bool(
+                item.get("kind") == "address"
+                and item.get("approvable", item.get("actionable"))
+                and not active_job
+                and not {
+                    action.get("status")
+                    for action in item.get("dependent_actions", [])
+                }
+                & {"running", "succeeded", "unknown"}
+            )
         field_items = [item for item in items if item.get("kind") == "field"]
         address_items = [item for item in items if item.get("kind") == "address"]
         field_page, field_pages, field_page_items = _paginate(
@@ -404,21 +454,110 @@ def create_app(
             fields=field_page_items,
             addresses=address_page_items,
             status=status,
+            queue=queue,
+            confidence=confidence or "",
             query=request.args.get("q") or "",
             field_page=field_page,
             field_pages=field_pages,
             address_page=address_page,
             address_pages=address_pages,
+            approval_complete=request.args.get("complete") == "1",
+            active_execution_job=active_job,
         )
 
     @app.post("/runs/<run_id>/llm-actions/<review_id>/approve")
     def approve_llm_action(run_id: str, review_id: str):
         _archive_or_404(output_root, run_id)
+        address_patch = None
+        if "addressLine1" in request.form:
+            address_patch = {
+                field: request.form.get(field)
+                for field in (
+                    "addressLine1",
+                    "addressLine2",
+                    "townCity",
+                    "county",
+                    "postcode",
+                )
+            }
         try:
-            app.config["EXECUTION_SERVICE"].approve_llm_review(run_id, review_id)
+            app.config["EXECUTION_SERVICE"].approve_llm_review(
+                run_id,
+                review_id,
+                address_patch=address_patch,
+                execution_job_active=bool(
+                    app.config["EXECUTION_JOB_RUNNER"].active()
+                ),
+            )
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(url_for("llm_actions_review", run_id=run_id))
+        return redirect(
+            _next_llm_review_url(
+                app.config["EXECUTION_SERVICE"], run_id, review_id, request.form
+            )
+        )
+
+    @app.get("/runs/<run_id>/api-changes")
+    def api_changes_review(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        payload = app.config["EXECUTION_SERVICE"].get_api_changes_review(run_id)
+        hold = request.args.get("hold")
+        changes = payload["changes"]
+        if hold:
+            changes = [change for change in changes if _change_has_hold(change, hold)]
+        page, pages, changes_page = _paginate(changes, request.args.get("page"))
+        return render_template(
+            "api_changes_review.html",
+            archive=archive,
+            changes=changes_page,
+            page=page,
+            pages=pages,
+            hold=hold,
+            comparison_job=app.config["EXECUTION_JOB_RUNNER"].latest_for_run(run_id),
+            active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
+        )
+
+    @app.post("/runs/<run_id>/api-changes/refresh")
+    def refresh_api_changes(run_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            job = app.config["EXECUTION_JOB_RUNNER"].start(run_id, "comparison")
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(url_for("api_changes_review", run_id=run_id, job_id=job.job_id))
+
+    @app.post("/runs/<run_id>/api-changes/<action_id>/refresh")
+    def refresh_api_change(run_id: str, action_id: str):
+        _archive_or_404(output_root, run_id)
+        court_slug = request.form.get("court_slug") or ""
+        try:
+            app.config["EXECUTION_SERVICE"].refresh_target_comparison(
+                run_id, court_slug, action_id
+            )
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(url_for("api_changes_review", run_id=run_id))
+
+    @app.post("/runs/<run_id>/api-changes/<change_id>/approve")
+    def approve_api_change(run_id: str, change_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            app.config["EXECUTION_SERVICE"].approve_target_change(run_id, change_id)
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(url_for("api_changes_review", run_id=run_id))
+
+    @app.post("/runs/<run_id>/courts/<court_slug>/select-source")
+    def select_duplicate_source(run_id: str, court_slug: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            source_row_number = int(request.form.get("source_row_number") or "")
+            app.config["EXECUTION_SERVICE"].select_source_row(
+                run_id, court_slug, source_row_number
+            )
+        except (TypeError, ValueError) as exc:
+            abort(400, str(exc))
+        return redirect(url_for("api_changes_review", run_id=run_id))
 
     @app.get("/runs/<run_id>/os-address-factors")
     def os_address_factors(run_id: str):
@@ -437,7 +576,7 @@ def create_app(
     @app.get("/runs/<run_id>/api-actions")
     def api_actions(run_id: str):
         archive = _archive_or_404(output_root, run_id)
-        manifest = _load_readiness_report(archive["path"])
+        manifest = app.config["EXECUTION_SERVICE"].get_readiness_report(run_id)
         readiness = request.args.get("readiness")
         ledger = app.config["EXECUTION_SERVICE"].get_ledger(run_id)
 
@@ -468,11 +607,28 @@ def create_app(
     @app.get("/runs/<run_id>/execution-summary")
     def execution_summary(run_id: str):
         archive = _archive_or_404(output_root, run_id)
+        requested_job = request.args.get("job_id")
+        job = (
+            app.config["EXECUTION_JOB_RUNNER"].get(requested_job)
+            if requested_job
+            else app.config["EXECUTION_JOB_RUNNER"].latest_for_run(run_id)
+        )
         return render_template(
             "execution_summary.html",
             archive=archive,
             execution_summary=app.config["EXECUTION_SERVICE"].get_execution_summary(run_id),
+            execution_job=job,
+            active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
+            writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
         )
+
+    @app.get("/execution-jobs/<job_id>/status.json")
+    def execution_job_status(job_id: str):
+        job = app.config["EXECUTION_JOB_RUNNER"].get(job_id)
+        if job is None:
+            abort(404)
+        summary = app.config["EXECUTION_SERVICE"].get_execution_summary(job.run_id)
+        return jsonify({"job": job.model_dump(mode="json"), "execution_summary": summary})
 
     @app.get("/runs/<run_id>/execution-summary.json")
     def execution_summary_json(run_id: str):
@@ -505,14 +661,12 @@ def create_app(
         if not app.config["APP_CONFIG"].fact_data_api_writes_enabled:
             abort(403, "FaCT API writes are disabled by FACT_DATA_API_WRITES_ENABLED")
         try:
-            app.config["EXECUTION_SERVICE"].execute_action(run_id, court_slug, action_id)
+            job = app.config["EXECUTION_JOB_RUNNER"].start(
+                run_id, "action", court_slug=court_slug, action_id=action_id
+            )
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(
-            url_for(
-                "record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]
-            )
-        )
+        return redirect(url_for("execution_summary", run_id=run_id, job_id=job.job_id))
 
     @app.post("/runs/<run_id>/courts/<court_slug>/execute-safe")
     def api_execute_court(run_id: str, court_slug: str):
@@ -520,14 +674,12 @@ def create_app(
         if not app.config["APP_CONFIG"].fact_data_api_writes_enabled:
             abort(403, "FaCT API writes are disabled by FACT_DATA_API_WRITES_ENABLED")
         try:
-            app.config["EXECUTION_SERVICE"].execute_safe_court_actions(run_id, court_slug)
+            job = app.config["EXECUTION_JOB_RUNNER"].start(
+                run_id, "court", court_slug=court_slug
+            )
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(
-            url_for(
-                "record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]
-            )
-        )
+        return redirect(url_for("execution_summary", run_id=run_id, job_id=job.job_id))
 
     @app.post("/runs/<run_id>/execute-safe")
     def api_execute_run(run_id: str):
@@ -535,10 +687,10 @@ def create_app(
         if not app.config["APP_CONFIG"].fact_data_api_writes_enabled:
             abort(403, "FaCT API writes are disabled by FACT_DATA_API_WRITES_ENABLED")
         try:
-            app.config["EXECUTION_SERVICE"].execute_all_safe_actions(run_id)
+            job = app.config["EXECUTION_JOB_RUNNER"].start(run_id, "run")
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(url_for("run_detail", run_id=run_id))
+        return redirect(url_for("execution_summary", run_id=run_id, job_id=job.job_id))
 
     @app.get("/runs/<run_id>/download/archive.zip")
     def download_archive(run_id: str):
@@ -659,6 +811,144 @@ def _run_factor_summary(archive: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def _review_overview(archive: dict[str, Any], service: ApiExecutionService) -> dict[str, Any]:
+    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    row_groups: dict[str, set[int]] = {}
+    row_issue_counts: dict[str, int] = {}
+    for submission in submissions:
+        if submission.get("status") != "needs_human_review":
+            continue
+        row = submission.get("source", {}).get("source_row_number")
+        if not isinstance(row, int):
+            continue
+        for issue in submission.get("issues", []):
+            if issue.get("code") not in HUMAN_REVIEW_ISSUE_CODES and issue.get("severity") != "error":
+                continue
+            category = _review_category(
+                str(issue.get("field") or ""), str(issue.get("code") or "")
+            )
+            row_groups.setdefault(category, set()).add(row)
+            row_issue_counts[category] = row_issue_counts.get(category, 0) + 1
+
+    run_id = archive["manifest"].get("run_id")
+    llm = service.get_llm_actions_review(str(run_id))
+    changes = service.get_api_changes_review(str(run_id))["changes"]
+    hold_groups: dict[str, dict[str, Any]] = {}
+
+    def add_hold(name: str, row: int | None, change_id: str) -> None:
+        group = hold_groups.setdefault(name, {"rows": set(), "items": set()})
+        if isinstance(row, int):
+            group["rows"].add(row)
+        group["items"].add(change_id)
+
+    for item in llm.get("items", []):
+        if item.get("approval_status") == "pending" and item.get("actionable"):
+            add_hold("llm_approval", item.get("source_row_number"), str(item.get("review_id")))
+    for change in changes:
+        row = change.get("source_row_number")
+        change_id = str(change.get("change_id"))
+        if change.get("source_selection_required") and not change.get(
+            "selected_source_row_number"
+        ):
+            add_hold("source_selection", row, change_id)
+        comparison = change.get("comparison")
+        if comparison is None:
+            add_hold("target_not_checked", row, change_id)
+        elif comparison.get("has_existing_data") and not comparison.get("is_no_change") and not change.get("target_approved"):
+            add_hold("target_replacement", row, change_id)
+        if change.get("action", {}).get("readiness") == "pending":
+            reason = str(change.get("action", {}).get("reason") or "")
+            add_hold("os_resolution" if "Address verification" in reason else "invalid_request", row, change_id)
+        if change.get("execution_status") in {"blocked", "failed", "unknown"}:
+            add_hold("execution_attention", row, change_id)
+
+    return {
+        "needs_review_rows": sum(
+            submission.get("status") == "needs_human_review" for submission in submissions
+        ),
+        "row_categories": [
+            {
+                "code": category,
+                "label": category.replace("_", " ").title(),
+                "row_count": len(rows),
+                "issue_count": row_issue_counts.get(category, 0),
+            }
+            for category, rows in sorted(row_groups.items(), key=lambda item: (-len(item[1]), item[0]))
+        ],
+        "hold_categories": [
+            {
+                "code": category,
+                "label": category.replace("_", " ").title(),
+                "row_count": len(values["rows"]),
+                "item_count": len(values["items"]),
+            }
+            for category, values in sorted(
+                hold_groups.items(), key=lambda item: (-len(item[1]["items"]), item[0])
+            )
+        ],
+    }
+
+
+def _review_category(field: str, code: str = "") -> str:
+    if "DUPLICATE" in code or code == "COURT_SLUG_NOT_FOUND":
+        return "court_identity_duplicates"
+    root = field.split("[", 1)[0].split(".", 1)[0]
+    return {
+        "court_slug": "court_identity_duplicates",
+        "addresses": "addresses",
+        "contacts": "contacts",
+        "facilities": "facilities_accessibility",
+        "counter_service": "counter_service",
+        "opening_hours": "opening_hours",
+    }.get(root, "other")
+
+
+def _submission_has_review_category(
+    submission: dict[str, Any], category: str
+) -> bool:
+    return any(
+        _review_category(str(issue.get("field") or ""), str(issue.get("code") or ""))
+        == category
+        and (
+            issue.get("code") in HUMAN_REVIEW_ISSUE_CODES
+            or issue.get("severity") == "error"
+        )
+        for issue in submission.get("issues", [])
+    )
+
+
+def _change_has_hold(change: dict[str, Any], hold: str) -> bool:
+    comparison = change.get("comparison")
+    if hold == "source_selection":
+        return bool(
+            change.get("source_selection_required")
+            and not change.get("selected_source_row_number")
+        )
+    if hold == "target_not_checked":
+        return comparison is None
+    if hold == "target_replacement":
+        return bool(
+            comparison
+            and comparison.get("has_existing_data")
+            and not comparison.get("is_no_change")
+            and not change.get("target_approved")
+        )
+    if hold == "invalid_request":
+        reason = str(change.get("action", {}).get("reason") or "")
+        return (
+            change.get("action", {}).get("readiness") == "pending"
+            and "Address verification" not in reason
+        )
+    if hold == "os_resolution":
+        return (
+            change.get("action", {}).get("readiness") == "pending"
+            and "Address verification" in str(change.get("action", {}).get("reason") or "")
+        )
+    if hold == "execution_attention":
+        return change.get("execution_status") in {"blocked", "failed", "unknown"}
+    return True
+
+
 def _llm_review_factors(archive: dict[str, Any]) -> list[dict[str, Any]]:
     """Return model-specific factors that directly hold a row for review."""
 
@@ -773,6 +1063,111 @@ def _paginate(items: list[Any], page_value: str | None) -> tuple[int, int, list[
     page = min(page, pages)
     start = (page - 1) * PAGE_SIZE
     return page, pages, items[start : start + PAGE_SIZE]
+
+
+def _review_confidence(item: dict[str, Any]) -> str:
+    confidence = (item.get("model_result") or {}).get("confidence")
+    return confidence if confidence in {"high", "medium", "low"} else "unavailable"
+
+
+def _llm_review_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    rank = {"high": 0, "medium": 1, "low": 2, "unavailable": 3}
+    return (
+        rank[_review_confidence(item)],
+        int(item.get("source_row_number") or 0),
+        str(item.get("field") or ""),
+        str(item.get("review_id") or ""),
+    )
+
+
+def _next_llm_review_url(
+    service: ApiExecutionService,
+    run_id: str,
+    current_review_id: str,
+    form: Any,
+) -> str:
+    """Return to the next matching pending decision without accepting an arbitrary URL."""
+
+    status = str(form.get("review_status") or "")
+    confidence = str(form.get("review_confidence") or "")
+    query = str(form.get("review_query") or "")
+    queue = str(form.get("review_queue") or "")
+    folded_query = query.strip().casefold()
+    payload = service.get_llm_actions_review(run_id)
+    matching = sorted(
+        [
+            item
+            for item in payload.get("items", [])
+            if (not confidence or _review_confidence(item) == confidence)
+            and (
+                not folded_query
+                or folded_query in str(item.get("court_slug") or "").casefold()
+                or folded_query in str(item.get("source_row_number") or "").casefold()
+                or folded_query in str(item.get("field") or "").casefold()
+                or folded_query in str(item.get("review_id") or "").casefold()
+            )
+        ],
+        key=_llm_review_sort_key,
+    )
+    ordered = [item for item in matching if item.get("kind") == "field"] + [
+        item for item in matching if item.get("kind") == "address"
+    ]
+    current_index = next(
+        (
+            index
+            for index, item in enumerate(ordered)
+            if item.get("review_id") == current_review_id
+        ),
+        -1,
+    )
+    search_order = ordered[current_index + 1 :] + ordered[: current_index + 1]
+    next_item = (
+        next(
+            (item for item in search_order if item.get("approval_status") == "pending"),
+            None,
+        )
+        if status in {"", "pending"}
+        else None
+    )
+    params = {
+        "run_id": run_id,
+        "status": status or None,
+        "confidence": confidence or None,
+        "q": query or None,
+        "queue": queue or None,
+        "field_page": form.get("field_page") or 1,
+        "address_page": form.get("address_page") or 1,
+    }
+    if next_item is None:
+        return url_for(
+            "llm_actions_review",
+            **params,
+            complete=1 if status in {"", "pending"} else None,
+            _anchor=(
+                f"review-{current_review_id}"
+                if status not in {"", "pending"}
+                else None
+            ),
+        )
+
+    visible = [
+        item
+        for item in matching
+        if not status or item.get("approval_status") == status
+    ]
+    section = str(next_item.get("kind") or "field")
+    section_items = [item for item in visible if item.get("kind") == section]
+    target_index = next(
+        index
+        for index, item in enumerate(section_items)
+        if item.get("review_id") == next_item.get("review_id")
+    )
+    params[f"{section}_page"] = target_index // PAGE_SIZE + 1
+    return url_for(
+        "llm_actions_review",
+        **params,
+        _anchor=f"review-{next_item['review_id']}",
+    )
 
 
 def _action_execution_status(ledger, court_slug: str | None, action_id: str | None) -> str:

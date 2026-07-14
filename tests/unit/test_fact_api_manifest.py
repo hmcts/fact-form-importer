@@ -110,7 +110,7 @@ def test_manifest_builds_ready_actions_with_preflight_and_source_evidence():
     assert manifest.summary["api_manifest_pending_action_count"] == 0
 
 
-def test_manifest_marks_invalid_api_text_and_missing_court_uuid_as_pending():
+def test_manifest_marks_invalid_api_text_pending_and_resolves_court_uuid_at_execution():
     submission = CourtSubmission(
         source=SourceMetadata(source_row_number=2),
         court_slug="example-court",
@@ -122,7 +122,8 @@ def test_manifest_marks_invalid_api_text_and_missing_court_uuid_as_pending():
 
     action = manifest.records[0].actions[0]
     assert action.readiness == "pending"
-    assert "UUID" in action.reason
+    assert "UUID" not in action.reason
+    assert action.body["courtId"] == "{court_id}"
     assert "characters rejected" in action.reason
 
 
@@ -234,6 +235,99 @@ def test_manifest_turns_usable_llm_address_selection_into_an_approval_dependency
     assert action.llm_review_ids
 
 
+def test_manifest_plans_a_valid_section_despite_an_unrelated_source_error():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="needs_human_review",
+        addresses=[
+            Address(
+                index=1,
+                address_type="Visit",
+                line_1="1 Main Street",
+                town_or_city="London",
+                postcode="SW1A 1AA",
+            )
+        ],
+        issues=[
+            Issue(
+                field="contacts[1].email",
+                code="INVALID_EMAIL",
+                severity="error",
+                message="Contact email is invalid",
+            )
+        ],
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+
+    assert [action.resource for action in manifest.records[0].actions] == ["address"]
+    assert manifest.records[0].actions[0].readiness == "ready"
+
+
+def test_duplicate_court_rows_have_provisional_actions_pending_source_selection():
+    submissions = [
+        CourtSubmission(
+            source=SourceMetadata(source_row_number=row),
+            court_slug="duplicate-court",
+            contacts=[ContactDetail(index=1, description="Enquiries", phone=f"020 7000 000{row}")],
+        )
+        for row in (2, 3)
+    ]
+
+    manifest = build_fact_api_import_manifest(
+        submissions,
+        "run-1",
+        _vocabularies(),
+        lambda slug: CourtReference("court-id", slug),
+    ).manifest
+
+    record = manifest.records[0]
+    assert record.source_row_numbers == [2, 3]
+    assert len(record.actions) == 2
+    assert all(action.source_selection_required for action in record.actions)
+    assert {action.source_row_number for action in record.actions} == {2, 3}
+
+
+def test_po_box_address_has_no_special_manual_value_dependency():
+    address = Address(
+        index=1,
+        address_type="Visit",
+        line_1="PO Box 12",
+        town_or_city="London",
+        postcode="SW1A 1AA",
+    )
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=4),
+        court_slug="example-court",
+        addresses=[address],
+    )
+    verification = AddressVerification(
+        source_row_number=4,
+        court_slug="example-court",
+        address_index=1,
+        postcode="SW1A 1AA",
+        status="unavailable",
+        message="Address lookup is temporarily unavailable",
+        original_address=address.model_dump(mode="json"),
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission],
+        "run-1",
+        _vocabularies(),
+        lambda slug: CourtReference("court-id", slug),
+        AddressVerificationBatch(enabled=True, verifications=[verification]),
+    ).manifest
+
+    action = manifest.records[0].actions[0]
+    assert action.readiness == "ready"
+    assert action.llm_review_ids == []
+    assert action.body["addressLine1"] == "PO Box 12"
+
+
 def test_manifest_omits_professional_information_without_form_evidence():
     submission = CourtSubmission(
         source=SourceMetadata(source_row_number=2),
@@ -250,7 +344,7 @@ def test_manifest_omits_professional_information_without_form_evidence():
         [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
     ).manifest
 
-    assert [action.resource for action in manifest.records[0].actions] == []
+    assert manifest.records == []
 
 
 def test_manifest_keeps_unknown_child_values_pending_and_supports_weekday_times():

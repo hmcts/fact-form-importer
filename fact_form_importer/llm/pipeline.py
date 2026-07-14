@@ -163,6 +163,7 @@ def normalise_submissions_with_llm(
 
     for prepared, outcome in zip(prepared_calls, outcomes):
         submission = prepared.submission
+        review_start = len(review_items)
         metrics.calls += outcome.calls
         metrics.retries += outcome.retries
 
@@ -185,12 +186,14 @@ def normalise_submissions_with_llm(
                         submission,
                         field,
                         value=None,
+                        operation="unresolved",
                         confidence="unavailable",
                         needs_human_review=True,
                         reason=f"LLM request failed ({type(outcome.error).__name__})",
                         outcome="failed",
                     )
                 )
+            _attach_exact_request(review_items[review_start:], prepared.request)
             continue
 
         if outcome.response is None:
@@ -205,6 +208,7 @@ def normalise_submissions_with_llm(
             metrics=metrics,
             review_items=review_items,
         )
+        _attach_exact_request(review_items[review_start:], prepared.request)
 
     return LlmNormalisationResult(
         submissions=submissions, metrics=metrics, review_items=review_items
@@ -266,7 +270,16 @@ def apply_llm_response(
                 )
             continue
 
-        if normalised_field.value is None:
+        if normalised_field.operation == "unresolved":
+            if normalised_field.value is not None:
+                _add_llm_issue(
+                    submission,
+                    selected.field,
+                    LLM_RETURNED_INVALID_VALUE,
+                    "LLM unresolved operation must have a null value",
+                    normalised_field.value,
+                )
+                continue
             # The model must scope an unresolved selected field here rather
             # than relying on the aggregate response-level review flag.
             if normalised_field.needs_human_review:
@@ -283,12 +296,87 @@ def apply_llm_response(
                         submission,
                         selected,
                         value=None,
+                        operation="unresolved",
                         confidence=normalised_field.confidence,
                         needs_human_review=normalised_field.needs_human_review,
                         reason=normalised_field.reason,
                         outcome="no_value",
                     )
                 )
+            continue
+
+        if normalised_field.operation == "clear":
+            if (
+                selected.field.split("]", 1)[-1].lstrip(".") != "explanation"
+                or not selected.field.startswith("contacts[")
+                or normalised_field.value is not None
+                or normalised_field.needs_human_review
+            ):
+                _add_llm_issue(
+                    submission,
+                    selected.field,
+                    LLM_RETURNED_INVALID_VALUE,
+                    "LLM clear operation is not permitted for this field or response state",
+                    normalised_field.value,
+                )
+                if review_items is not None:
+                    review_items.append(
+                        _field_review_item(
+                            submission,
+                            selected,
+                            value=normalised_field.value,
+                            operation="clear",
+                            confidence=normalised_field.confidence,
+                            needs_human_review=True,
+                            reason=normalised_field.reason,
+                            outcome="rejected",
+                        )
+                    )
+                continue
+            if not _set_selected_value(submission, selected.field, None):
+                _add_llm_issue(
+                    submission,
+                    selected.field,
+                    LLM_RETURNED_UNEXPECTED_FIELD,
+                    "LLM field path could not be cleared on this submission",
+                    None,
+                )
+                continue
+            processed += 1
+            if review_items is not None:
+                review_items.append(
+                    _field_review_item(
+                        submission,
+                        selected,
+                        value=None,
+                        operation="clear",
+                        confidence=normalised_field.confidence,
+                        needs_human_review=False,
+                        reason=normalised_field.reason,
+                        outcome="accepted",
+                    )
+                )
+            add_issue_once(
+                submission,
+                Issue(
+                    field=selected.field,
+                    code=LLM_FIELD_NORMALISED,
+                    severity="info",
+                    message="LLM cleared an optional selected field",
+                    raw_value=selected.cleaned_value,
+                    cleaned_value=None,
+                ),
+            )
+            continue
+
+        if normalised_field.operation != "set" or normalised_field.value is None:
+            _add_llm_issue(
+                submission,
+                selected.field,
+                LLM_RETURNED_INVALID_VALUE,
+                "LLM set operation must have a non-null value",
+                normalised_field.value,
+            )
             continue
 
         value = _safe_value_for_field(
@@ -304,6 +392,7 @@ def apply_llm_response(
                         submission,
                         selected,
                         value=normalised_field.value,
+                        operation=normalised_field.operation,
                         confidence=normalised_field.confidence,
                         needs_human_review=True,
                         reason=normalised_field.reason,
@@ -326,6 +415,7 @@ def apply_llm_response(
                         submission,
                         selected,
                         value=normalised_field.value,
+                        operation=normalised_field.operation,
                         confidence=normalised_field.confidence,
                         needs_human_review=True,
                         reason=normalised_field.reason,
@@ -341,6 +431,7 @@ def apply_llm_response(
                     submission,
                     selected,
                     value=value,
+                    operation="set",
                     confidence=normalised_field.confidence,
                     needs_human_review=normalised_field.needs_human_review,
                     reason=normalised_field.reason,
@@ -412,6 +503,7 @@ def _field_review_item(
     selected: LlmField,
     *,
     value: object,
+    operation: str,
     confidence: str,
     needs_human_review: bool,
     reason: str,
@@ -430,12 +522,21 @@ def _field_review_item(
         },
         "model_result": {
             "value": value,
+            "operation": operation,
             "confidence": confidence,
             "needs_human_review": needs_human_review,
             "reason": reason,
         },
         "outcome": outcome,
     }
+
+
+def _attach_exact_request(
+    items: list[dict[str, object]], request: LlmNormalisationRequest
+) -> None:
+    exact_request = request.model_dump(mode="json")
+    for item in items:
+        item["llm_request"] = exact_request
 
 
 _REJECTED = object()
@@ -618,7 +719,9 @@ def _canonicalise_vocab_value(
     return canonical_values[0]
 
 
-def _set_selected_value(submission: CourtSubmission, path: str, value: str | list[str]) -> bool:
+def _set_selected_value(
+    submission: CourtSubmission, path: str, value: str | list[str] | None
+) -> bool:
     if path.startswith("facilities."):
         submission.facilities[path.removeprefix("facilities.")] = value
         return True
@@ -640,6 +743,8 @@ def _set_selected_value(submission: CourtSubmission, path: str, value: str | lis
             return False
         _, attribute = target
         if attribute not in {"description", "explanation"}:
+            return False
+        if value is None and attribute != "explanation":
             return False
         setattr(target[0], attribute, value)
         return True

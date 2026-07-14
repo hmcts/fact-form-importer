@@ -163,6 +163,10 @@ def test_approval_store_is_idempotent_and_legacy_report_is_derived(tmp_path):
                             {
                                 "action_id": "example-court-1",
                                 "source_fields": ["facilities.accessible_toilet_description"],
+                            },
+                            {
+                                "action_id": "example-court-address",
+                                "source_fields": ["addresses[1]"],
                             }
                         ],
                     }
@@ -170,10 +174,54 @@ def test_approval_store_is_idempotent_and_legacy_report_is_derived(tmp_path):
             }
         )
     )
-    (archive / "address_verification_report.json").write_text("{}")
+    (archive / "address_verification_report.json").write_text(
+        json.dumps(
+            {
+                "verifications": [
+                    {
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "address_index": 1,
+                        "postcode": "SW1A 1AA",
+                        "status": "review_required",
+                        "message": "Legacy address review",
+                        "original_address": {
+                            "index": 1,
+                            "address_type": "Visit",
+                            "line_1": "Submitted Court",
+                            "town_or_city": "London",
+                            "postcode": "SW1A 1AA",
+                        },
+                        "candidates": [
+                            {
+                                "uprn": "uprn-1",
+                                "address": "OS Court, London, SW1A 1AA",
+                                "organisation_name": "OS Court",
+                                "building_number": None,
+                                "building_name": None,
+                                "thoroughfare_name": None,
+                                "post_town": "London",
+                                "postcode": "SW1A 1AA",
+                            }
+                        ],
+                        "selected_candidate": None,
+                        "llm_suggestion": {
+                            "uprn": "uprn-1",
+                            "confidence": "high",
+                            "needs_human_review": False,
+                            "reason": "One candidate",
+                        },
+                    },
+                    {"source_row_number": "invalid"},
+                ]
+            }
+        )
+    )
 
     report = load_or_derive_llm_actions_review(archive)
 
     assert report["derived_from_legacy_archive"] is True
     assert report["items"][0]["actionable"] is True
     assert report["items"][0]["model_result"]["reason"] == "Unavailable for this legacy run"
+    assert report["items"][1]["legacy"] is True
+    assert report["items"][1]["dependent_action_ids"] == ["example-court-address"]

@@ -7,8 +7,13 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
-from fact_form_importer.execution.approvals import LlmApprovalLedger
+from fact_form_importer.execution.approvals import (
+    ADDRESS_AUTO_APPROVAL_POLICY_VERSION,
+    UNCHANGED_FIELD_AUTO_APPROVAL_POLICY_VERSION,
+    LlmApprovalLedger,
+)
 from fact_form_importer.execution.models import ExecutionLedger
+from fact_form_importer.execution.review_state import ExecutionReviewLedger, target_change_id
 
 
 _ACTION_STATUSES = (
@@ -29,7 +34,7 @@ _COURT_STATUSES = (
     "completed",
 )
 _ATTENTION_ACTION_STATUSES = {"blocked", "failed", "unknown"}
-EXECUTION_SUMMARY_VERSION = "1.4"
+EXECUTION_SUMMARY_VERSION = "1.6"
 _COURT_UUID_IN_PATH = re.compile(
     r"(?<=/courts/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/)",
     re.IGNORECASE,
@@ -53,6 +58,7 @@ def build_execution_summary(
     *,
     review_report: dict[str, Any] | None = None,
     approvals: LlmApprovalLedger | None = None,
+    execution_review: ExecutionReviewLedger | None = None,
 ) -> dict[str, Any]:
     """Return a review-safe summary of all planned court actions.
 
@@ -69,6 +75,7 @@ def build_execution_summary(
     review_report = review_report or {"items": []}
     approval_ledger = approvals or LlmApprovalLedger(run_id=run_id)
     approved_ids = set(approval_ledger.approvals)
+    review_ledger = execution_review or ExecutionReviewLedger(run_id=run_id)
 
     records = sorted(
         readiness_report.get("records", []),
@@ -80,15 +87,32 @@ def build_execution_summary(
         actions: list[dict[str, Any]] = []
 
         for action in record.get("actions", []):
+            if action.get("source_selection_required"):
+                selection = review_ledger.source_selections.get(court_slug)
+                if selection and selection.source_row_number != action.get("source_row_number"):
+                    continue
             action_id = str(action.get("action_id") or "")
             action_state = state.actions.get(action_id) if state else None
             action_status = action_state.status if action_state else "planned"
             if action_status not in {"blocked", "failed", "unknown", "running", "succeeded"}:
+                hold_codes = []
+                if action.get("source_selection_required") and not review_ledger.source_selections.get(court_slug):
+                    hold_codes.append("source_selection")
                 review_ids = _action_review_ids(action, review_report)
                 if any(review_id not in approved_ids for review_id in review_ids):
+                    hold_codes.append("value_approval")
+                comparison = review_ledger.comparisons.get(
+                    target_change_id(court_slug, action_id)
+                )
+                if comparison and comparison.has_existing_data and not comparison.is_no_change:
+                    if comparison.change_id not in review_ledger.target_approvals:
+                        hold_codes.append("target_replacement")
+                if hold_codes:
                     action_status = "awaiting_approval"
                 elif action_status == "awaiting_approval":
                     action_status = "planned"
+            else:
+                hold_codes = []
             action_counts[action_status] += 1
             if action_status == "succeeded":
                 succeeded_action_ids.add(action_id)
@@ -101,6 +125,7 @@ def build_execution_summary(
                 "status": action_status,
                 "http_status": action_state.last_response_status if action_state else None,
                 "reason": action_state.reason if action_state else action.get("reason"),
+                "hold_codes": hold_codes,
             }
             actions.append(action_result)
             if action_status in _ATTENTION_ACTION_STATUSES:
@@ -136,10 +161,37 @@ def build_execution_summary(
         "llm_approval_counts": _llm_approval_counts(
             review_report, approval_ledger, succeeded_action_ids
         ),
+        "replacement_approval_counts": _replacement_approval_counts(review_ledger),
+        "duplicate_source_selection_counts": {
+            "selected": len(review_ledger.source_selections),
+            "pending_courts": sum(
+                any(action.get("source_selection_required") for action in record.get("actions", []))
+                and str(record.get("court_slug") or "") not in review_ledger.source_selections
+                for record in records
+            ),
+        },
         "common_error_themes": _group_error_themes(attention_actions),
         "attention_by_request_type": _group_attention_by_request_type(attention_actions),
         "attention_actions": attention_actions,
         "courts": courts,
+    }
+
+
+def _replacement_approval_counts(review: ExecutionReviewLedger) -> dict[str, int]:
+    required = [
+        comparison
+        for comparison in review.comparisons.values()
+        if comparison.has_existing_data and not comparison.is_no_change
+    ]
+    approved = sum(
+        comparison.change_id in review.target_approvals for comparison in required
+    )
+    return {
+        "comparisons": len(review.comparisons),
+        "required": len(required),
+        "approved": approved,
+        "pending": len(required) - approved,
+        "not_checked": 0,
     }
 
 
@@ -182,6 +234,11 @@ def _llm_approval_counts(
         approval.approval_method == "policy" and review_id in actionable_ids
         for review_id, approval in approvals.approvals.items()
     )
+    policy_approved = {
+        review_id: approval
+        for review_id, approval in approvals.approvals.items()
+        if approval.approval_method == "policy"
+    }
     already_executed = sum(
         str(item.get("review_id")) not in approved_ids
         and bool(item.get("dependent_action_ids"))
@@ -196,6 +253,15 @@ def _llm_approval_counts(
         "approved": approved,
         "manual_approved": approved - auto_approved,
         "auto_approved": auto_approved,
+        "auto_approved_total": len(policy_approved),
+        "auto_approved_addresses": sum(
+            approval.policy_version == ADDRESS_AUTO_APPROVAL_POLICY_VERSION
+            for approval in policy_approved.values()
+        ),
+        "auto_approved_unchanged_fields": sum(
+            approval.policy_version == UNCHANGED_FIELD_AUTO_APPROVAL_POLICY_VERSION
+            for approval in policy_approved.values()
+        ),
         "pending": len(actionable) - approved - already_executed,
         "already_executed": already_executed,
         "not_actionable": sum(

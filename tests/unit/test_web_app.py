@@ -1,5 +1,6 @@
 import io
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from zipfile import ZIP_STORED, ZipFile
@@ -14,9 +15,12 @@ from fact_form_importer.web.app import (
     LocalJobRunner,
     _action_evidence,
     _action_execution_status,
+    _change_has_hold,
     _load_readiness_report,
     _raw_evidence_for_fields,
+    _review_category,
     _safe_job_error,
+    _submission_has_review_category,
     _value_at_path,
     create_app,
     run_server,
@@ -52,6 +56,50 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert b"Duplicate form decision workbook" in client.get(f"/runs/{run_id}").data
     assert b"LLM review rows" in client.get("/").data
     assert b"OS-held address rows" in client.get("/").data
+
+
+def test_review_queue_classification_and_hold_filters():
+    assert _review_category("", "DUPLICATE_COURT_SLUG") == "court_identity_duplicates"
+    assert _review_category("addresses[1].postcode") == "addresses"
+    assert _submission_has_review_category(
+        {
+            "issues": [
+                {
+                    "field": "contacts[1].email",
+                    "code": "INVALID_EMAIL",
+                    "severity": "error",
+                }
+            ]
+        },
+        "contacts",
+    )
+    base = {
+        "source_selection_required": True,
+        "selected_source_row_number": None,
+        "comparison": None,
+        "action": {"readiness": "pending", "reason": "invalid body"},
+        "execution_status": "blocked",
+    }
+    assert _change_has_hold(base, "source_selection")
+    assert _change_has_hold(base, "target_not_checked")
+    assert _change_has_hold(base, "invalid_request")
+    assert _change_has_hold(base, "execution_attention")
+    address = {
+        **base,
+        "action": {
+            "readiness": "pending",
+            "reason": "Address verification requires review",
+        },
+    }
+    assert _change_has_hold(address, "os_resolution")
+    assert not _change_has_hold(address, "invalid_request")
+    replacement = {
+        **base,
+        "comparison": {"has_existing_data": True, "is_no_change": False},
+        "target_approved": False,
+    }
+    assert _change_has_hold(replacement, "target_replacement")
+    assert _change_has_hold(replacement, "unknown-filter")
 
 
 def test_llm_actions_page_displays_evidence_and_approves_without_executing(tmp_path):
@@ -109,6 +157,195 @@ def test_llm_actions_page_displays_evidence_and_approves_without_executing(tmp_p
     assert service.get_execution_summary(run_id)["llm_approval_counts"]["approved"] == 1
 
 
+def test_llm_approval_advances_to_next_item_and_preserves_confidence_filter(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    items = []
+    for row, review_id, confidence in (
+        (3, "medium-review", "medium"),
+        (2, "first-high", "high"),
+        (4, "second-high", "high"),
+    ):
+        items.append(
+            {
+                "review_id": review_id,
+                "kind": "field",
+                "source_row_number": row,
+                "court_slug": "example-court",
+                "field": "facilities.food_and_drink",
+                "llm_input": {"raw_value": "water", "cleaned_value": "water"},
+                "model_result": {
+                    "value": ["Free water dispensers"],
+                    "confidence": confidence,
+                    "needs_human_review": confidence != "high",
+                    "reason": "Test result",
+                },
+                "outcome": "accepted",
+                "dependent_action_ids": ["example-court-1"],
+                "actionable": True,
+            }
+        )
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps({"review_version": "1.1", "items": items})
+    )
+    client = create_app(output_root).test_client()
+
+    page = client.get(f"/runs/{run_id}/llm-actions?status=pending&confidence=high")
+    approved = client.post(
+        f"/runs/{run_id}/llm-actions/first-high/approve",
+        data={
+            "review_status": "pending",
+            "review_confidence": "high",
+            "review_query": "",
+            "review_queue": "",
+            "field_page": "1",
+            "address_page": "1",
+        },
+    )
+
+    assert page.status_code == 200
+    assert page.data.index(b"first-high") < page.data.index(b"second-high")
+    assert b"medium-review" not in page.data
+    assert b"confirm(" not in page.data
+    assert approved.status_code == 302
+    assert "confidence=high" in approved.headers["Location"]
+    assert "status=pending" in approved.headers["Location"]
+    assert approved.headers["Location"].endswith("#review-second-high")
+
+
+def test_llm_review_explains_missing_court_in_plain_english(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    submissions_path = archive_path / "submissions_cleaned.json"
+    submissions = json.loads(submissions_path.read_text())
+    submissions[0]["issues"] = [
+        {
+            "field": "court_slug",
+            "code": "COURT_SLUG_NOT_FOUND",
+            "severity": "warning",
+            "message": "Court slug does not exist in FaCT Data API",
+        }
+    ]
+    submissions_path.write_text(json.dumps(submissions))
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "blocked-review",
+                        "kind": "field",
+                        "source_row_number": 2,
+                        "court_slug": "missing-court",
+                        "field": "facilities.accessible_toilet_description",
+                        "llm_input": {"cleaned_value": "Ground floor"},
+                        "model_result": {
+                            "operation": "set",
+                            "value": "Available on the ground floor.",
+                            "confidence": "high",
+                            "needs_human_review": False,
+                            "reason": "Normalised wording",
+                        },
+                        "outcome": "accepted",
+                        "dependent_action_ids": [],
+                        "actionable": False,
+                        "approvable": True,
+                    }
+                ],
+            }
+        )
+    )
+
+    page = create_app(output_root).test_client().get(f"/runs/{run_id}/llm-actions")
+
+    assert page.status_code == 200
+    assert b"This court could not be found in the FaCT database." in page.data
+    assert b"Technical details" in page.data
+    assert b"No API action was planned because" not in page.data
+
+
+def test_address_review_fields_are_editable_and_posted_value_is_approved(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    readiness_path = archive_path / "api_readiness_report.json"
+    readiness = json.loads(readiness_path.read_text())
+    action = readiness["records"][0]["actions"][0]
+    action["resource"] = "address"
+    action["llm_review_ids"] = ["address-review"]
+    readiness_path.write_text(json.dumps(readiness))
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "address-review",
+                        "kind": "address",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "addresses[1]",
+                        "address_index": 1,
+                        "submitted_address": {"line_1": "Submitted Court"},
+                        "llm_input": {
+                            "candidates": [
+                                {"uprn": "uprn-1"},
+                                {"uprn": "uprn-2"},
+                            ]
+                        },
+                        "os_candidates": [{"uprn": "uprn-1"}],
+                        "model_result": {
+                            "uprn": "uprn-1",
+                            "confidence": "high",
+                            "needs_human_review": False,
+                            "reason": "Selected candidate",
+                        },
+                        "api_body_patch": {
+                            "addressLine1": "OS Court",
+                            "addressLine2": None,
+                            "townCity": "London",
+                            "county": None,
+                            "postcode": "SW1A 1AA",
+                        },
+                        "proposed_address": {
+                            "line_1": "OS Court",
+                            "town_or_city": "London",
+                            "postcode": "SW1A 1AA",
+                        },
+                        "outcome": "accepted",
+                        "dependent_action_ids": ["example-court-1"],
+                        "actionable": True,
+                        "approvable": True,
+                    }
+                ],
+            }
+        )
+    )
+    service = ApiExecutionService(output_root, AppConfig(), _FakeExecutionClient())
+    client = create_app(output_root, execution_service=service).test_client()
+
+    page = client.get(f"/runs/{run_id}/llm-actions")
+    approved = client.post(
+        f"/runs/{run_id}/llm-actions/address-review/approve",
+        data={
+            "addressLine1": "Reviewer Court",
+            "addressLine2": "PO Box 12",
+            "townCity": "London",
+            "county": "Greater London",
+            "postcode": "SW1A 1AA",
+            "field_page": "1",
+            "address_page": "1",
+        },
+    )
+
+    assert page.status_code == 200
+    assert b'name="addressLine1"' in page.data
+    assert b"Address type, areas of law, court types and the selected UPRN remain unchanged" in page.data
+    assert approved.status_code == 302
+    approval = service.approval_store.load(run_id).approvals["address-review"]
+    assert approval.approved_address_patch["addressLine1"] == "Reviewer Court"
+    assert approval.approved_address_patch["addressLine2"] == "PO Box 12"
+
+
 def test_llm_actions_page_labels_strict_address_policy_approval(tmp_path):
     output_root, run_id = _archive(tmp_path)
     archive_path = output_root / "final" / run_id
@@ -163,6 +400,116 @@ def test_llm_actions_page_labels_strict_address_policy_approval(tmp_path):
     assert b"Addresses auto-approved" in summary.data
     assert service.get_execution_summary(run_id)["llm_approval_counts"]["auto_approved"] == 1
     assert execution_client.writes == []
+
+
+def test_review_overview_and_api_change_routes_cover_value_source_and_target_gates(
+    tmp_path,
+):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    readiness_path = archive_path / "api_readiness_report.json"
+    readiness = json.loads(readiness_path.read_text())
+    record = readiness["records"][0]
+    record["source_row_numbers"] = [2, 3]
+    action = record["actions"][0]
+    action["source_row_number"] = 2
+    action["source_selection_required"] = True
+    action["llm_review_ids"] = ["field-review"]
+    readiness_path.write_text(json.dumps(readiness))
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "field-review",
+                        "kind": "field",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "facilities.parking_available",
+                        "llm_input": {"raw_value": "Yes", "cleaned_value": True},
+                        "model_result": {
+                            "operation": "set",
+                            "value": False,
+                            "confidence": "high",
+                            "needs_human_review": False,
+                            "reason": "Safe test result",
+                        },
+                        "outcome": "accepted",
+                        "dependent_action_ids": ["example-court-1"],
+                        "actionable": True,
+                        "approvable": True,
+                    }
+                ],
+            }
+        )
+    )
+
+    execution_client = _ExistingTargetExecutionClient()
+    service = ApiExecutionService(output_root, AppConfig(), execution_client)
+    app = create_app(output_root, config=AppConfig(), execution_service=service)
+    client = app.test_client()
+
+    overview = client.get(f"/runs/{run_id}/review")
+    assert overview.status_code == 200
+    assert b"Source Selection" in overview.data
+    assert b"Llm Approval" in overview.data
+    assert (
+        client.get(
+            f"/runs/{run_id}/records?status=needs_human_review"
+            "&category=facilities_accessibility"
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(f"/runs/{run_id}/llm-actions?status=pending&queue=llm").status_code
+        == 200
+    )
+
+    selected = client.post(
+        f"/runs/{run_id}/courts/example-court/select-source",
+        data={"source_row_number": "2"},
+    )
+    approved_value = client.post(f"/runs/{run_id}/llm-actions/field-review/approve")
+    refreshed = client.post(
+        f"/runs/{run_id}/api-changes/example-court-1/refresh",
+        data={"court_slug": "example-court"},
+    )
+    change = service.get_api_changes_review(run_id)["changes"][0]
+    approved_target = client.post(
+        f"/runs/{run_id}/api-changes/{change['change_id']}/approve"
+    )
+    changes_page = client.get(f"/runs/{run_id}/api-changes")
+
+    assert {selected.status_code, approved_value.status_code, refreshed.status_code} == {302}
+    assert approved_target.status_code == 302
+    assert changes_page.status_code == 200
+    assert b"component difference" in changes_page.data
+    assert execution_client.writes == []
+    assert client.get(
+        f"/runs/{run_id}/api-changes?hold=target_replacement"
+    ).status_code == 200
+    assert client.post(
+        f"/runs/{run_id}/llm-actions/missing-review/approve"
+    ).status_code == 400
+    assert client.post(
+        f"/runs/{run_id}/api-changes/missing-action/refresh",
+        data={"court_slug": "example-court"},
+    ).status_code == 400
+    assert client.post(
+        f"/runs/{run_id}/api-changes/missing-change/approve"
+    ).status_code == 400
+    assert client.post(
+        f"/runs/{run_id}/courts/example-court/select-source",
+        data={"source_row_number": "not-a-number"},
+    ).status_code == 400
+    assert client.get("/execution-jobs/missing/status.json").status_code == 404
+
+    scan = client.post(f"/runs/{run_id}/api-changes/refresh")
+    assert scan.status_code == 302
+    scan_job = _wait_for_execution_job(app)
+    assert scan_job.state == "completed"
+    assert client.get(f"/execution-jobs/{scan_job.job_id}/status.json").status_code == 200
 
 
 def test_review_ui_allows_only_manifested_artifact_downloads(tmp_path):
@@ -359,7 +706,8 @@ def test_review_ui_checks_actions_but_refuses_writes_when_circuit_breaker_is_off
     output_root, run_id = _archive(tmp_path)
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "false")
     execution = ApiExecutionService(output_root, AppConfig(), _FakeExecutionClient())
-    client = create_app(output_root, config=AppConfig(), execution_service=execution).test_client()
+    app = create_app(output_root, config=AppConfig(), execution_service=execution)
+    client = app.test_client()
 
     detail = client.get(f"/runs/{run_id}/records/2")
     assert b"Check target sections" in detail.data
@@ -376,6 +724,11 @@ def test_review_ui_checks_actions_but_refuses_writes_when_circuit_breaker_is_off
         data={"source_row_number": "2"},
     )
     assert execute.status_code == 403
+    assert client.post(
+        f"/runs/{run_id}/courts/example-court/execute-safe",
+        data={"source_row_number": "2"},
+    ).status_code == 403
+    assert client.post(f"/runs/{run_id}/execute-safe").status_code == 403
 
 
 def test_review_ui_executes_a_preflight_safe_action_when_explicitly_enabled(tmp_path, monkeypatch):
@@ -383,7 +736,8 @@ def test_review_ui_executes_a_preflight_safe_action_when_explicitly_enabled(tmp_
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
     execution_client = _FakeExecutionClient()
     execution = ApiExecutionService(output_root, AppConfig(), execution_client)
-    client = create_app(output_root, config=AppConfig(), execution_service=execution).test_client()
+    app = create_app(output_root, config=AppConfig(), execution_service=execution)
+    client = app.test_client()
 
     response = client.post(
         f"/runs/{run_id}/courts/example-court/actions/example-court-1/execute",
@@ -391,6 +745,7 @@ def test_review_ui_executes_a_preflight_safe_action_when_explicitly_enabled(tmp_
     )
 
     assert response.status_code == 302
+    _wait_for_execution_job(app)
     assert execution_client.writes == [
         (
             "POST",
@@ -417,37 +772,33 @@ def test_review_ui_executes_all_safe_actions_and_handles_execution_errors(tmp_pa
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
     execution_client = _FakeExecutionClient()
     execution = ApiExecutionService(output_root, AppConfig(), execution_client)
-    client = create_app(output_root, config=AppConfig(), execution_service=execution).test_client()
+    app = create_app(output_root, config=AppConfig(), execution_service=execution)
+    client = app.test_client()
 
     success = client.post(
         f"/runs/{run_id}/courts/example-court/execute-safe", data={"source_row_number": "2"}
     )
     assert success.status_code == 302
+    _wait_for_execution_job(app)
     assert execution_client.writes
 
-    failing_client = create_app(
+    failing_app = create_app(
         output_root, config=AppConfig(), execution_service=_FailingExecutionService()
-    ).test_client()
+    )
+    failing_client = failing_app.test_client()
     assert (
         failing_client.post(
             f"/runs/{run_id}/courts/example-court/api-check", data={"source_row_number": "2"}
         ).status_code
         == 400
     )
-    assert (
-        failing_client.post(
-            f"/runs/{run_id}/courts/example-court/actions/example-court-1/execute",
-            data={"source_row_number": "2"},
-        ).status_code
-        == 400
-    )
-    assert (
-        failing_client.post(
-            f"/runs/{run_id}/courts/example-court/execute-safe", data={"source_row_number": "2"}
-        ).status_code
-        == 400
-    )
-    assert failing_client.post(f"/runs/{run_id}/execute-safe").status_code == 400
+    for path in [
+        f"/runs/{run_id}/courts/example-court/actions/example-court-1/execute",
+        f"/runs/{run_id}/courts/example-court/execute-safe",
+        f"/runs/{run_id}/execute-safe",
+    ]:
+        assert failing_client.post(path, data={"source_row_number": "2"}).status_code == 302
+        assert _wait_for_execution_job(failing_app).state == "failed"
 
 
 def test_review_ui_executes_all_safe_actions_for_a_run_and_shows_summary(tmp_path, monkeypatch):
@@ -455,12 +806,14 @@ def test_review_ui_executes_all_safe_actions_for_a_run_and_shows_summary(tmp_pat
     monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
     execution_client = _FakeExecutionClient()
     execution = ApiExecutionService(output_root, AppConfig(), execution_client)
-    client = create_app(output_root, config=AppConfig(), execution_service=execution).test_client()
+    app = create_app(output_root, config=AppConfig(), execution_service=execution)
+    client = app.test_client()
 
     assert b"Run all safe actions" in client.get(f"/runs/{run_id}").data
     response = client.post(f"/runs/{run_id}/execute-safe")
 
     assert response.status_code == 302
+    _wait_for_execution_job(app)
     assert execution_client.writes
     summary = client.get(f"/runs/{run_id}/execution-summary")
     assert b"Succeeded actions" in summary.data
@@ -531,10 +884,12 @@ def test_action_execution_status_handles_missing_ledger_values(tmp_path):
 def test_legacy_readiness_download_missing_file_and_server_runner(tmp_path, monkeypatch):
     output_root, run_id = _archive(tmp_path)
     archive_path = output_root / "final" / run_id
+    assert _load_readiness_report(archive_path)["records"]
     (archive_path / "api_readiness_report.json").unlink()
     (archive_path / "fact_api_import_manifest.json").write_text(json.dumps({"records": []}))
     assert _load_readiness_report(archive_path) == {"records": []}
     client = create_app(output_root).test_client()
+    assert client.get("/jobs/missing/status").status_code == 404
     (archive_path / "import_summary.json").unlink()
     assert client.get(f"/runs/{run_id}/download/import_summary.json").status_code == 404
 
@@ -664,6 +1019,24 @@ class _FakeExecutionClient:
     def write(self, method, path, body):
         self.writes.append((method, path, body))
         return ApiResponse(201)
+
+
+class _ExistingTargetExecutionClient(_FakeExecutionClient):
+    def get(self, path):
+        return ApiResponse(200, {"parking": False})
+
+
+def _wait_for_execution_job(app):
+    runner = app.config["EXECUTION_JOB_RUNNER"]
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        job = runner.active()
+        if job is None:
+            jobs = list(runner.directory.glob("*.json"))
+            assert jobs
+            return runner.get(max(jobs, key=lambda path: path.stat().st_mtime).stem)
+        time.sleep(0.01)
+    raise AssertionError("execution job did not finish")
 
 
 class _FailingExecutionService:

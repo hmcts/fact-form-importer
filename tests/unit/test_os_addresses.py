@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+import pytest
+
 from fact_form_importer.models.court_submission import Address, CourtSubmission
 from fact_form_importer.models.source import SourceMetadata
 from fact_form_importer.validators.os_addresses import (
@@ -127,6 +129,24 @@ def test_verification_handles_invalid_postcodes_and_unavailable_service_without_
     assert batch.as_dict()["action_blocking_count"] == 1
     assert batch.summary_metrics()["address_verification_action_blocking_count"] == 1
     assert batch.summary_metrics()["address_verification_action_blocking_submission_count"] == 1
+    assert calls == ["SW1A 1AA"]
+
+
+@pytest.mark.parametrize("line", ["PO Box 12", "P.O. Box 12", "P O Box 12", "P.O Box 12"])
+def test_po_box_variants_follow_the_ordinary_os_lookup(line):
+    submission = _submission(
+        Address(index=1, address_type="Visit", line_1=line, postcode="SW1A 1AA")
+    )
+    calls = []
+
+    batch = verify_submission_addresses(
+        [submission], lambda postcode: calls.append(postcode) or _Response(200, {})
+    )
+
+    verification = batch.verifications[0]
+    assert verification.status == "no_os_result"
+    assert verification.original_address["line_1"] == line
+    assert verification.candidates == []
     assert calls == ["SW1A 1AA"]
 
 

@@ -127,8 +127,13 @@ archived runs, shows raw and cleaned records, issues and API readiness details,
 and can upload one XLSX/CSV for background processing. From a run summary, use
 `LLM actions review` to inspect exact field/address evidence and approve pending
 results; `LLM review factors` is read-only. Approval never executes an API
-action—use the record, court, or run execution control separately. The UI only
-binds to localhost because the review views contain contact and submitter data.
+action—use the record, court, or run execution control separately. Review items
+are ordered from high to low confidence and can be filtered by confidence.
+Approval has no confirmation dialog and moves to the next pending result while
+preserving filters and pagination. Where an action cannot be planned, the page
+explains the blocker in plain English and keeps internal issue codes inside
+expandable technical details. The UI only binds to localhost because the review
+views contain contact and submitter data.
 
 ```bash
 python3 -m fact_form_importer api-check-court --output "./out" --run-id "<run-id>" --court-slug "<court-slug>"
@@ -517,12 +522,14 @@ does not call FaCT. Do not use an offline-fallback payload as controller input.
 
 `api_readiness_report.json` is the immutable, endpoint-shaped action plan for
 the reviewed run. It is not a new FaCT controller payload and it does not
-create courts. Actions are derived only for importable records and contain the
-existing endpoint, method, target path, request body and source-field evidence.
-Before each write, the execution layer re-resolves the court by slug and checks
-the target API section. Under the current conservative policy, a populated
-target section blocks that action for human review rather than replacing,
-merging, or deleting existing FaCT data.
+create courts. Manifest version 1.7 plans complete, valid sections independently,
+so an unrelated source issue does not hide a safe proposal. Address, contact,
+and opening-hours entries are grouped into one logical section action. Duplicate
+court rows retain provisional actions for every candidate row until a reviewer
+selects one authoritative source. Before each write, execution re-resolves the
+court by slug, validates the full proposal and compares it with the live target.
+A populated target can be replaced only after every contained value is approved
+and the exact current-versus-proposed section diff is separately approved.
 
 For professional information, the form supplies only interview-room values.
 The approved migration policy sets `videoHearings`, `commonPlatform`, and
@@ -586,7 +593,11 @@ Execution state is written separately to
 `out/execution-state/<run-id>.json`, never back into the archived action plan.
 It records local preflight and write outcomes only; it is not a replacement for
 the existing review and approval workflow in `fact-admin-frontend`. Every write
-still repeats the live preflight and no-overwrite checks.
+still repeats the live target comparison. Replacement approval is bound to
+canonical hashes of both snapshots; a changed live target or proposal returns
+the action to review. Collection writes update/create first and delete surplus
+entries last. A failed or unknown update/create stops before deletion, re-reads
+FaCT and records the partial state for attention.
 Action status is one of `planned`, `awaiting_approval`, `ready`, `blocked`,
 `running`, `succeeded`, `failed`, or `unknown`. A court is `completed` only
 once every planned action has succeeded. `blocked` means no write was attempted for that action because
@@ -613,16 +624,42 @@ remains `awaiting_approval`. Approved OS mappings are applied only to the
 eventual request body, and execution confirms that the selected UPRN is still
 returned before writing.
 
+Policy `high-unchanged-field-v1` also approves accepted `set` results when the
+typed proposed value exactly equals the cleaned submitted value, confidence is
+high, and the model did not request review. Format-only changes, clears,
+unresolved results, and medium/low confidence remain reviewable. Reviewers may
+edit the five address text components shown on the LLM actions page before
+execution. The ledger stores the canonical approved patch and its hash while
+the archived OS/LLM evidence remains unchanged. Editing an automatic approval
+converts it to a manual decision, retains decision history, resets safe
+unexecuted action state, and invalidates stale FaCT comparisons. Address type,
+areas of law, court types, and selected UPRN remain read-only; execution still
+requires the selected UPRN at the approved postcode.
+
+The structured field response has an explicit `set`, `clear`, or `unresolved`
+operation. `clear` is initially allowed only for optional
+`contacts[*].explanation`: opening days and times are removed because structured
+opening-hours fields carry them, and the supplied National Contact Centre-only
+example clears to “Not supplied”. Accessible-toilet floor text uses UCD wording:
+`Ground floor` becomes `Available on the ground floor.`, and multiple floors use
+`Available on the ground, first and third floors.` without inventing locations.
+PO Box addresses are allowed and have no separate manual-only dependency. They
+follow the same OS lookup, LLM confidence, approval-policy, and execution rules
+as every other address.
+
+Verification for this workflow: 332 unit tests pass, Ruff is clean, global
+coverage is 90.22%, and every configured 95% core coverage gate passes.
+
 Each check or write also creates
 `out/execution-state/<run-id>.summary.json` and refreshes the latest
 `out/execution_summary.json`. These mutable reports contain per-court action
 outcomes, an explicit list of actions needing attention, and grouped error
-themes such as existing target data, address verification, missing
+themes such as pending target replacement, address verification, missing
 accessibility details, inconsistent interview-room data, opening-hours
 constraints, API validation, and authentication failures. They intentionally
 contain no action bodies or raw form data. The `attention_by_request_type`
 section is the product-decision report: it distinguishes
-`expected_no_overwrite`, `address_review`, `missing_or_invalid_form_data`,
+`target_replacement`, `address_review`, `missing_or_invalid_form_data`,
 `invalid_form_data`, `api_rejection`, and `execution_uncertain` outcomes.
 `blocked` means the importer did not attempt a write. `failed` means a request
 was sent and FaCT rejected it. A dependent numeric field reported as required
@@ -638,6 +675,18 @@ historic run and verify its files.
 report directory rather than an archive artifact. It lets the UI show whether
 individual actions have been checked, blocked, completed, failed, or have an
 unknown outcome without changing the generated run evidence or its integrity
+hashes. Other mutable, versioned sidecars are:
+
+- `out/llm-approval-state/<run-id>.json` for manual/policy value approvals
+- `out/execution-review-state/<run-id>.json` for duplicate source selection,
+  live comparisons and hash-bound replacement approvals
+- `out/execution-review-state/<run-id>.plan.json` for a derived current-run
+  section-plan overlay when the immutable archive predates manifest 1.7
+- `out/.execution-jobs/<job-id>.json` for queued, running, completed, failed or
+  interrupted comparison/execution jobs
+
+The current-run overlay never edits archive evidence. Legacy section actions
+that already succeeded are preserved and are never regrouped or invalidated.
 hashes.
 
 `failed_records.json` contains records that cannot progress because required
@@ -687,17 +736,18 @@ and approved counts. High-confidence address selections are automatically
 approved only when the model selected the sole supplied OS candidate, did not
 request review, and the result has an actionable address API dependency. The
 versioned approval ledger records these as policy approvals; multi-candidate,
-medium/low-confidence and non-actionable results remain manual or read-only.
+medium/low-confidence and changed results remain manual or read-only. Exact
+unchanged high-confidence fields use a separate policy, including when another
+blocker means no API action currently depends on the result.
 Automatic approval never executes a FaCT request, and address execution still
-performs the fresh-UPRN, target-section and no-overwrite preflights. In a
+performs the fresh-UPRN, target-section and snapshot-bound replacement preflights. In a
 normal run, `vocabulary_source` should be
 `fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
-run. Duplicate groups are conservative for now: every affected record is
-excluded from `fact_import_payload.json` and included in the `needs_human_review`
-count. The duplicate count is not an additional status category: a duplicate
-record can also have other review issues, such as invalid opening hours. The
-importer does not pick a winner or merge duplicate rows until explicit
-merge/precedence rules exist.
+run. Duplicate groups remain in the human-review count and are excluded from
+`fact_import_payload.json`, but the execution overlay creates provisional
+section proposals. A reviewer must explicitly choose the authoritative row;
+changing it invalidates target-diff approvals, and it cannot be changed after
+any section for that court succeeds. The importer never chooses a winner.
 
 The status counts are counts of submitted form rows and always add up to
 `submission_count`. `unique_court_slug_count` is reported separately because a
@@ -744,14 +794,24 @@ request-only migration assumptions, and run one action or all safe actions for
 that court. The run page also offers run-level execution. Write buttons appear only when
 `FACT_DATA_API_WRITES_ENABLED=true`; server-side checks enforce the same rule.
 The run-level write control prompts for confirmation and uses the same
-no-overwrite preflight as the record controls. Tables support status/court-row
+value-approval and snapshot-bound replacement gates as the record controls.
+Action-, court-, run-, and comparison scans share one persistent background
+queue. While a job is active every execution control is disabled; the execution
+summary polls safe JSON progress, refreshes action/court outcomes, and becomes
+the final results page. Jobs left active across a server restart are marked
+`interrupted` and unknown writes are never retried automatically. Tables support status/court-row
 filtering and pagination. When relevant, the run list and run page show direct
 LLM review rows and OS-held address rows separately, each linking to a paginated
 factor page. The per-run LLM actions page separately lists normalised fields and
 addresses, shows raw/request/OS/model evidence, labels automatic and manual
 approvals, and provides one approval button per pending actionable result. Use
 `LLM actions review` for approval controls; `LLM review factors` is a separate
-read-only explanation of why rows need review. LLM factors are model-specific
+read-only explanation of why rows need review. The per-run Review overview
+separates overlapping form-row blocker counts from API hold work items and links
+to category queues. LLM rows show highlighted submitted-versus-proposed text;
+addresses mark line one as a weaker matching signal; API changes show the live
+complete before/after section, component differences and resulting operations.
+Policy-approved addresses do not contribute to “LLM approvals pending”. LLM factors are model-specific
 causes of human review; OS factors hold only the affected address action. Each
 run has a single ZIP download containing
 its JSON, workbooks, reports, and immutable manifest; individual files remain
@@ -925,7 +985,8 @@ Current issue meanings:
   candidate, so it was not changed.
 - `ADDRESS_OS_REVIEW_REQUIRED`: the postcode lookup returned candidates but no
   unique high-confidence address match. No address data was changed and only
-  that address action is held for review.
+  that address action is held for review. PO Box addresses are not special
+  cased: they pass through this same lookup and review path.
 - `ADDRESS_OS_LOOKUP_UNAVAILABLE`: FaCT's OS proxy could not be reached or
   returned an unexpected response. No address data was changed; retry the
   check later rather than treating it as a bad address.

@@ -23,6 +23,7 @@ from fact_form_importer.validators.base import (
     LLM_LOW_CONFIDENCE,
     LLM_NORMALISATION_FAILED,
     LLM_RETURNED_INVALID_VOCAB_VALUE,
+    LLM_RETURNED_INVALID_VALUE,
     LLM_RETURNED_SENSITIVE_VALUE,
     LLM_RETURNED_UNEXPECTED_FIELD,
     VOCAB_NO_MATCH,
@@ -71,6 +72,7 @@ def test_pipeline_calls_once_per_selected_submission_and_applies_canonical_vocab
     assert _has_issue(submission, LLM_FIELD_NORMALISED)
     assert result.review_items[0]["outcome"] == "accepted"
     assert result.review_items[0]["model_result"]["value"] == "Enquiries"
+    assert result.review_items[0]["llm_request"] == requests[0].model_dump(mode="json")
 
 
 def test_pipeline_does_not_call_model_when_all_values_match_vocabularies():
@@ -168,6 +170,7 @@ def test_pipeline_rejects_vocab_value_not_owned_by_fact_vocabulary():
     assert result.metrics.fields_processed == 0
     assert _has_issue(submission, LLM_RETURNED_INVALID_VOCAB_VALUE)
     assert calculate_status(submission) == "needs_human_review"
+    assert result.review_items[0]["outcome"] == "rejected"
 
 
 def test_medium_confidence_result_requires_human_review_after_safe_merge():
@@ -203,11 +206,15 @@ def test_unselected_response_field_is_rejected_without_mutating_submission():
     ]
     response = _response("source-row-2", "translation_email", "should-not-be-applied")
 
-    processed = apply_llm_response(submission, response, fields, _vocabularies())
+    review_items = []
+    processed = apply_llm_response(
+        submission, response, fields, _vocabularies(), review_items=review_items
+    )
 
     assert processed == 0
     assert submission.contacts[0].description == "general enquiries"
     assert _has_issue(submission, LLM_RETURNED_UNEXPECTED_FIELD)
+    assert review_items[0]["outcome"] == "unexpected_field"
 
 
 def test_mismatched_response_identifier_is_treated_as_row_failure():
@@ -246,6 +253,119 @@ def test_public_text_value_with_contact_data_is_rejected():
     assert processed == 0
     assert submission.facilities["accessible_toilet_description"] == "Near reception."
     assert _has_issue(submission, LLM_RETURNED_SENSITIVE_VALUE)
+
+
+def test_contact_explanation_clear_is_distinct_from_an_unresolved_null():
+    selected = [
+        LlmField(
+            field="contacts[1].explanation",
+            raw_value="National Contact Centre, Monday to Friday 9am to 5pm",
+            cleaned_value="National Contact Centre, Monday to Friday 9am to 5pm",
+        )
+    ]
+    cleared = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        contacts=[
+            ContactDetail(
+                index=1,
+                explanation="National Contact Centre, Monday to Friday 9am to 5pm",
+            )
+        ],
+    )
+    review_items = []
+    clear_response = _response("source-row-2", "contacts[1].explanation", "unused")
+    clear_response.normalised_fields[0].operation = "clear"
+    clear_response.normalised_fields[0].value = None
+
+    processed = apply_llm_response(
+        cleared, clear_response, selected, _vocabularies(), review_items=review_items
+    )
+
+    assert processed == 1
+    assert cleared.contacts[0].explanation is None
+    assert review_items[0]["model_result"]["operation"] == "clear"
+    assert review_items[0]["outcome"] == "accepted"
+
+    unresolved = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        contacts=[ContactDetail(index=1, explanation="Keep this text")],
+    )
+    unresolved_response = _response("source-row-2", "contacts[1].explanation", "unused")
+    unresolved_response.normalised_fields[0].operation = "unresolved"
+    unresolved_response.normalised_fields[0].value = None
+    unresolved_response.normalised_fields[0].needs_human_review = True
+
+    assert apply_llm_response(
+        unresolved, unresolved_response, selected, _vocabularies()
+    ) == 0
+    assert unresolved.contacts[0].explanation == "Keep this text"
+
+
+def test_invalid_operations_and_unapplied_paths_are_rejected_with_review_evidence():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        facilities={"accessible_toilet_description": "Ground floor"},
+        contacts=[ContactDetail(index=1, explanation="Keep")],
+    )
+    facility = LlmField(
+        field="facilities.accessible_toilet_description",
+        raw_value="Ground floor",
+        cleaned_value="Ground floor",
+    )
+    review_items = []
+
+    unresolved_with_value = _response(
+        "source-row-2", facility.field, "Available on the ground floor."
+    )
+    unresolved_with_value.normalised_fields[0].operation = "unresolved"
+    assert (
+        apply_llm_response(
+            submission,
+            unresolved_with_value,
+            [facility],
+            _vocabularies(),
+            review_items=review_items,
+        )
+        == 0
+    )
+
+    forbidden_clear = _response("source-row-2", facility.field, "unused")
+    forbidden_clear.normalised_fields[0].operation = "clear"
+    forbidden_clear.normalised_fields[0].value = None
+    assert (
+        apply_llm_response(
+            submission,
+            forbidden_clear,
+            [facility],
+            _vocabularies(),
+            review_items=review_items,
+        )
+        == 0
+    )
+
+    null_set = _response("source-row-2", facility.field, "unused")
+    null_set.normalised_fields[0].value = None
+    assert apply_llm_response(
+        submission, null_set, [facility], _vocabularies()
+    ) == 0
+
+    missing = LlmField(
+        field="contacts[2].explanation", raw_value="Public information"
+    )
+    unapplied = _response("source-row-2", missing.field, "Public information")
+    assert (
+        apply_llm_response(
+            submission,
+            unapplied,
+            [missing],
+            _vocabularies(),
+            review_items=review_items,
+        )
+        == 0
+    )
+
+    assert _has_issue(submission, LLM_RETURNED_INVALID_VALUE)
+    assert {item["outcome"] for item in review_items} == {"rejected", "unapplied"}
 
 
 def test_list_vocabulary_value_is_canonicalised_and_applied_to_address():
@@ -308,6 +428,7 @@ def test_null_field_with_explicit_review_flag_requires_human_review():
         normalised_fields=[
             LlmNormalisedField(
                 field="contacts[1].description",
+                operation="unresolved",
                 value=None,
                 confidence="high",
                 needs_human_review=True,
@@ -467,6 +588,7 @@ def _response(record_id, field, value, confidence="high"):
         normalised_fields=[
             LlmNormalisedField(
                 field=field,
+                operation="set",
                 value=value,
                 confidence=confidence,
                 needs_human_review=False,

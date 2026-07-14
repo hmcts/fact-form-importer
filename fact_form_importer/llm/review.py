@@ -15,7 +15,7 @@ from fact_form_importer.validators.os_addresses import (
     OsAddressCandidate,
 )
 
-LLM_ACTIONS_REVIEW_VERSION = "1.0"
+LLM_ACTIONS_REVIEW_VERSION = "1.1"
 LLM_ACTIONS_REVIEW_NAME = "llm_actions_review.json"
 LLM_FIELD_NORMALISED = "LLM_FIELD_NORMALISED"
 
@@ -90,6 +90,7 @@ def build_llm_actions_review(
             "source_raw_values": _raw_values_for_fields(submission, [field], mapping_path),
             "dependent_action_ids": dependencies,
         }
+        item["approvable"] = bool(item.get("outcome") == "accepted")
         item["actionable"] = bool(item.get("outcome") == "accepted" and dependencies)
         items.append(item)
 
@@ -187,6 +188,7 @@ def load_or_derive_llm_actions_review(archive_path: Path) -> dict[str, Any]:
                     "source_raw_values": _legacy_raw_values(submission, field),
                     "dependent_action_ids": dependencies,
                     "actionable": bool(dependencies),
+                    "approvable": True,
                     "legacy": True,
                 }
             )
@@ -293,6 +295,7 @@ def _address_item(
         "outcome": outcome,
         "dependent_action_ids": dependencies,
         "actionable": bool(usable and dependencies),
+        "approvable": bool(usable),
     }
     return item
 
@@ -312,6 +315,7 @@ def _report(items: list[dict[str, Any]]) -> dict[str, Any]:
         "field_item_count": sum(item.get("kind") == "field" for item in ordered),
         "address_item_count": sum(item.get("kind") == "address" for item in ordered),
         "actionable_item_count": sum(bool(item.get("actionable")) for item in ordered),
+        "approvable_item_count": sum(bool(item.get("approvable")) for item in ordered),
         "items": ordered,
     }
 
@@ -319,6 +323,15 @@ def _report(items: list[dict[str, Any]]) -> dict[str, Any]:
 def _actions_by_row(manifest: dict[str, Any]) -> dict[int, list[dict[str, Any]]]:
     result: dict[int, list[dict[str, Any]]] = {}
     for record in manifest.get("records", []) if isinstance(manifest, dict) else []:
+        actions_with_rows = [
+            action
+            for action in record.get("actions", [])
+            if isinstance(action.get("source_row_number"), int)
+        ]
+        if actions_with_rows:
+            for action in actions_with_rows:
+                result.setdefault(int(action["source_row_number"]), []).append(action)
+            continue
         for row in record.get("source_row_numbers", []):
             if isinstance(row, int):
                 result.setdefault(row, []).extend(record.get("actions", []))
@@ -432,6 +445,23 @@ def _verification_from_dict(value: dict[str, Any]) -> AddressVerification | None
         )
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def address_verification_batch_from_dict(value: dict[str, Any]) -> AddressVerificationBatch:
+    """Rehydrate archived address evidence for a mutable derived execution plan."""
+
+    batch = AddressVerificationBatch(
+        enabled=bool(value.get("enabled")),
+        unique_postcode_lookups=int(value.get("unique_postcode_lookups") or 0),
+        cache_hits=int(value.get("cache_hits") or 0),
+        rate_limit_retries=int(value.get("rate_limit_retries") or 0),
+    )
+    for candidate in value.get("verifications", []):
+        if isinstance(candidate, dict):
+            verification = _verification_from_dict(candidate)
+            if verification is not None:
+                batch.verifications.append(verification)
+    return batch
 
 
 def _read_json(path: Path, default: Any) -> Any:
