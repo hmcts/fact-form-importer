@@ -1,11 +1,11 @@
-"""Serializable state for post-review FaCT API execution."""
+"""Serializable state for FaCT API execution."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 ActionExecutionStatus = Literal[
     "planned", "ready", "blocked", "running", "succeeded", "failed", "unknown"
@@ -13,8 +13,6 @@ ActionExecutionStatus = Literal[
 CourtExecutionStatus = Literal[
     "not_started", "in_progress", "attention_required", "completed"
 ]
-
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -37,6 +35,9 @@ class ActionExecutionState(BaseModel):
 
 
 class CourtExecutionState(BaseModel):
+    # Old local ledgers can contain the removed importer-approval fields.
+    model_config = ConfigDict(extra="ignore")
+
     court_slug: str
     court_id: Optional[str] = None
     status: CourtExecutionStatus = "not_started"

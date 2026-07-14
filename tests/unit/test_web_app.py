@@ -43,7 +43,9 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert b"LLM Review Factors" in client.get(f"/runs/{run_id}/llm-review-factors").data
     assert b"OS-Held Address Actions" in client.get(f"/runs/{run_id}/os-address-factors").data
     assert client.get(f"/runs/{run_id}/api-actions?readiness=ready").status_code == 200
-    assert client.get(f"/runs/{run_id}/execution-summary").status_code == 200
+    execution_page = client.get(f"/runs/{run_id}/execution-summary")
+    assert execution_page.status_code == 200
+    assert b"Attention by API request type" in execution_page.data
     execution_json = client.get(f"/runs/{run_id}/execution-summary.json")
     assert execution_json.status_code == 200
     assert execution_json.headers["Content-Disposition"].startswith("attachment")
@@ -322,7 +324,7 @@ def test_review_ui_executes_all_safe_actions_for_a_run_and_shows_summary(tmp_pat
     execution = ApiExecutionService(output_root, AppConfig(), execution_client)
     client = create_app(output_root, config=AppConfig(), execution_service=execution).test_client()
 
-    assert b"Run all currently safe actions" in client.get(f"/runs/{run_id}").data
+    assert b"Run all safe actions" in client.get(f"/runs/{run_id}").data
     response = client.post(f"/runs/{run_id}/execute-safe")
 
     assert response.status_code == 302
@@ -528,6 +530,7 @@ class _FailingExecutionService:
             "court_status_counts": {"completed": 0, "attention_required": 0},
             "action_status_counts": {"succeeded": 0, "blocked": 0, "failed": 0, "unknown": 0},
             "common_error_themes": [],
+            "attention_by_request_type": [],
             "attention_actions": [],
             "courts": [],
         }

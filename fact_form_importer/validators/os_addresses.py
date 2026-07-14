@@ -26,7 +26,10 @@ ADDRESS_OS_VERIFIED = "ADDRESS_OS_VERIFIED"
 ADDRESS_OS_REVIEW_REQUIRED = "ADDRESS_OS_REVIEW_REQUIRED"
 ADDRESS_OS_LOOKUP_UNAVAILABLE = "ADDRESS_OS_LOOKUP_UNAVAILABLE"
 
-DEFAULT_OS_MIN_INTERVAL_SECONDS = 1.1
+# 1.25 seconds stays within OS's 50-request/minute development/trial limit.
+# Live projects can opt into 0.11 seconds through AppConfig, leaving headroom
+# below the documented 600-request/minute limit.
+DEFAULT_OS_MIN_INTERVAL_SECONDS = 1.25
 AUTO_MATCH_THRESHOLD = 0.98
 AUTO_MATCH_MARGIN = 0.05
 MAX_REPORTED_CANDIDATES = 10

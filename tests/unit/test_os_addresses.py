@@ -102,7 +102,7 @@ def test_verification_caches_duplicate_postcodes_and_rate_limits_unique_requests
     )
     limiter.get("SW1A 1AA")
     limiter.get("SW1A 2AA")
-    assert delays == [1.1]
+    assert delays == [1.25]
 
 
 def test_verification_handles_invalid_postcodes_and_unavailable_service_without_changes():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+import re
 from typing import Any
 
 from fact_form_importer.execution.models import ExecutionLedger
@@ -20,6 +21,21 @@ _ACTION_STATUSES = (
 )
 _COURT_STATUSES = ("not_started", "in_progress", "attention_required", "completed")
 _ATTENTION_ACTION_STATUSES = {"blocked", "failed", "unknown"}
+EXECUTION_SUMMARY_VERSION = "1.1"
+_COURT_UUID_IN_PATH = re.compile(
+    r"(?<=/courts/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/)",
+    re.IGNORECASE,
+)
+_RESOURCE_LABELS = {
+    "accessibility_options": "Accessibility options",
+    "address": "Addresses",
+    "building_facilities": "Building facilities",
+    "contact_detail": "Contact details",
+    "counter_service_opening_hours": "Counter service opening hours",
+    "court_opening_hours": "Court opening hours",
+    "professional_information": "Professional information",
+    "translation_services": "Translation services",
+}
 
 
 def build_execution_summary(
@@ -86,6 +102,7 @@ def build_execution_summary(
         )
 
     return {
+        "summary_version": EXECUTION_SUMMARY_VERSION,
         "run_id": run_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "selected_court_count": len(records),
@@ -94,9 +111,171 @@ def build_execution_summary(
         "action_status_counts": {status: action_counts[status] for status in _ACTION_STATUSES},
         "attention_action_count": len(attention_actions),
         "common_error_themes": _group_error_themes(attention_actions),
+        "attention_by_request_type": _group_attention_by_request_type(attention_actions),
         "attention_actions": attention_actions,
         "courts": courts,
     }
+
+
+def _group_attention_by_request_type(
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group attention outcomes into a product-decision friendly report."""
+
+    resources: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for action in actions:
+        resources[str(action.get("resource") or "unknown")].append(action)
+
+    grouped_resources = []
+    for resource, resource_actions in resources.items():
+        outcome_groups: dict[tuple[str, Any, str], list[dict[str, Any]]] = defaultdict(list)
+        for action in resource_actions:
+            key = (
+                str(action.get("status") or "unknown"),
+                action.get("http_status"),
+                _normalised_attention_reason(str(action.get("reason") or "")),
+            )
+            outcome_groups[key].append(action)
+
+        outcomes = []
+        for (status, http_status, reason), outcome_actions in outcome_groups.items():
+            courts = sorted({str(action["court_slug"]) for action in outcome_actions})
+            classification = _attention_classification(
+                resource, status, http_status, reason
+            )
+            outcomes.append(
+                {
+                    "classification": classification,
+                    "status": status,
+                    "http_status": http_status,
+                    "reason": reason,
+                    "action_count": len(outcome_actions),
+                    "court_count": len(courts),
+                    "example_courts": courts[:5],
+                    "example_reason": next(
+                        (
+                            str(action["reason"])
+                            for action in outcome_actions
+                            if action.get("reason")
+                        ),
+                        None,
+                    ),
+                    "decision_guidance": _decision_guidance(resource, classification),
+                }
+            )
+
+        status_counts = Counter(str(action.get("status") or "unknown") for action in resource_actions)
+        courts = {str(action["court_slug"]) for action in resource_actions}
+        grouped_resources.append(
+            {
+                "resource": resource,
+                "label": _RESOURCE_LABELS.get(resource, resource.replace("_", " ").title()),
+                "methods": sorted(
+                    {str(action.get("method")) for action in resource_actions if action.get("method")}
+                ),
+                "endpoint_templates": sorted(
+                    {
+                        _COURT_UUID_IN_PATH.sub("{court_id}", str(action.get("path") or ""))
+                        for action in resource_actions
+                        if action.get("path")
+                    }
+                ),
+                "attention_action_count": len(resource_actions),
+                "court_count": len(courts),
+                "status_counts": {
+                    status: status_counts[status]
+                    for status in ("blocked", "failed", "unknown")
+                },
+                "distinct_outcome_count": len(outcomes),
+                "outcomes": sorted(
+                    outcomes,
+                    key=lambda outcome: (
+                        -outcome["action_count"],
+                        outcome["status"],
+                        outcome["reason"],
+                    ),
+                ),
+            }
+        )
+
+    return sorted(
+        grouped_resources,
+        key=lambda group: (-group["attention_action_count"], group["resource"]),
+    )
+
+
+def _normalised_attention_reason(reason: str) -> str:
+    if reason.startswith(
+        "Address verification requires review: FaCT/Ordnance Survey returned no address result:"
+    ):
+        return (
+            "Address verification requires review: FaCT/Ordnance Survey returned no address "
+            "result for the submitted postcode"
+        )
+    return reason or "No diagnostic reason was recorded"
+
+
+def _attention_classification(
+    resource: str, status: str, http_status: Any, reason: str
+) -> str:
+    if "Target section already contains FaCT data" in reason:
+        return "expected_no_overwrite"
+    if resource == "address" and "Address verification" in reason:
+        return "address_review"
+    if status == "failed" or isinstance(http_status, int) and http_status >= 400:
+        return "api_rejection"
+    if status == "unknown":
+        return "execution_uncertain"
+    if resource in {"accessibility_options", "professional_information"}:
+        return "missing_or_invalid_form_data"
+    if resource in {
+        "contact_detail",
+        "counter_service_opening_hours",
+        "court_opening_hours",
+    }:
+        return "invalid_form_data"
+    return "human_review"
+
+
+def _decision_guidance(resource: str, classification: str) -> str:
+    if classification == "expected_no_overwrite":
+        return (
+            "Confirm that the earlier migration owns this section. The importer deliberately "
+            "does not merge with or overwrite existing FaCT data."
+        )
+    if classification == "address_review":
+        return (
+            "Review the submitted address against FaCT/Ordnance Survey evidence. Do not write "
+            "an unresolved or unsupported address automatically."
+        )
+    if classification == "api_rejection":
+        return (
+            "Inspect the rejected value or contract mismatch, correct the importer/source rule, "
+            "then generate a new run before retrying."
+        )
+    if classification == "execution_uncertain":
+        return "Resolve authentication, connectivity or timeout uncertainty before retrying."
+    if resource == "accessibility_options":
+        return (
+            "Convert valid measurements deterministically where possible. Use numeric defaults "
+            "only for genuinely blank dependent values; never invent a public phone number."
+        )
+    if resource == "professional_information":
+        return (
+            "Review the submitted room count. A value of 1 is only safe when interview rooms are "
+            "Yes and the dependent count is genuinely blank."
+        )
+    if resource in {"counter_service_opening_hours", "court_opening_hours"}:
+        return (
+            "Review the source hours and correct them in the form/admin workflow when they cannot "
+            "be represented as a valid opening period."
+        )
+    if resource == "contact_detail":
+        return (
+            "Use a verified public phone number or email, or omit the contact after review. Do not "
+            "invent public contact details."
+        )
+    return "Review the source evidence and FaCT contract before deciding whether to write."
 
 
 def _group_error_themes(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:

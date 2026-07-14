@@ -14,7 +14,7 @@
   <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Execution summary</a>
 </nav>
 <div class="summary">
-  {% for label, value in [('Form rows', summary.get('submission_count', status_total)),('Unique court slugs', summary.get('unique_court_slug_count', factor_summary.unique_court_slug_count)),('Processed rows', summary.get('processed_count', 0)),('Warning rows', summary.get('processed_with_warnings_count', 0)),('Needs review rows', summary.get('needs_human_review_count', 0)),('Failed rows', summary.get('failed_count', 0)),('Duplicate rows', summary.get('duplicate_slug_affected_record_count', 0)),('Addresses checked', summary.get('address_verification_count', 0)),('Address actions held', summary.get('address_verification_action_blocking_count', 0)),('Ready API actions', summary.get('api_manifest_ready_action_count', 0)),('Pending API actions', summary.get('api_manifest_pending_action_count', 0)),('LLM calls', summary.get('llm_calls', 0))] %}
+  {% for label, value in [('Form rows', summary.get('submission_count', status_total)),('Unique court slugs', summary.get('unique_court_slug_count', factor_summary.unique_court_slug_count)),('Processed rows', summary.get('processed_count', 0)),('Warning rows', summary.get('processed_with_warnings_count', 0)),('Needs review rows', summary.get('needs_human_review_count', 0)),('Failed rows', summary.get('failed_count', 0)),('Duplicate rows', summary.get('duplicate_slug_affected_record_count', 0)),('Addresses checked', summary.get('address_verification_count', 0)),('Address actions held', summary.get('address_verification_action_blocking_count', 0)),('Ready API actions', summary.get('api_manifest_ready_action_count', 0)),('Pending API actions', summary.get('api_manifest_pending_action_count', 0)),('Review-required defaults', summary.get('api_manifest_review_required_default_count', 0)),('LLM calls', summary.get('llm_calls', 0))] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
@@ -34,11 +34,11 @@
   {% endfor %}
 </div>
 {% if writes_enabled %}
-<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe action for this archived run? Existing FaCT data will remain blocked.');">
-  <button type="submit">Run all currently safe actions</button>
+<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe action in this archived run? Existing FaCT data will remain blocked.');">
+  <button type="submit">Run all safe actions</button>
 </form>
 {% else %}
-<p class="muted">Run-level writes are disabled. Set <code>FACT_DATA_API_WRITES_ENABLED=true</code> only when ready to make approved FaCT changes.</p>
+<p class="muted">Run-level writes are disabled. Set <code>FACT_DATA_API_WRITES_ENABLED=true</code> only when ready to make FaCT changes.</p>
 {% endif %}
 <h2>Downloads</h2>
 <a class="button-link" href="{{ url_for('download_archive', run_id=archive.manifest.run_id) }}">Download this run (.zip)</a>

@@ -13,6 +13,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 load_dotenv()
 
+DEFAULT_OS_MIN_INTERVAL_SECONDS = 1.25
+MIN_OS_MIN_INTERVAL_SECONDS = 0.1
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -55,14 +58,23 @@ class AppConfig:
 
     @property
     def os_address_min_interval_seconds(self) -> float:
-        """Minimum gap between uncached FaCT/OS postcode lookups."""
+        """Minimum gap between uncached FaCT/OS postcode lookups.
 
-        raw = os.getenv("OS_ADDRESS_MIN_INTERVAL_SECONDS", "1.1")
+        The safe default remains within the documented 50-request/minute
+        development/trial limit. Live-mode projects may explicitly use 0.11
+        seconds, which stays below the documented 600-request/minute ceiling.
+        """
+
+        raw = os.getenv(
+            "OS_ADDRESS_MIN_INTERVAL_SECONDS", str(DEFAULT_OS_MIN_INTERVAL_SECONDS)
+        )
         try:
             value = float(raw)
         except ValueError:
-            return 1.1
-        return value if value >= 1.0 else 1.0
+            return DEFAULT_OS_MIN_INTERVAL_SECONDS
+        if value <= 0:
+            return DEFAULT_OS_MIN_INTERVAL_SECONDS
+        return max(value, MIN_OS_MIN_INTERVAL_SECONDS)
 
     @property
     def llm_enabled(self) -> bool:

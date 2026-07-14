@@ -224,6 +224,144 @@ def test_manifest_marks_api_required_conditional_values_as_pending():
     assert "liftSupportPhoneNumber" in action.reason
 
 
+def test_manifest_uses_review_visible_defaults_for_blank_lift_measurements():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=7),
+        court_slug="example-court",
+        status="processed",
+        facilities={
+            "accessible_parking": True,
+            "accessible_entrance": True,
+            "hearing_enhancement_equipment": "Hearing loop systems are available at this court.",
+            "lift_available": True,
+            "quiet_room_available": False,
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+
+    action = next(
+        action
+        for action in manifest.records[0].actions
+        if action.resource == "accessibility_options"
+    )
+    assert action.readiness == "ready"
+    assert action.body["liftDoorWidth"] == 1
+    assert action.body["liftDoorLimit"] == 1
+    assert action.migration_assumptions == [
+        "Review-required migration default: lift is marked available but the source has no "
+        "door width, so this FaCT request uses 1 cm. It does not amend the source or cleaned data.",
+        "Review-required migration default: lift is marked available but the source has no "
+        "weight limit, so this FaCT request uses 1 kg. It does not amend the source or cleaned data.",
+    ]
+    assert manifest.summary["api_manifest_review_required_default_count"] == 2
+    assert manifest.summary["api_manifest_review_required_default_action_count"] == 1
+
+
+def test_manifest_does_not_default_explicitly_invalid_or_missing_lift_answers():
+    explicit_invalid = CourtSubmission(
+        source=SourceMetadata(source_row_number=8),
+        court_slug="invalid-lift-court",
+        status="processed",
+        facilities={
+            "accessible_parking": True,
+            "accessible_entrance": True,
+            "hearing_enhancement_equipment": "Hearing loop systems are available at this court.",
+            "lift_available": True,
+            "lift_door_width": "0",
+            "lift_weight_limit": "not recorded",
+            "quiet_room_available": False,
+        },
+    )
+    missing_controller = CourtSubmission(
+        source=SourceMetadata(source_row_number=9),
+        court_slug="missing-lift-court",
+        status="processed",
+        facilities={
+            "accessible_parking": True,
+            "accessible_entrance": True,
+            "hearing_enhancement_equipment": "Hearing loop systems are available at this court.",
+            "quiet_room_available": False,
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [explicit_invalid, missing_controller],
+        "run-1",
+        _vocabularies(),
+        lambda slug: CourtReference(f"{slug}-id", slug),
+    ).manifest
+    invalid_action = next(
+        action
+        for action in manifest.records[0].actions
+        if action.resource == "accessibility_options"
+    )
+    missing_action = next(
+        action
+        for action in manifest.records[1].actions
+        if action.resource == "accessibility_options"
+    )
+
+    assert invalid_action.readiness == "pending"
+    assert invalid_action.body.get("liftDoorWidth") is None
+    assert invalid_action.body.get("liftDoorLimit") is None
+    assert invalid_action.migration_assumptions == []
+    assert "liftDoorWidth" in invalid_action.reason
+    assert "liftDoorLimit" in invalid_action.reason
+    assert missing_action.readiness == "pending"
+    assert "lift" not in missing_action.body
+    assert "lift is required" in missing_action.reason
+
+
+def test_manifest_uses_review_visible_interview_room_count_defaults():
+    rooms_available = CourtSubmission(
+        source=SourceMetadata(source_row_number=10),
+        court_slug="rooms-available-court",
+        status="processed",
+        interview_rooms={"has_interview_rooms": True},
+    )
+    rooms_unavailable = CourtSubmission(
+        source=SourceMetadata(source_row_number=11),
+        court_slug="rooms-unavailable-court",
+        status="processed",
+        interview_rooms={"has_interview_rooms": False, "room_count": "3"},
+    )
+    unknown_answer = CourtSubmission(
+        source=SourceMetadata(source_row_number=12),
+        court_slug="rooms-unknown-court",
+        status="processed",
+        interview_rooms={"room_count": "3"},
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [rooms_available, rooms_unavailable, unknown_answer],
+        "run-1",
+        _vocabularies(),
+        lambda slug: CourtReference(f"{slug}-id", slug),
+    ).manifest
+    actions = {
+        record.court_slug: next(
+            action
+            for action in record.actions
+            if action.resource == "professional_information"
+        )
+        for record in manifest.records
+    }
+
+    assert actions["rooms-available-court"].readiness == "ready"
+    assert actions["rooms-available-court"].body["professionalInformation"]["interviewRoomCount"] == 1
+    assert "uses 1" in actions["rooms-available-court"].migration_assumptions[1]
+    assert actions["rooms-unavailable-court"].readiness == "ready"
+    assert actions["rooms-unavailable-court"].body["professionalInformation"]["interviewRoomCount"] == 0
+    assert "uses a room count of 0" in actions["rooms-unavailable-court"].migration_assumptions[1]
+    assert actions["rooms-unknown-court"].readiness == "pending"
+    assert "interviewRooms is required" in actions["rooms-unknown-court"].reason
+    assert manifest.summary["api_manifest_review_required_default_count"] == 2
+    assert manifest.summary["api_manifest_review_required_default_action_count"] == 2
+
+
 def test_manifest_normalises_conventional_address_notation_for_fact_api():
     submission = CourtSubmission(
         source=SourceMetadata(source_row_number=7),
@@ -336,6 +474,25 @@ def test_fact_api_contract_validation_covers_remaining_api_constraints():
     )
     assert "liftDoorWidth" in lift_reason
     assert "liftDoorLimit" in lift_reason
+
+    invalid_support_phone_reason = validate_fact_api_action_body(
+        "accessibility_options",
+        {
+            "courtId": "court-id",
+            "accessibleParking": False,
+            "accessibleEntrance": False,
+            "accessibleEntrancePhoneNumber": "ask reception",
+            "hearingEnhancementEquipment": "HEARING_LOOP_SYSTEMS",
+            "lift": True,
+            "liftDoorWidth": 1,
+            "liftDoorLimit": 1,
+            "quietRoom": False,
+        },
+    )
+    assert (
+        "accessibleEntrancePhoneNumber does not match the FaCT API phone format"
+        in invalid_support_phone_reason
+    )
 
     professional_reason = validate_fact_api_action_body("professional_information", {})
     assert "professionalInformation" in professional_reason

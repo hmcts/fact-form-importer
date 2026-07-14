@@ -172,6 +172,23 @@ def test_app_config_reads_fact_data_api_environment(monkeypatch):
     assert config.fact_data_api_user_id == "00000000-0000-4000-a000-000000000001"
 
 
+def test_app_config_applies_safe_os_rate_limit_intervals(monkeypatch):
+    monkeypatch.delenv("OS_ADDRESS_MIN_INTERVAL_SECONDS", raising=False)
+    assert AppConfig().os_address_min_interval_seconds == 1.25
+
+    monkeypatch.setenv("OS_ADDRESS_MIN_INTERVAL_SECONDS", "0.11")
+    assert AppConfig().os_address_min_interval_seconds == 0.11
+
+    monkeypatch.setenv("OS_ADDRESS_MIN_INTERVAL_SECONDS", "0.01")
+    assert AppConfig().os_address_min_interval_seconds == 0.1
+
+    monkeypatch.setenv("OS_ADDRESS_MIN_INTERVAL_SECONDS", "invalid")
+    assert AppConfig().os_address_min_interval_seconds == 1.25
+
+    monkeypatch.setenv("OS_ADDRESS_MIN_INTERVAL_SECONDS", "0")
+    assert AppConfig().os_address_min_interval_seconds == 1.25
+
+
 def test_app_config_reads_openai_environment(monkeypatch):
     monkeypatch.setenv("LLM_ENABLED", "true")
     monkeypatch.setenv("LLM_MAX_CONCURRENCY", "12")

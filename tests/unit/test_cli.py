@@ -38,6 +38,7 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     assert "Excluded submitter users: 0" in captured.out
     assert "LLM enabled: False" in captured.out
     assert "Address verification requested: False" in captured.out
+    assert "Review-required request defaults: 0 across 0 actions" in captured.out
     assert "Vocabulary source: local_json" in captured.out
     assert "Wrote duplicate form review workbook:" in captured.out
     assert (output_path / "profile.json").exists()
@@ -280,7 +281,6 @@ def test_api_execution_commands_require_explicit_confirmation(tmp_path, capsys):
     assert exit_code == 1
     assert "--confirm is required" in captured.err
 
-
 def test_api_execute_run_reports_execution_summary(tmp_path, capsys, monkeypatch):
     calls = []
 
@@ -302,6 +302,14 @@ def test_api_execute_run_reports_execution_summary(tmp_path, capsys, monkeypatch
                         "label": "Address verification prevented the write",
                         "action_count": 1,
                         "court_count": 1,
+                    }
+                ],
+                "attention_by_request_type": [
+                    {
+                        "label": "Addresses",
+                        "attention_action_count": 1,
+                        "court_count": 1,
+                        "distinct_outcome_count": 1,
                     }
                 ],
                 "attention_actions": [
@@ -334,6 +342,7 @@ def test_api_execute_run_reports_execution_summary(tmp_path, capsys, monkeypatch
     assert "Courts considered: 2" in captured.out
     assert "Failed actions: 1" in captured.out
     assert "Address verification prevented the write: 1 actions across 1 courts" in captured.out
+    assert "Addresses: 1 actions across 1 courts, 1 distinct outcomes" in captured.out
     assert "per-court action list" in captured.out
 
 def test_run_command_returns_error_for_missing_file(tmp_path, capsys):

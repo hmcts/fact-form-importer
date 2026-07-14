@@ -19,7 +19,11 @@ from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "1.4"
+API_MANIFEST_VERSION = "1.5"
+_MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
+_MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
+_MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
+_REVIEW_REQUIRED_MIGRATION_DEFAULT_PREFIX = "Review-required migration default:"
 
 # These expressions deliberately mirror the public FaCT Data API request
 # constraints. Keeping them here makes a rejected action reviewable before a
@@ -99,6 +103,14 @@ def build_fact_api_import_manifest(
         records.append(_build_record(submission, vocabularies, court_lookup, address_verifications))
 
     actions = [action for record in records for action in record.actions]
+    review_required_default_actions = [
+        action
+        for action in actions
+        if any(
+            assumption.startswith(_REVIEW_REQUIRED_MIGRATION_DEFAULT_PREFIX)
+            for assumption in action.migration_assumptions
+        )
+    ]
     summary = {
         "api_manifest_record_count": len(records),
         "api_manifest_ready_action_count": sum(action.readiness == "ready" for action in actions),
@@ -108,6 +120,14 @@ def build_fact_api_import_manifest(
             record.readiness == "partially_ready" for record in records
         ),
         "api_manifest_pending_record_count": sum(record.readiness == "pending" for record in records),
+        "api_manifest_review_required_default_count": sum(
+            sum(
+                assumption.startswith(_REVIEW_REQUIRED_MIGRATION_DEFAULT_PREFIX)
+                for assumption in action.migration_assumptions
+            )
+            for action in actions
+        ),
+        "api_manifest_review_required_default_action_count": len(review_required_default_actions),
     }
     return FactApiManifestResult(
         manifest=FactApiImportManifest(run_id=run_id, records=records, summary=summary)
@@ -191,11 +211,12 @@ def _build_record(
             "facilities.wifi_available",
         ],
     )
+    accessibility_body = _accessibility_options_body(submission.facilities)
     add(
         "accessibility_options",
         "POST",
         "/courts/{court_id}/v1/accessibility-options",
-        _accessibility_options_body(submission.facilities),
+        accessibility_body,
         source_fields=[
             "facilities.accessible_parking",
             "facilities.accessible_parking_phone",
@@ -208,6 +229,7 @@ def _build_record(
             "facilities.lift_weight_limit",
             "facilities.quiet_room_available",
         ],
+        migration_assumptions=_accessibility_options_assumptions(submission.facilities),
     )
     add(
         "translation_services",
@@ -315,6 +337,7 @@ def _accessibility_options_body(facilities: dict[str, Any]) -> dict[str, Any]:
         "Infrared systems are available at this court.": "INFRARED_SYSTEMS",
         "Hearing loop systems are available at this court.": "HEARING_LOOP_SYSTEMS",
     }
+    lift_available = facilities.get("lift_available")
     return _without_none(
         {
             "accessibleParking": facilities.get("accessible_parking"),
@@ -325,12 +348,40 @@ def _accessibility_options_body(facilities: dict[str, Any]) -> dict[str, Any]:
             "hearingEnhancementEquipment": hearing_equipment.get(
                 facilities.get("hearing_enhancement_equipment")
             ),
-            "lift": facilities.get("lift_available"),
-            "liftDoorWidth": _positive_int(facilities.get("lift_door_width")),
-            "liftDoorLimit": _positive_int(facilities.get("lift_weight_limit")),
+            "lift": lift_available,
+            "liftDoorWidth": _lift_measurement_for_request(
+                facilities.get("lift_door_width"),
+                lift_available,
+                _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM,
+            ),
+            "liftDoorLimit": _lift_measurement_for_request(
+                facilities.get("lift_weight_limit"),
+                lift_available,
+                _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG,
+            ),
             "quietRoom": facilities.get("quiet_room_available"),
         }
     )
+
+
+def _accessibility_options_assumptions(facilities: dict[str, Any]) -> list[str]:
+    """Describe approved request-only defaults for incomplete lift measurements."""
+
+    if facilities.get("lift_available") is not True:
+        return []
+
+    assumptions = []
+    if _is_missing_form_value(facilities.get("lift_door_width")):
+        assumptions.append(
+            "Review-required migration default: lift is marked available but the source has no "
+            "door width, so this FaCT request uses 1 cm. It does not amend the source or cleaned data."
+        )
+    if _is_missing_form_value(facilities.get("lift_weight_limit")):
+        assumptions.append(
+            "Review-required migration default: lift is marked available but the source has no "
+            "weight limit, so this FaCT request uses 1 kg. It does not amend the source or cleaned data."
+        )
+    return assumptions
 
 
 def _translation_body(submission: CourtSubmission) -> dict[str, Any]:
@@ -347,10 +398,12 @@ def _professional_information_body(submission: CourtSubmission) -> dict[str, Any
     if not _has_professional_information_evidence(rooms):
         return {}
 
+    interview_rooms = rooms.get("has_interview_rooms")
+
     body = _without_none(
         {
-            "interviewRooms": rooms.get("has_interview_rooms"),
-            "interviewRoomCount": _positive_int(rooms.get("room_count")),
+            "interviewRooms": interview_rooms,
+            "interviewRoomCount": _interview_room_count_for_request(rooms),
             "interviewPhoneNumber": rooms.get("booking_phone"),
             # The Microsoft Forms export does not collect these three fields.
             # Product approved false as the migration default; this applies only
@@ -366,10 +419,25 @@ def _professional_information_body(submission: CourtSubmission) -> dict[str, Any
 def _professional_information_assumptions(submission: CourtSubmission) -> list[str]:
     if not _has_professional_information_evidence(submission.interview_rooms):
         return []
-    return [
+    rooms = submission.interview_rooms
+    assumptions = [
         "Migration policy: the form does not collect videoHearings, commonPlatform, "
         "or accessScheme, so this request defaults each field to false."
     ]
+    if rooms.get("has_interview_rooms") is True and _is_missing_form_value(rooms.get("room_count")):
+        assumptions.append(
+            "Review-required migration default: interview rooms are marked available but the source has no "
+            "room count, so this FaCT request uses 1. It does not amend the source or cleaned data."
+        )
+    elif rooms.get("has_interview_rooms") is False and _positive_int(rooms.get("room_count")) not in {
+        None,
+        0,
+    }:
+        assumptions.append(
+            "Review-required migration default: interview rooms are marked unavailable, so this FaCT request "
+            "uses a room count of 0 instead of the contradictory source count. It does not amend the source or cleaned data."
+        )
+    return assumptions
 
 
 def _has_professional_information_evidence(rooms: dict[str, Any]) -> bool:
@@ -587,6 +655,16 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
     if resource == "building_facilities" and body.get("waitingArea") is True and body.get("waitingAreaChildren") is None:
         errors.append("waitingAreaChildren is required by the FaCT API when waitingArea is true")
     if resource == "accessibility_options":
+        for field in (
+            "accessibleParkingPhoneNumber",
+            "accessibleEntrancePhoneNumber",
+            "liftSupportPhoneNumber",
+        ):
+            phone = body.get(field)
+            if phone is not None and (
+                not isinstance(phone, str) or not _FACT_API_PHONE_PATTERN.fullmatch(phone)
+            ):
+                errors.append(f"{field} does not match the FaCT API phone format")
         if body.get("accessibleEntrance") is False and not body.get("accessibleEntrancePhoneNumber"):
             errors.append(
                 "accessibleEntrancePhoneNumber is required by the FaCT API when accessibleEntrance is false"
@@ -831,6 +909,44 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def _is_missing_form_value(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _lift_measurement_for_request(
+    value: Any, lift_available: Any, migration_default: int
+) -> int | None:
+    """Use a reviewed numeric placeholder only for a present `lift=yes` answer.
+
+    An explicit invalid value, such as zero or non-numeric text, remains absent
+    and is blocked by FaCT contract validation. This deliberately distinguishes
+    missing dependent data from a missing/invalid controlling answer.
+    """
+
+    parsed = _positive_int(value)
+    if parsed is not None:
+        return parsed
+    if lift_available is True and _is_missing_form_value(value):
+        return migration_default
+    return None
+
+
+def _interview_room_count_for_request(rooms: dict[str, Any]) -> int | None:
+    """Represent an explicit rooms yes/no answer without changing source evidence."""
+
+    has_interview_rooms = rooms.get("has_interview_rooms")
+    value = rooms.get("room_count")
+    if has_interview_rooms is False:
+        return 0
+
+    parsed = _positive_int(value)
+    if parsed is not None:
+        return parsed
+    if has_interview_rooms is True and _is_missing_form_value(value):
+        return _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT
+    return None
 
 
 def _combine_reasons(*reasons: str | None) -> str | None:

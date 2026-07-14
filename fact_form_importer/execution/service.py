@@ -1,4 +1,4 @@
-"""Conservative, one-court execution service for reviewed API action reports."""
+"""Conservative, one-court execution service for archived API action reports."""
 
 from __future__ import annotations
 
@@ -21,7 +21,10 @@ from fact_form_importer.execution.models import (
     ExecutionLedger,
     utc_now,
 )
-from fact_form_importer.execution.report import build_execution_summary
+from fact_form_importer.execution.report import (
+    EXECUTION_SUMMARY_VERSION,
+    build_execution_summary,
+)
 from fact_form_importer.output.archive import load_run_archive
 from fact_form_importer.output.fact_api_manifest import (
     normalise_fact_api_action_body,
@@ -108,7 +111,7 @@ class ApiExecutionService:
         return self._save_with_summary(run_id, ledger)
 
     def execute_all_safe_actions(self, run_id: str) -> ExecutionLedger:
-        """Execute every unattempted reviewed court action sequentially.
+        """Execute every unattempted, preflight-safe court action sequentially.
 
         This is intentionally a single-threaded operation. It shares the
         postcode cache/rate limiter, preserves progress after each court, and
@@ -126,11 +129,10 @@ class ApiExecutionService:
         try:
             for record in records:
                 court_slug = str(record.get("court_slug") or "")
+                court = self._court_state(ledger, court_slug, record.get("court_id"))
                 actions = self._batch_actions_to_attempt(ledger, record)
                 if not actions:
-                    self._update_court_status(
-                        self._court_state(ledger, court_slug), record.get("actions", [])
-                    )
+                    self._update_court_status(court, record.get("actions", []))
                     self._save_with_summary(run_id, ledger, report)
                     continue
                 try:
@@ -149,9 +151,12 @@ class ApiExecutionService:
 
     def get_execution_summary(self, run_id: str) -> dict[str, Any]:
         existing = self.store.load_summary(run_id)
-        if existing is not None:
+        if existing is not None and existing.get("summary_version") == EXECUTION_SUMMARY_VERSION:
             return existing
-        return build_execution_summary(run_id, self._readiness_report(run_id), self.store.load(run_id))
+        summary = build_execution_summary(
+            run_id, self._readiness_report(run_id), self.store.load(run_id)
+        )
+        return self.store.save_summary(run_id, summary)
 
     def _record(self, run_id: str, court_slug: str) -> dict[str, Any]:
         report = self._readiness_report(run_id)

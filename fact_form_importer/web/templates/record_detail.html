@@ -7,18 +7,18 @@
 <section>
   <h2>FaCT API execution</h2>
   <p>Court: <strong>{{ submission.court_slug }}</strong> · execution status: <strong>{{ court_execution.status if court_execution else 'not_started' }}</strong></p>
-  <p class="muted">Every action rechecks that this court exists and that its target section is empty. Existing data blocks the action for human review; this tool never creates a court.</p>
+  <p class="muted">Every action rechecks that this court exists and that its target section is empty. Existing data blocks the action for human review; this tool never creates a court. Final review and approval remains in fact-admin-frontend.</p>
   <form method="post" action="{{ url_for('api_check_court', run_id=archive.manifest.run_id, court_slug=submission.court_slug) }}" class="inline-form">
     <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
     <button type="submit" class="secondary">Check target sections</button>
   </form>
   {% if writes_enabled %}
-  <form method="post" action="{{ url_for('api_execute_court', run_id=archive.manifest.run_id, court_slug=submission.court_slug) }}" class="inline-form">
+  <form method="post" action="{{ url_for('api_execute_court', run_id=archive.manifest.run_id, court_slug=submission.court_slug) }}" class="inline-form" onsubmit="return confirm('Run every currently safe action for this court? Existing FaCT data will remain blocked.');">
     <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
     <button type="submit">Run all safe actions for this court</button>
   </form>
-  {% else %}
-  <p class="muted">Writes are disabled locally. Set <code>FACT_DATA_API_WRITES_ENABLED=true</code> only when ready to make approved FaCT changes.</p>
+  {% elif not writes_enabled %}
+  <p class="muted">Writes are disabled locally. Set <code>FACT_DATA_API_WRITES_ENABLED=true</code> only when ready to make FaCT changes.</p>
   {% endif %}
 
   <table>
@@ -32,7 +32,7 @@
         <td><strong>{{ action.execution.status }}</strong>{% if action.execution.reason %}<br>{{ action.execution.reason }}{% endif %}{% if action.execution.last_response_status %}<br>HTTP {{ action.execution.last_response_status }}{% endif %}</td>
         <td>
           {% if writes_enabled %}
-          <form method="post" action="{{ url_for('api_execute_action', run_id=archive.manifest.run_id, court_slug=submission.court_slug, action_id=action.action_id) }}">
+          <form method="post" action="{{ url_for('api_execute_action', run_id=archive.manifest.run_id, court_slug=submission.court_slug, action_id=action.action_id) }}" onsubmit="return confirm('Run this FaCT API action? It will be preflighted again before a write.');">
             <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
             <button type="submit" {% if action.execution.status == 'succeeded' %}disabled{% endif %}>Run action</button>
           </form>

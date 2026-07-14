@@ -391,13 +391,13 @@ def create_app(
         archive = _archive_or_404(output_root, run_id)
         manifest = _load_readiness_report(archive["path"])
         readiness = request.args.get("readiness")
+        ledger = app.config["EXECUTION_SERVICE"].get_ledger(run_id)
+
         actions = [
             {
                 "court_slug": record.get("court_slug"),
                 "execution_status": _action_execution_status(
-                    app.config["EXECUTION_SERVICE"].get_ledger(run_id),
-                    record.get("court_slug"),
-                    action.get("action_id"),
+                    ledger, record.get("court_slug"), action.get("action_id")
                 ),
                 **action,
             }

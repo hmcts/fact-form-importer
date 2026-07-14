@@ -140,8 +140,8 @@ python3 -m fact_form_importer api-execute-court --output "./out" --run-id "<run-
 python3 -m fact_form_importer api-execute-run --output "./out" --run-id "<run-id>" --confirm
 ```
 
-Executes one reviewed API action, or all currently safe actions for one court.
-`api-execute-run` processes every importable court sequentially in slug order.
+Executes one currently safe API action, or all currently safe actions for one
+court. `api-execute-run` processes importable courts sequentially in slug order.
 It re-resolves each court and preflights every action immediately before a
 write, continues after failures, and does not automatically retry an earlier
 `blocked`, `failed`, or `unknown` action. All three commands require
@@ -150,7 +150,12 @@ write, continues after failures, and does not automatically retry an earlier
 that UUID to attribute its audit records; the importer never creates a user
 automatically. The batch command prints counts and grouped attention themes;
 use `out/execution_summary.json` or the execution-summary page in the local UI
-for the complete per-court action list.
+for the complete per-court action list. The execution summary also groups
+attention outcomes by API request type. Each request-type group shows the
+method/endpoint template, affected action and court counts, distinct reasons,
+whether the outcome was a preflight block or an API rejection, example courts,
+and decision guidance. Postcode-specific FaCT/OS no-result messages are grouped
+as one distinct reason while retaining an example of the original diagnostic.
 
 ```bash
 python3 -m fact_form_importer check-llm
@@ -238,12 +243,19 @@ direct Ordnance Survey integration:
 ```text
 FACT_DATA_API_BASE_URL=http://127.0.0.1:8989
 FACT_DATA_API_BEARER_TOKEN=<fact-api-token>
-OS_ADDRESS_MIN_INTERVAL_SECONDS=1.1
+OS_ADDRESS_MIN_INTERVAL_SECONDS=1.25
 ```
 
-Keep `OS_ADDRESS_MIN_INTERVAL_SECONDS` at or above `1.0`. `OS_KEY` is present
-in `.env.example` only as a reminder for the separately running FaCT Data API;
-this importer does not read it.
+Ordnance Survey currently documents a limit of 50 transactions per minute for
+development-mode projects and partner trials, and 600 transactions per minute
+for live-mode projects. Leave `OS_ADDRESS_MIN_INTERVAL_SECONDS` unset or at
+`1.25` for development/trial use. A confirmed live-mode migration project can
+use `0.11`, which is approximately 545 requests per minute and leaves headroom
+below the published live limit. Values below `0.10` are clamped to `0.10`.
+The limiter caches duplicate postcodes and retries once after an HTTP 429.
+`OS_KEY` is present in `.env.example` only as a reminder for the separately
+running FaCT Data API; this importer does not read it. See the
+[OS rate-limiting policy](https://docs.os.uk/os-apis/core-concepts/rate-limiting-policy).
 
 #### LLM field selection
 
@@ -510,18 +522,30 @@ and review UI.
 
 ### API-required values not collected by the form
 
-The importer does **not** invent text, telephone numbers, measurements, or
-contact details merely to satisfy a FaCT API constraint. In particular, when a
-court has no lift, FaCT currently requires `liftSupportPhoneNumber`, but the
-Microsoft Form has no lift-specific support-number question. That field is a
-validated public telephone number, not free text: values such as `unknown`,
-`N/A`, or a numeric placeholder would either be rejected or displayed to court
-users as a misleading phone number. The action therefore remains pending.
+The importer does **not** invent text, telephone numbers, times, or a missing
+controlling Yes/No answer merely to satisfy a FaCT API constraint. In
+particular, when a court has no lift, FaCT currently requires
+`liftSupportPhoneNumber`, but the Microsoft Form has no lift-specific
+support-number question. That field is a validated public telephone number, not
+free text: values such as `unknown`, `N/A`, or a numeric placeholder would
+either be rejected or displayed to court users as a misleading phone number.
+The action therefore remains pending. The same rule applies to a missing
+accessible-entrance support number.
 
-The same rule applies to a missing accessible-entrance support number and to
-lift dimensions/weight limits that were left blank in the optional form fields.
-Only explicit, product-approved boolean defaults are applied, such as the
-professional-information defaults above.
+There is one narrow, reviewed numeric-default policy for dependent fields where
+the controlling Yes/No answer is present and FaCT requires a numeric value:
+
+- `lift=true` with a blank door width sends `liftDoorWidth=1` centimetre.
+- `lift=true` with a blank weight limit sends `liftDoorLimit=1` kilogram.
+- `interviewRooms=true` with a blank room count sends `interviewRoomCount=1`.
+- `interviewRooms=false` sends `interviewRoomCount=0`, including when the
+  optional form count contradicts that No answer.
+
+These defaults are request-only: raw and cleaned source data are unchanged, and
+each action displays a `Migration assumptions` entry in the UI/action plan.
+They are never used for an explicit zero/non-numeric value or a missing parent
+Yes/No answer; those actions remain pending. The data is then reviewed through
+the existing approval feature in `fact-admin-frontend`.
 
 The public FaCT frontend already has a safe no-number fallback for a court with
 no lift. To unblock these actions without inventing data, either provide a
@@ -549,6 +573,9 @@ execution time.
 
 Execution state is written separately to
 `out/execution-state/<run-id>.json`, never back into the archived action plan.
+It records local preflight and write outcomes only; it is not a replacement for
+the existing review and approval workflow in `fact-admin-frontend`. Every write
+still repeats the live preflight and no-overwrite checks.
 Action status is one of `planned`, `ready`, `blocked`, `running`, `succeeded`,
 `failed`, or `unknown`. A court is `completed` only once every planned action
 has succeeded. `blocked` means no write was attempted for that action because
@@ -565,7 +592,15 @@ outcomes, an explicit list of actions needing attention, and grouped error
 themes such as existing target data, address verification, missing
 accessibility details, inconsistent interview-room data, opening-hours
 constraints, API validation, and authentication failures. They intentionally
-contain no action bodies or raw form data.
+contain no action bodies or raw form data. The `attention_by_request_type`
+section is the product-decision report: it distinguishes
+`expected_no_overwrite`, `address_review`, `missing_or_invalid_form_data`,
+`invalid_form_data`, `api_rejection`, and `execution_uncertain` outcomes.
+`blocked` means the importer did not attempt a write. `failed` means a request
+was sent and FaCT rejected it. A dependent numeric field reported as required
+can either be blank or contain submitted text that could not be converted to
+the API integer type; inspect the archived action evidence before approving a
+placeholder.
 
 `run_manifest.json` records the source display name, completion time, run
 summary, and SHA-256 hashes of every archived artifact. Use it to identify a
@@ -616,8 +651,9 @@ count, mapping warnings, issue counts by code, `vocabulary_source`, and whether
 LLM processing was enabled. It also records LLM requested state, calls,
 failures, parse retries, selected and processed field counts, affected
 submissions, model name, address-verification enabled/count/cache/review and
-address-action-blocking metrics, direct LLM review-row counts, and API-readiness
-ready/pending action counts. In a
+address-action-blocking metrics, direct LLM review-row counts, API-readiness
+ready/pending action counts, and the count of visible request-only migration
+defaults. In a
 normal run, `vocabulary_source` should be
 `fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
 run. Duplicate groups are conservative for now: every affected record is
@@ -667,10 +703,9 @@ newest to oldest. Select a run to inspect its summary, records, raw submitted
 values, cleaned values, issues, duplicate status and API readiness report. A
 record with an action plan has a FaCT API execution table showing the request
 body, relevant cleaned values, mapped raw source values, preflight outcome and
-current execution state. The run page links to an execution summary with a
-downloadable JSON report and can run all currently safe actions sequentially.
-The record page can still check a court, run one action, or run all safe actions
-for that one court. Write buttons appear only when
+current execution state. The record page can check target sections, inspect
+request-only migration assumptions, and run one action or all safe actions for
+that court. The run page also offers run-level execution. Write buttons appear only when
 `FACT_DATA_API_WRITES_ENABLED=true`; server-side checks enforce the same rule.
 The run-level write control prompts for confirmation and uses the same
 no-overwrite preflight as the record controls. Tables support status/court-row

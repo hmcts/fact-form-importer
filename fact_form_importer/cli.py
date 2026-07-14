@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     api_action_parser.add_argument("--confirm", action="store_true", help="Required acknowledgement before any write.")
 
     api_court_parser = subparsers.add_parser(
-        "api-execute-court", help="Execute all preflight-safe actions for one reviewed court."
+        "api-execute-court", help="Execute all preflight-safe actions for one court."
     )
     api_court_parser.add_argument("--output", required=True, type=Path, help="Importer output root.")
     api_court_parser.add_argument("--run-id", required=True, help="Archived run identifier.")
@@ -215,6 +215,12 @@ def run(
     print(f"Address actions held for review: {summary['address_verification_action_blocking_count']}")
     print(f"API readiness ready actions: {summary['api_manifest_ready_action_count']}")
     print(f"API readiness pending actions: {summary['api_manifest_pending_action_count']}")
+    print(
+        "Review-required request defaults: "
+        f"{summary.get('api_manifest_review_required_default_count', 0)} "
+        "across "
+        f"{summary.get('api_manifest_review_required_default_action_count', 0)} actions"
+    )
     print(f"Wrote NSU review workbook: {result.review_workbook_path}")
     print(f"Wrote duplicate form review workbook: {result.duplicate_review_workbook_path}")
     print(f"Wrote read-only approval users: {result.submitters.json_path}")
@@ -405,6 +411,13 @@ def api_execute_run(output_path: Path, run_id: str, confirm: bool) -> int:
             print(
                 f"- {theme['label']}: {theme['action_count']} actions "
                 f"across {theme['court_count']} courts"
+            )
+        print("Attention by API request type:")
+        for request_type in summary.get("attention_by_request_type", []):
+            print(
+                f"- {request_type['label']}: {request_type['attention_action_count']} actions "
+                f"across {request_type['court_count']} courts, "
+                f"{request_type['distinct_outcome_count']} distinct outcomes"
             )
         print("See the execution summary JSON or local review UI for the per-court action list.")
     return 0

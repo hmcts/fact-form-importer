@@ -4,6 +4,8 @@
 <nav>
   <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
   <a href="{{ url_for('execution_summary_json', run_id=archive.manifest.run_id) }}">Download JSON</a>
+  <a href="#request-types">By request type</a>
+  <a href="#attention-actions">Per-court attention list</a>
 </nav>
 <div class="summary">
   {% for label, value in [('Courts considered', execution_summary.selected_court_count), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
@@ -15,11 +17,35 @@
 <table>
   <thead><tr><th>Theme</th><th>Actions</th><th>Courts</th><th>Example reason</th></tr></thead>
   <tbody>{% for theme in execution_summary.common_error_themes %}
-    <tr><td><strong>{{ theme.label }}</strong><br><code>{{ theme.code }}</code></td><td>{{ theme.action_count }}</td><td>{{ theme.courts | join(', ') }}</td><td>{{ theme.example_reason }}</td></tr>
+    <tr><td><strong>{{ theme.label }}</strong><br><code>{{ theme.code }}</code></td><td>{{ theme.action_count }}</td><td>{{ theme.court_count }}<br><small>Examples: {{ theme.courts[:5] | join(', ') }}</small></td><td>{{ theme.example_reason }}</td></tr>
   {% else %}<tr><td colspan="4">No actions currently need attention.</td></tr>{% endfor %}</tbody>
 </table>
 
-<h2>Actions needing attention</h2>
+<h2 id="request-types">Attention by API request type</h2>
+<p>This separates deliberate preflight blocks from requests that reached FaCT and failed.</p>
+{% for request_type in execution_summary.attention_by_request_type %}
+<h3>{{ request_type.label }}</h3>
+<p><strong>{{ request_type.attention_action_count }}</strong> actions across <strong>{{ request_type.court_count }}</strong> courts. {{ request_type.distinct_outcome_count }} distinct outcome{% if request_type.distinct_outcome_count != 1 %}s{% endif %}.<br>
+{% for method in request_type.methods %}<code>{{ method }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+{% for endpoint in request_type.endpoint_templates %}<code>{{ endpoint }}</code>{% if not loop.last %}<br>{% endif %}{% endfor %}</p>
+<table>
+  <thead><tr><th>Classification</th><th>Status</th><th>Actions</th><th>Courts</th><th>Distinct reason</th><th>Decision guidance</th></tr></thead>
+  <tbody>{% for outcome in request_type.outcomes %}
+    <tr>
+      <td><code>{{ outcome.classification }}</code></td>
+      <td>{{ outcome.status }}{% if outcome.http_status %}<br>HTTP {{ outcome.http_status }}{% endif %}</td>
+      <td>{{ outcome.action_count }}</td>
+      <td>{{ outcome.court_count }}{% if outcome.example_courts %}<br><small>Examples: {{ outcome.example_courts | join(', ') }}</small>{% endif %}</td>
+      <td>{{ outcome.reason }}{% if outcome.example_reason and outcome.example_reason != outcome.reason %}<br><small>Example: {{ outcome.example_reason }}</small>{% endif %}</td>
+      <td>{{ outcome.decision_guidance }}</td>
+    </tr>
+  {% endfor %}</tbody>
+</table>
+{% else %}
+<p>No API request types currently need attention.</p>
+{% endfor %}
+
+<h2 id="attention-actions">Actions needing attention</h2>
 <table>
   <thead><tr><th>Court</th><th>Source rows</th><th>Action</th><th>Status</th><th>HTTP</th><th>Reason</th></tr></thead>
   <tbody>{% for action in execution_summary.attention_actions %}
