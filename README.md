@@ -559,11 +559,18 @@ the controlling Yes/No answer is present and FaCT requires a numeric value:
 - `interviewRooms=false` sends `interviewRoomCount=0`, including when the
   optional form count contradicts that No answer.
 
+Explicit, unambiguous lift measurements are preserved through request-only unit
+normalisation. Door widths supplied in millimetres, centimetres, or metres are
+sent as integer centimetres, and limits carrying `kg`/`kgs` are sent as integer
+kilograms (for example, `800 mm` becomes `80` cm and `650KG` becomes `650` kg).
+Ambiguous prose, conflicting measurements, zero, and values that cannot be
+represented exactly as the required positive integer remain pending.
+
 These defaults are request-only: raw and cleaned source data are unchanged, and
 each action displays a `Migration assumptions` entry in the UI/action plan.
-They are never used for an explicit zero/non-numeric value or a missing parent
-Yes/No answer; those actions remain pending. The data is then reviewed through
-the existing approval feature in `fact-admin-frontend`.
+They are never used for an explicit zero, an unrecognised or ambiguous value,
+or a missing parent Yes/No answer; those actions remain pending. The data is
+then reviewed through the existing approval feature in `fact-admin-frontend`.
 
 The public FaCT frontend already has a safe no-number fallback for a court with
 no lift. To unblock these actions without inventing data, either provide a

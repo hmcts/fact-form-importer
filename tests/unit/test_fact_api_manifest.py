@@ -464,6 +464,39 @@ def test_manifest_uses_review_visible_defaults_for_blank_lift_measurements():
     assert manifest.summary["api_manifest_review_required_default_action_count"] == 1
 
 
+def test_manifest_normalises_explicit_lift_measurement_units():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=8),
+        court_slug="croydon-employment-tribunal",
+        status="processed",
+        facilities={
+            "accessible_parking": False,
+            "accessible_toilet_description": "Available on the first floor.",
+            "accessible_entrance": True,
+            "hearing_enhancement_equipment": "Infrared systems are available at this court.",
+            "lift_available": True,
+            "lift_door_width": "800 mm",
+            "lift_weight_limit": "650KG",
+            "quiet_room_available": False,
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+
+    action = next(
+        action
+        for action in manifest.records[0].actions
+        if action.resource == "accessibility_options"
+    )
+    assert action.readiness == "ready"
+    assert action.reason is None
+    assert action.body["liftDoorWidth"] == 80
+    assert action.body["liftDoorLimit"] == 650
+    assert action.migration_assumptions == []
+
+
 def test_manifest_does_not_default_explicitly_invalid_or_missing_lift_answers():
     explicit_invalid = CourtSubmission(
         source=SourceMetadata(source_row_number=8),

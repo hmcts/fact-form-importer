@@ -397,6 +397,9 @@ def test_llm_actions_page_labels_strict_address_policy_approval(tmp_path):
     assert page.status_code == 200
     assert b"Automatically approved" in page.data
     assert b"high-single-os-candidate-v1" in page.data
+    assert b"Save address and continue" not in page.data
+    assert b"Edit approved address" in page.data
+    assert b"Save edited address" in page.data
     assert b"Addresses auto-approved" in summary.data
     assert service.get_execution_summary(run_id)["llm_approval_counts"]["auto_approved"] == 1
     assert execution_client.writes == []

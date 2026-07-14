@@ -40,6 +40,7 @@ from fact_form_importer.execution.review_state import (
 from fact_form_importer.llm.review import load_or_derive_llm_actions_review
 from fact_form_importer.output.archive import load_run_archive
 from fact_form_importer.output.fact_api_manifest import (
+    API_MANIFEST_VERSION,
     normalise_fact_api_action_body,
     validate_fact_api_action_body,
 )
@@ -632,7 +633,7 @@ class ApiExecutionService:
         }
         if (
             latest.get("run_id") == run_id
-            and str(report.get("manifest_version") or "") < "1.7"
+            and str(report.get("manifest_version") or "") < API_MANIFEST_VERSION
             and (archive["path"] / "submissions_cleaned.json").exists()
         ):
             return derive_latest_execution_overlay(

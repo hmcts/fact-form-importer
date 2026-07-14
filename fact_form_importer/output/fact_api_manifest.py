@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -25,7 +26,7 @@ from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "1.7"
+API_MANIFEST_VERSION = "1.8"
 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
@@ -491,11 +492,13 @@ def _accessibility_options_body(facilities: dict[str, Any]) -> dict[str, Any]:
                 facilities.get("lift_door_width"),
                 lift_available,
                 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM,
+                measurement="width",
             ),
             "liftDoorLimit": _lift_measurement_for_request(
                 facilities.get("lift_weight_limit"),
                 lift_available,
                 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG,
+                measurement="weight",
             ),
             "quietRoom": facilities.get("quiet_room_available"),
         }
@@ -1082,21 +1085,108 @@ def _is_missing_form_value(value: Any) -> bool:
 
 
 def _lift_measurement_for_request(
-    value: Any, lift_available: Any, migration_default: int
+    value: Any,
+    lift_available: Any,
+    migration_default: int,
+    *,
+    measurement: Literal["width", "weight"],
 ) -> int | None:
-    """Use a reviewed numeric placeholder only for a present `lift=yes` answer.
+    """Normalise explicit units or use a placeholder for a blank dependent answer.
 
-    An explicit invalid value, such as zero or non-numeric text, remains absent
-    and is blocked by FaCT contract validation. This deliberately distinguishes
-    missing dependent data from a missing/invalid controlling answer.
+    FaCT expects door width as an integer number of centimetres and lift limit
+    as an integer number of kilograms.  Forms commonly include those units in
+    the answer (for example ``800 mm`` or ``650KG``), so retain unambiguous
+    measurements rather than treating them as absent.  Explicit invalid or
+    ambiguous text remains blocked.  The migration default is reserved for a
+    genuinely blank dependent answer when the lift answer is yes.
     """
 
-    parsed = _positive_int(value)
+    parsed = _parse_lift_measurement(value, measurement)
     if parsed is not None:
         return parsed
     if lift_available is True and _is_missing_form_value(value):
         return migration_default
     return None
+
+
+def _parse_lift_measurement(
+    value: Any, measurement: Literal["width", "weight"]
+) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        return _positive_integral_decimal(value)
+    if not isinstance(value, str):
+        return None
+
+    text = unicodedata.normalize("NFKC", value).strip().casefold()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return _positive_integral_decimal(text)
+
+    if measurement == "width":
+        units = {
+            "mm": Decimal("0.1"),
+            "millimetre": Decimal("0.1"),
+            "millimetres": Decimal("0.1"),
+            "millimeter": Decimal("0.1"),
+            "millimeters": Decimal("0.1"),
+            "cm": Decimal("1"),
+            "cms": Decimal("1"),
+            "centimetre": Decimal("1"),
+            "centimetres": Decimal("1"),
+            "centimeter": Decimal("1"),
+            "centimeters": Decimal("1"),
+            "m": Decimal("100"),
+            "metre": Decimal("100"),
+            "metres": Decimal("100"),
+            "meter": Decimal("100"),
+            "meters": Decimal("100"),
+        }
+        unit_pattern = (
+            r"millimetres?|millimeters?|centimetres?|centimeters?|cms?|mm|metres?|meters?|m"
+        )
+    else:
+        units = {
+            "kg": Decimal("1"),
+            "kgs": Decimal("1"),
+            "kilogram": Decimal("1"),
+            "kilograms": Decimal("1"),
+        }
+        unit_pattern = r"kilograms?|kgs?"
+
+    converted = []
+    for match in re.finditer(rf"(?<![\d.])(\d+(?:\.\d+)?)\s*({unit_pattern})\b", text):
+        number = _decimal(match.group(1))
+        if number is not None:
+            converted.append(number * units[match.group(2)])
+    if not converted:
+        return None
+    parsed_values = [_positive_integral_decimal(item) for item in converted]
+    if any(item is None for item in parsed_values):
+        return None
+    values = set(parsed_values)
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _positive_integral_decimal(value: Any) -> int | None:
+    number = _decimal(value)
+    if (
+        number is None
+        or not number.is_finite()
+        or number <= 0
+        or number != number.to_integral_value()
+    ):
+        return None
+    return int(number)
+
+
+def _decimal(value: Any) -> Decimal | None:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
 
 
 def _interview_room_count_for_request(rooms: dict[str, Any]) -> int | None:

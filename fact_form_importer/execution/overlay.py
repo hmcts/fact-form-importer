@@ -10,7 +10,10 @@ from pydantic import ValidationError
 
 from fact_form_importer.llm.review import address_verification_batch_from_dict
 from fact_form_importer.models.court_submission import CourtSubmission
-from fact_form_importer.output.fact_api_manifest import build_fact_api_import_manifest
+from fact_form_importer.output.fact_api_manifest import (
+    API_MANIFEST_VERSION,
+    build_fact_api_import_manifest,
+)
 from fact_form_importer.validators.fact_api_courts import CourtReference
 from fact_form_importer.validators.vocabularies import Vocabularies
 
@@ -26,9 +29,10 @@ def derive_latest_execution_overlay(
     path = directory / f"{run_id}.plan.json"
     if path.exists():
         derived = json.loads(path.read_text(encoding="utf-8"))
-        return _preserve_succeeded_sections(
-            derived, original, succeeded_action_ids or set()
-        )
+        if derived.get("manifest_version") == API_MANIFEST_VERSION:
+            return _preserve_succeeded_sections(
+                derived, original, succeeded_action_ids or set()
+            )
 
     try:
         submissions = [

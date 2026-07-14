@@ -120,7 +120,7 @@ def test_overlay_derives_section_plan_and_preserves_succeeded_legacy_sections(tm
         "run", archive, tmp_path / "out", original, {"legacy-address", "legacy-orphan"}
     )
 
-    assert overlay["manifest_version"] == "1.7"
+    assert overlay["manifest_version"] == "1.8"
     assert overlay["derived_execution_overlay"] is True
     assert overlay["preserved_succeeded_section_count"] == 2
     example = next(
