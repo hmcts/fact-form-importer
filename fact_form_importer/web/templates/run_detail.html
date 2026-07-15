@@ -39,6 +39,7 @@
 <div class="summary">
   <div><strong>Unique courts needing review</strong><br><a href="{{ url_for('records', run_id=archive.manifest.run_id, work='outstanding') }}">{{ review_progress.unique_courts_outstanding }}</a></div>
   <div><strong>Review decisions pending</strong><br>{{ review_progress.pending_value_decisions }}<br><span class="muted">across {{ review_progress.pending_value_decision_courts }} courts, including results without an API action</span></div>
+  <div><strong>Denied review decisions</strong><br>{{ review_progress.denied_value_decisions }}<br><span class="muted">across {{ review_progress.denied_value_decision_courts }} courts; dependent actions remain held</span></div>
   <div><strong>Source corrections</strong><br>{{ review_progress.source_correction_items }}<br><span class="muted">across {{ review_progress.source_correction_courts }} courts</span></div>
   <div><strong>Existing-data approvals pending</strong><br>{{ review_progress.existing_data_approvals_pending }}<br><span class="muted">across {{ review_progress.existing_data_approval_courts }} courts</span></div>
   <div><strong>Ambiguous comparisons</strong><br>{{ review_progress.ambiguous_comparisons }}<br><span class="muted">across {{ review_progress.ambiguous_comparison_courts }} courts</span></div>
@@ -49,7 +50,7 @@
 
 <h2>Approval outcomes</h2>
 <div class="summary">
-  {% for label, value in [('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('High-confidence fields auto-approved', execution_summary.llm_approval_counts.auto_approved_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved)] %}
+  {% for label, value in [('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('High-confidence fields auto-approved', execution_summary.llm_approval_counts.auto_approved_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Results denied', execution_summary.llm_approval_counts.denied)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>

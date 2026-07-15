@@ -383,15 +383,24 @@ def create_app(
         category = request.args.get("category")
         query = (request.args.get("q") or "").strip().casefold()
         ledger = service.get_ledger(run_id)
+        target_overrides = service.get_execution_review(run_id).court_target_overrides
         for submission in submissions:
-            court = ledger.courts.get(submission.get("court_slug"))
-            submission["execution_status"] = court.status if court else "not_started"
             row = submission.get("source", {}).get("source_row_number")
+            target_override = target_overrides.get(str(row))
+            operational_slug = (
+                target_override.target_slug
+                if target_override
+                else submission.get("court_slug")
+            )
+            submission["operational_court_slug"] = operational_slug
+            court = ledger.courts.get(operational_slug)
+            submission["execution_status"] = court.status if court else "not_started"
             _add_record_review_guidance(
                 submission,
                 review_items_by_row.get(row, []),
                 records_by_row.get(row),
                 action_tasks_by_row.get(row, []),
+                target_override=target_override,
             )
         filtered = [
             submission
@@ -430,8 +439,17 @@ def create_app(
         )
         if submission is None:
             abort(404)
-        manifest = app.config["EXECUTION_SERVICE"].get_readiness_report(run_id)
-        llm_review = app.config["EXECUTION_SERVICE"].get_llm_actions_review(run_id)
+        service = app.config["EXECUTION_SERVICE"]
+        manifest = service.get_readiness_report(run_id)
+        llm_review = service.get_llm_actions_review(run_id)
+        court_target_resolution = service.get_court_target_resolution(
+            run_id, source_row_number
+        )
+        operational_court_slug = (
+            court_target_resolution.get("override", {}).get("target_slug")
+            if court_target_resolution and court_target_resolution.get("override")
+            else submission.get("court_slug")
+        )
         actions = next(
             (
                 item.get("actions", [])
@@ -440,8 +458,8 @@ def create_app(
             ),
             [],
         )
-        ledger = app.config["EXECUTION_SERVICE"].get_ledger(run_id)
-        court_execution = ledger.courts.get(submission.get("court_slug"))
+        ledger = service.get_ledger(run_id)
+        court_execution = ledger.courts.get(operational_court_slug)
         actions = [
             {
                 "body": action.get("body", {}),
@@ -465,6 +483,11 @@ def create_app(
                     "changes", []
                 )
             ).get(source_row_number, []),
+            target_override=(
+                court_target_resolution.get("override")
+                if court_target_resolution
+                else None
+            ),
         )
         return render_template(
             "record_detail.html",
@@ -472,8 +495,61 @@ def create_app(
             submission=submission,
             actions=actions,
             court_execution=court_execution,
+            court_target_resolution=court_target_resolution,
+            operational_court_slug=operational_court_slug,
+            court_target_error=request.args.get("court_target_error"),
+            court_target_saved=request.args.get("court_target_saved"),
             writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
             active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
+        )
+
+    @app.post("/runs/<run_id>/records/<int:source_row_number>/court-target")
+    def select_court_target(run_id: str, source_row_number: int):
+        _archive_or_404(output_root, run_id)
+        review_id = request.form.get("review_id")
+        params = {
+            "run_id": run_id,
+            "status": request.form.get("review_status") or None,
+            "confidence": request.form.get("review_confidence") or None,
+            "q": request.form.get("review_query") or None,
+            "queue": request.form.get("review_queue") or None,
+            "field_page": request.form.get("field_page") or 1,
+            "address_page": request.form.get("address_page") or 1,
+        }
+
+        def destination(**extra):
+            if review_id:
+                return url_for(
+                    "llm_actions_review",
+                    **params,
+                    **extra,
+                    _anchor=f"review-{review_id}",
+                )
+            return url_for(
+                "record_detail",
+                run_id=run_id,
+                source_row_number=source_row_number,
+                **extra,
+            )
+
+        try:
+            override = app.config["EXECUTION_SERVICE"].set_court_target_override(
+                run_id,
+                source_row_number,
+                request.form.get("target_slug") or "",
+            )
+        except ValueError as exc:
+            return redirect(
+                destination(
+                    court_target_error=str(exc),
+                    court_target_review_id=review_id,
+                )
+            )
+        return redirect(
+            destination(
+                court_target_saved=override.target_slug,
+                court_target_review_id=review_id,
+            )
         )
 
     @app.get("/runs/<run_id>/issues")
@@ -548,6 +624,7 @@ def create_app(
             item["address_editable"] = bool(
                 item.get("kind") == "address"
                 and item.get("approvable", item.get("actionable"))
+                and item.get("approval_status") in {"pending", "approved"}
                 and not active_job
                 and not {
                     action.get("status")
@@ -578,6 +655,10 @@ def create_app(
             address_page=address_page,
             address_pages=address_pages,
             approval_complete=request.args.get("complete") == "1",
+            bulk_approved=request.args.get("bulk_approved"),
+            court_target_error=request.args.get("court_target_error"),
+            court_target_saved=request.args.get("court_target_saved"),
+            court_target_review_id=request.args.get("court_target_review_id"),
             active_execution_job=active_job,
         )
 
@@ -610,6 +691,58 @@ def create_app(
         return redirect(
             _next_llm_review_url(
                 app.config["EXECUTION_SERVICE"], run_id, review_id, request.form
+            )
+        )
+
+    @app.post("/runs/<run_id>/llm-actions/<review_id>/deny")
+    def deny_llm_action(run_id: str, review_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            app.config["EXECUTION_SERVICE"].deny_llm_review(run_id, review_id)
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(
+            _next_llm_review_url(
+                app.config["EXECUTION_SERVICE"], run_id, review_id, request.form
+            )
+        )
+
+    @app.post("/runs/<run_id>/llm-actions/<review_id>/reconsider")
+    def reconsider_llm_action(run_id: str, review_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            app.config["EXECUTION_SERVICE"].reconsider_llm_review(run_id, review_id)
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(
+            url_for(
+                "llm_actions_review",
+                run_id=run_id,
+                status="pending",
+                confidence=request.form.get("review_confidence") or None,
+                q=request.form.get("review_query") or None,
+                queue=request.form.get("review_queue") or None,
+                field_page=request.form.get("field_page") or 1,
+                address_page=request.form.get("address_page") or 1,
+                _anchor=f"review-{review_id}",
+            )
+        )
+
+    @app.post("/runs/<run_id>/llm-actions/approve-all")
+    def approve_all_llm_actions(run_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            _, approved = app.config[
+                "EXECUTION_SERVICE"
+            ].approve_all_pending_llm_reviews(run_id)
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(
+            url_for(
+                "llm_actions_review",
+                run_id=run_id,
+                status="pending",
+                bulk_approved=approved,
             )
         )
 
@@ -654,6 +787,7 @@ def create_app(
             comparison_job=comparison_job,
             active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
             review_complete=request.args.get("completed") == "1",
+            bulk_approved=request.args.get("bulk_approved"),
         )
 
     @app.post("/runs/<run_id>/api-changes/refresh")
@@ -687,6 +821,24 @@ def create_app(
         return redirect(
             _next_api_change_location(
                 app.config["EXECUTION_SERVICE"], run_id, change_id
+            )
+        )
+
+    @app.post("/runs/<run_id>/api-changes/approve-all")
+    def approve_all_api_changes(run_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            _, approved = app.config[
+                "EXECUTION_SERVICE"
+            ].approve_all_target_changes(run_id)
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(
+            url_for(
+                "api_changes_review",
+                run_id=run_id,
+                view="pending",
+                bulk_approved=approved,
             )
         )
 
@@ -960,6 +1112,18 @@ def _run_factor_summary(archive: dict[str, Any]) -> dict[str, int]:
 
 def _review_overview(archive: dict[str, Any], service: ApiExecutionService) -> dict[str, Any]:
     submissions = _operational_submissions(archive)
+    run_id = str(archive["manifest"].get("run_id") or "")
+    execution_review = (
+        service.get_execution_review(run_id)
+        if hasattr(service, "get_execution_review")
+        else None
+    )
+    target_override_rows = {
+        int(row)
+        for row in (
+            execution_review.court_target_overrides if execution_review else {}
+        )
+    }
     row_groups: dict[str, set[int]] = {}
     row_issue_counts: dict[str, int] = {}
     for submission in submissions:
@@ -969,6 +1133,11 @@ def _review_overview(archive: dict[str, Any], service: ApiExecutionService) -> d
         if not isinstance(row, int):
             continue
         for issue in submission.get("issues", []):
+            if row in target_override_rows and issue.get("code") in {
+                "COURT_SLUG_NOT_FOUND",
+                "COURT_SLUG_SUGGESTED",
+            }:
+                continue
             if issue.get("code") not in HUMAN_REVIEW_ISSUE_CODES and issue.get("severity") != "error":
                 continue
             category = _review_category(
@@ -977,9 +1146,8 @@ def _review_overview(archive: dict[str, Any], service: ApiExecutionService) -> d
             row_groups.setdefault(category, set()).add(row)
             row_issue_counts[category] = row_issue_counts.get(category, 0) + 1
 
-    run_id = archive["manifest"].get("run_id")
-    llm = service.get_llm_actions_review(str(run_id))
-    changes = service.get_api_changes_review(str(run_id))["changes"]
+    llm = service.get_llm_actions_review(run_id)
+    changes = service.get_api_changes_review(run_id)["changes"]
     hold_groups: dict[str, dict[str, Any]] = {}
 
     def add_hold(name: str, row: int | None, change_id: str) -> None:
@@ -1167,35 +1335,45 @@ def _os_address_factors(archive: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _workflow_payload(run_id: str, service: ApiExecutionService) -> dict[str, Any]:
-    llm = service.get_llm_actions_review(run_id)
-    changes = service.get_api_changes_review(run_id).get("changes", [])
-    execution = service.get_execution_summary(run_id)
-    approval_counts = llm.get("approval_counts", {})
-    llm_pending = int(
-        approval_counts.get("review_pending", approval_counts.get("pending", 0))
+    execution = service.get_cached_execution_summary(run_id)
+    approval_counts = execution.get("llm_approval_counts", {})
+    review_counts = execution.get("review_progress_counts", {})
+    comparisons = execution.get("replacement_approval_counts", {})
+    llm_pending = int(review_counts.get("pending_value_decisions", 0))
+    llm_execution_pending = int(
+        review_counts.get(
+            "pending_execution_value_dependencies",
+            approval_counts.get("pending", 0),
+        )
     )
-    llm_execution_pending = int(approval_counts.get("pending", 0))
-    comparisons = _comparison_summary(changes)
-    comparison_pending = comparisons["not_checked"]
-    change_approval_pending = comparisons["approval_required"]
-    merge_conflicts = comparisons["conflicts"]
+    comparison_pending = int(comparisons.get("not_checked", 0))
+    change_approval_pending = int(comparisons.get("pending", 0))
+    merge_conflicts = int(review_counts.get("ambiguous_comparisons", 0))
     court_counts = execution.get("court_status_counts", {})
     first_incomplete = (
-        "llm" if llm_pending else "changes" if comparison_pending or change_approval_pending else "courts"
+        "llm"
+        if llm_pending
+        else "changes"
+        if comparison_pending or change_approval_pending or merge_conflicts
+        else "courts"
     )
+    comparison_checked = int(comparisons.get("comparisons", 0))
+    comparison_required = int(comparisons.get("required", 0))
     return {
         "first_incomplete": first_incomplete,
         "llm_pending": llm_pending,
         "llm_execution_pending": llm_execution_pending,
-        "llm_total": llm.get("item_count", 0),
+        "llm_total": int(approval_counts.get("total", 0))
+        + int(approval_counts.get("not_actionable", 0)),
         "comparison_pending": comparison_pending,
         "change_approval_pending": change_approval_pending,
         "merge_conflicts": merge_conflicts,
-        "comparison_total": comparisons["total"],
-        "comparison_checked": comparisons["checked"],
-        "comparison_no_change": comparisons["no_change"],
-        "comparison_empty_target": comparisons["empty_target"],
-        "comparison_approved": comparisons["approved"],
+        "comparison_total": execution.get("planned_action_count", 0),
+        "comparison_checked": comparison_checked,
+        "comparison_no_approval": max(
+            comparison_checked - comparison_required, 0
+        ),
+        "comparison_approved": comparisons.get("approved", 0),
         "court_count": execution.get("selected_court_count", 0),
         "court_counts": court_counts,
         "action_counts": execution.get("action_status_counts", {}),
@@ -1408,6 +1586,8 @@ def _add_record_review_guidance(
     review_items: list[dict[str, Any]],
     manifest_record: dict[str, Any] | None,
     action_review_tasks: list[dict[str, str]] | None = None,
+    *,
+    target_override: Any = None,
 ) -> None:
     """Describe whether each archived issue needs a decision, source fix, or no action."""
 
@@ -1415,6 +1595,19 @@ def _add_record_review_guidance(
     for issue in submission.get("issues", []):
         matching_items = _matching_llm_review_items(issue, review_items)
         issue["review_guidance"] = _record_issue_guidance(issue, matching_items)
+        if target_override and issue.get("code") in {
+            "COURT_SLUG_NOT_FOUND",
+            "COURT_SLUG_SUGGESTED",
+        }:
+            issue["review_guidance"] = {
+                "state": "complete",
+                "label": "Resolved with a validated FaCT court target",
+                "explanation": (
+                    "The submitted slug remains in immutable audit evidence, but the "
+                    "operational plan uses the reviewer-selected existing FaCT court."
+                ),
+                "remedy": "No workbook rerun is required for this run.",
+            }
 
     action_count = 0
     if manifest_record:

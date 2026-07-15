@@ -36,7 +36,7 @@ _COURT_STATUSES = (
     "completed",
 )
 _ATTENTION_ACTION_STATUSES = {"blocked", "failed", "unknown"}
-EXECUTION_SUMMARY_VERSION = "1.9"
+EXECUTION_SUMMARY_VERSION = "2.0"
 _SOURCE_CORRECTION_CODES = {
     "COURT_SLUG_NOT_FOUND",
     "COURT_SLUG_SUGGESTED",
@@ -95,6 +95,7 @@ def build_execution_summary(
     review_report = review_report or {"items": []}
     approval_ledger = approvals or LlmApprovalLedger(run_id=run_id)
     approved_ids = set(approval_ledger.approvals)
+    denied_ids = set(approval_ledger.denials)
     review_ledger = execution_review or ExecutionReviewLedger(run_id=run_id)
 
     records = sorted(
@@ -121,6 +122,8 @@ def build_execution_summary(
                 review_ids = _action_review_ids(action, review_report)
                 if any(review_id not in approved_ids for review_id in review_ids):
                     hold_codes.append("value_approval")
+                if any(review_id in denied_ids for review_id in review_ids):
+                    hold_codes.append("denied_value")
                 comparison = review_ledger.comparisons.get(
                     target_change_id(court_slug, action_id)
                 )
@@ -199,6 +202,7 @@ def build_execution_summary(
         "review_progress_counts": review_progress,
         "court_hold_counts": {
             "value_approval": len(hold_courts["value_approval"]),
+            "denied_value": len(hold_courts["denied_value"]),
             "target_replacement": len(hold_courts["target_replacement"]),
             "source_selection": len(hold_courts["source_selection"]),
             "held_by_approvals": len(approval_hold_courts),
@@ -250,6 +254,7 @@ def _review_progress_counts(
     """Count known outstanding human work once per authoritative court identity."""
 
     approved_ids = set(approvals.approvals)
+    denied_ids = set(approvals.denials)
     rows = {
         submission.get("source", {}).get("source_row_number"): submission
         for submission in submissions
@@ -262,8 +267,10 @@ def _review_progress_counts(
     review_items_by_row: dict[int, list[dict[str, Any]]] = defaultdict(list)
     pending_value_courts: set[str] = set()
     pending_execution_value_courts: set[str] = set()
+    denied_value_courts: set[str] = set()
     pending_value_items = []
     pending_execution_value_items = []
+    denied_value_items = []
     for item in review_report.get("items", []):
         review_id = str(item.get("review_id") or "")
         if not review_id or not item.get("approvable", item.get("actionable")):
@@ -272,6 +279,10 @@ def _review_progress_counts(
         if isinstance(row, int):
             review_items_by_row[row].append(item)
         if review_id in approved_ids:
+            continue
+        if review_id in denied_ids:
+            denied_value_items.append(item)
+            denied_value_courts.add(_review_court_key(item, rows.get(row)))
             continue
         pending_value_items.append(item)
         court_key = _review_court_key(item, rows.get(row))
@@ -286,6 +297,13 @@ def _review_progress_counts(
         row = submission.get("source", {}).get("source_row_number")
         row_items = review_items_by_row.get(row, []) if isinstance(row, int) else []
         for issue in submission.get("issues", []):
+            if (
+                isinstance(row, int)
+                and str(row) in execution_review.court_target_overrides
+                and issue.get("code")
+                in {"COURT_SLUG_NOT_FOUND", "COURT_SLUG_SUGGESTED"}
+            ):
+                continue
             if _issue_is_covered_by_review_item(issue, row_items):
                 continue
             if not _issue_needs_source_correction(issue):
@@ -337,6 +355,8 @@ def _review_progress_counts(
         "pending_execution_value_dependency_courts": len(
             pending_execution_value_courts
         ),
+        "denied_value_decisions": len(denied_value_items),
+        "denied_value_decision_courts": len(denied_value_courts),
         "ingestion_review_courts": len(ingestion_review_courts),
         "ingestion_or_value_review_courts": len(
             ingestion_review_courts | pending_value_courts
@@ -447,7 +467,9 @@ def _llm_approval_counts(
     actionable = [item for item in review_report.get("items", []) if item.get("actionable")]
     actionable_ids = {str(item.get("review_id")) for item in actionable}
     approved_ids = set(approvals.approvals)
+    denied_ids = set(approvals.denials)
     approved = len(actionable_ids & approved_ids)
+    denied = len(actionable_ids & denied_ids)
     auto_approved = sum(
         approval.approval_method == "policy" and review_id in actionable_ids
         for review_id, approval in approvals.approvals.items()
@@ -485,7 +507,8 @@ def _llm_approval_counts(
             approval.policy_version in FIELD_AUTO_APPROVAL_POLICY_VERSIONS
             for approval in policy_approved.values()
         ),
-        "pending": len(actionable) - approved - already_executed,
+        "denied": denied,
+        "pending": len(actionable) - approved - denied - already_executed,
         "already_executed": already_executed,
         "not_actionable": sum(
             not item.get("actionable") for item in review_report.get("items", [])

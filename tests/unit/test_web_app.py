@@ -3,6 +3,7 @@ import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 from zipfile import ZIP_STORED, ZipFile
 
 import httpx
@@ -10,7 +11,9 @@ import httpx
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.fact_api import ApiResponse
 from fact_form_importer.execution.models import ExecutionLedger
+from fact_form_importer.execution.review_state import build_target_comparison
 from fact_form_importer.execution.service import ApiExecutionService
+from fact_form_importer.llm.review import field_review_id
 from fact_form_importer.output.archive import publish_run_archive, stage_path
 from fact_form_importer.validators.fact_api_courts import CourtReference
 from fact_form_importer.web.app import (
@@ -473,6 +476,186 @@ def test_llm_approval_advances_to_next_item_and_preserves_confidence_filter(tmp_
     assert approved.headers["Location"].endswith("#review-second-high")
 
 
+def test_llm_deny_then_bulk_approve_excludes_denied_and_never_writes(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    items = []
+    for row, review_id in ((2, "deny-me"), (3, "approve-one"), (4, "approve-two")):
+        items.append(
+            {
+                "review_id": review_id,
+                "kind": "field",
+                "source_row_number": row,
+                "court_slug": "example-court",
+                "field": "facilities.food_and_drink",
+                "llm_input": {"raw_value": "water", "cleaned_value": "water"},
+                "model_result": {
+                    "operation": "set",
+                    "value": ["Free water dispensers"],
+                    "confidence": "medium",
+                    "needs_human_review": True,
+                    "reason": "Test result",
+                },
+                "outcome": "accepted",
+                "dependent_action_ids": ["example-court-1"],
+                "actionable": True,
+            }
+        )
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps({"review_version": "1.1", "items": items})
+    )
+    execution_client = _FakeExecutionClient()
+    service = ApiExecutionService(output_root, AppConfig(), execution_client)
+    client = create_app(output_root, execution_service=service).test_client()
+
+    pending = client.get(f"/runs/{run_id}/llm-actions?status=pending")
+    denied = client.post(
+        f"/runs/{run_id}/llm-actions/deny-me/deny",
+        data={"review_status": "pending", "field_page": "1", "address_page": "1"},
+    )
+    denied_page = client.get(f"/runs/{run_id}/llm-actions?status=denied")
+    bulk = client.post(f"/runs/{run_id}/llm-actions/approve-all")
+    bulk_page = client.get(bulk.headers["Location"])
+
+    assert b"Deny and continue" in pending.data
+    assert b"Approve all 3 remaining results" in pending.data
+    assert denied.headers["Location"].endswith("#review-approve-one")
+    assert b"Reconsider" in denied_page.data
+    assert "bulk_approved=2" in bulk.headers["Location"]
+    assert b"2 remaining LLM review approval(s) recorded" in bulk_page.data
+    review = service.get_llm_actions_review(run_id)
+    assert review["approval_counts"]["review_pending"] == 0
+    assert review["approval_counts"]["review_denied"] == 1
+    assert service.get_execution_summary(run_id)["llm_approval_counts"]["denied"] == 1
+    assert execution_client.writes == []
+
+    reconsidered = client.post(
+        f"/runs/{run_id}/llm-actions/deny-me/reconsider",
+        data={"review_status": "denied", "field_page": "1", "address_page": "1"},
+    )
+
+    assert "status=pending" in reconsidered.headers["Location"]
+    assert reconsidered.headers["Location"].endswith("#review-deny-me")
+    assert execution_client.writes == []
+
+
+def test_missing_court_target_can_be_validated_without_writing_and_collision_is_rejected(
+    tmp_path,
+):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    submissions_path = archive_path / "submissions_cleaned.json"
+    submissions = json.loads(submissions_path.read_text())
+    submissions[1] = {
+        "source": {"source_row_number": 3},
+        "court_slug": "missing-court",
+        "court_slug_raw": "Missing Court",
+        "status": "needs_human_review",
+        "facilities": {"parking_available": True},
+        "raw": {"court_slug": "Missing Court"},
+        "issues": [
+            {
+                "field": "court_slug",
+                "code": "COURT_SLUG_NOT_FOUND",
+                "severity": "warning",
+                "message": "Court slug does not exist in FaCT Data API",
+                "raw_value": "missing-court",
+                "cleaned_value": {
+                    "suggested_slug": "suggested-court",
+                    "suggested_court_name": "Suggested Court",
+                },
+            }
+        ],
+    }
+    submissions_path.write_text(json.dumps(submissions))
+    readiness_path = archive_path / "api_readiness_report.json"
+    readiness = json.loads(readiness_path.read_text())
+    readiness["manifest_version"] = "1.9"
+    readiness_path.write_text(json.dumps(readiness))
+    review_id = field_review_id(3, "facilities.parking_available")
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": review_id,
+                        "kind": "field",
+                        "source_row_number": 3,
+                        "court_slug": "missing-court",
+                        "field": "facilities.parking_available",
+                        "llm_input": {"cleaned_value": True},
+                        "model_result": {
+                            "operation": "set",
+                            "value": True,
+                            "confidence": "medium",
+                            "needs_human_review": True,
+                            "reason": "Test result",
+                        },
+                        "outcome": "accepted",
+                        "dependent_action_ids": [],
+                        "actionable": False,
+                        "approvable": True,
+                    }
+                ],
+            }
+        )
+    )
+    execution_client = _FakeExecutionClient()
+    service = ApiExecutionService(output_root, AppConfig(), execution_client)
+    client = create_app(output_root, execution_service=service).test_client()
+
+    existing_comparison = build_target_comparison(
+        "example-court",
+        {
+            "action_id": "example-court-1",
+            "resource": "building_facilities",
+            "source_row_number": 2,
+            "body": {"parking": True},
+        },
+        {"parking": False},
+    )
+    service.review_store.save_comparison(run_id, existing_comparison)
+    service.review_store.approve_target(run_id, existing_comparison.change_id)
+
+    page = client.get(f"/runs/{run_id}/llm-actions?status=pending&q=3")
+    collision = client.post(
+        f"/runs/{run_id}/records/3/court-target",
+        data={"target_slug": "example-court", "review_id": review_id},
+    )
+    selected = client.post(
+        f"/runs/{run_id}/records/3/court-target",
+        data={"target_slug": "validated-court", "review_id": review_id},
+    )
+
+    assert b"Validate and use this court" in page.data
+    assert b"suggested-court" in page.data
+    assert "court_target_error=" in collision.headers["Location"]
+    collision_error = parse_qs(urlparse(collision.headers["Location"]).query)[
+        "court_target_error"
+    ][0]
+    assert "already targeted by source row(s) 2" in collision_error
+    assert "court_target_saved=validated-court" in selected.headers["Location"]
+    override = service.get_execution_review(run_id).court_target_overrides["3"]
+    assert override.target_slug == "validated-court"
+    preserved_review = service.get_execution_review(run_id)
+    assert existing_comparison.change_id in preserved_review.comparisons
+    assert existing_comparison.change_id in preserved_review.target_approvals
+    record = next(
+        value
+        for value in service.get_readiness_report(run_id)["records"]
+        if value["court_slug"] == "validated-court"
+    )
+    assert record["actions"]
+    review = service.get_llm_actions_review(run_id)["items"][0]
+    assert review["actionable"] is True
+    assert review["dependent_actions"]
+    resolved_record_page = client.get(f"/runs/{run_id}/records/3")
+    assert b"Resolved with a validated FaCT court target" in resolved_record_page.data
+    assert b"validated-court" in resolved_record_page.data
+    assert execution_client.writes == []
+
+
 def test_llm_review_explains_missing_court_in_plain_english(tmp_path):
     output_root, run_id = _archive(tmp_path)
     archive_path = output_root / "final" / run_id
@@ -866,6 +1049,19 @@ def test_api_changes_defaults_to_pending_advances_approval_and_hides_stale_job(
             target = next(item for item in changes if item["change_id"] == change_id)
             target["target_approved"] = True
 
+        def approve_all_target_changes(self, requested_run_id):
+            assert requested_run_id == run_id
+            eligible = [
+                item
+                for item in changes
+                if item["comparison"]["has_existing_data"]
+                and not item["comparison"]["merge_conflicts"]
+                and not item["target_approved"]
+            ]
+            for item in eligible:
+                item["target_approved"] = True
+            return None, len(eligible)
+
     jobs = output_root / ".execution-jobs"
     jobs.mkdir(parents=True)
     (jobs / "stale.json").write_text(
@@ -895,16 +1091,17 @@ def test_api_changes_defaults_to_pending_advances_approval_and_hides_stale_job(
     assert b"court-1" in pending.data
     assert b"court-3" not in pending.data
     assert b"Approve and continue" in pending.data
+    assert b"Approve all 2 approvable changes" in pending.data
     assert b"Latest comparison scan" not in pending.data
     assert b"court-3" in all_sections.data
     assert "view=pending" in advanced.headers["Location"]
     assert "#change-change-2" in advanced.headers["Location"]
 
-    completed = client.post(
-        f"/runs/{run_id}/api-changes/change-2/approve",
-        data={"view": "pending"},
-    )
-    assert "completed=1" in completed.headers["Location"]
+    bulk = client.post(f"/runs/{run_id}/api-changes/approve-all")
+    assert "bulk_approved=1" in bulk.headers["Location"]
+    bulk_result = client.get(bulk.headers["Location"])
+    assert b"1 FaCT change approval(s) recorded" in bulk_result.data
+    assert b"court-3" not in bulk_result.data
 
 
 def test_api_change_refresh_explains_fact_authentication_failure(tmp_path):
@@ -1181,6 +1378,27 @@ def test_workflow_and_review_overview_count_all_hold_types(tmp_path):
                 "selected_court_count": 1,
                 "court_status_counts": {"pending": 1},
                 "action_status_counts": {"blocked": 1},
+            }
+
+        def get_cached_execution_summary(self, run_id):
+            return {
+                "selected_court_count": 1,
+                "planned_action_count": 2,
+                "court_status_counts": {"pending": 1},
+                "action_status_counts": {"blocked": 1},
+                "llm_approval_counts": {"total": 1, "pending": 1},
+                "review_progress_counts": {
+                    "pending_value_decisions": 1,
+                    "pending_execution_value_dependencies": 1,
+                    "ambiguous_comparisons": 1,
+                },
+                "replacement_approval_counts": {
+                    "comparisons": 1,
+                    "required": 1,
+                    "approved": 0,
+                    "pending": 1,
+                    "not_checked": 1,
+                },
             }
 
     service = ReviewService()

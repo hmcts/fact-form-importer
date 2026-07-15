@@ -14,7 +14,7 @@ from fact_form_importer.execution.models import utc_now
 from fact_form_importer.output.fact_api_manifest import MISSING_SUPPORT_PHONE_PLACEHOLDER
 
 
-EXECUTION_REVIEW_LEDGER_VERSION = "1.1"
+EXECUTION_REVIEW_LEDGER_VERSION = "1.2"
 _REQUEST_FIELDS_BY_RESOURCE = {
     "building_facilities": {
         "courtId", "parking", "freeWaterDispensers", "snackVendingMachines",
@@ -61,6 +61,15 @@ class SourceSelection(BaseModel):
     selected_at: str = Field(default_factory=utc_now)
 
 
+class CourtTargetOverride(BaseModel):
+    source_row_number: int
+    submitted_slug: str
+    target_slug: str
+    target_court_id: str
+    target_court_name: Optional[str] = None
+    selected_at: str = Field(default_factory=utc_now)
+
+
 class TargetComparison(BaseModel):
     change_id: str
     court_slug: str
@@ -91,6 +100,7 @@ class ExecutionReviewLedger(BaseModel):
     run_id: str
     updated_at: str = Field(default_factory=utc_now)
     source_selections: dict[str, SourceSelection] = Field(default_factory=dict)
+    court_target_overrides: dict[str, CourtTargetOverride] = Field(default_factory=dict)
     comparisons: dict[str, TargetComparison] = Field(default_factory=dict)
     target_approvals: dict[str, TargetApproval] = Field(default_factory=dict)
     plan_manifest_version: Optional[str] = None
@@ -127,6 +137,32 @@ class ExecutionReviewStore:
                     ledger.target_approvals.pop(change_id, None)
             return self.save(ledger)
 
+    def set_court_target_override(
+        self,
+        run_id: str,
+        override: CourtTargetOverride,
+    ) -> ExecutionReviewLedger:
+        """Persist a validated target court and invalidate row-bound comparisons."""
+
+        with self._lock:
+            ledger = self.load(run_id)
+            key = str(override.source_row_number)
+            existing = ledger.court_target_overrides.get(key)
+            if existing and (
+                existing.submitted_slug == override.submitted_slug
+                and existing.target_slug == override.target_slug
+                and existing.target_court_id == override.target_court_id
+                and existing.target_court_name == override.target_court_name
+            ):
+                return ledger
+            ledger.court_target_overrides[key] = override
+            for change_id, comparison in list(ledger.comparisons.items()):
+                if comparison.source_row_number != override.source_row_number:
+                    continue
+                ledger.comparisons.pop(change_id, None)
+                ledger.target_approvals.pop(change_id, None)
+            return self.save(ledger)
+
     def save_comparison(
         self, run_id: str, comparison: TargetComparison
     ) -> ExecutionReviewLedger:
@@ -150,27 +186,47 @@ class ExecutionReviewStore:
             return self.save(ledger)
 
     def approve_target(self, run_id: str, change_id: str) -> ExecutionReviewLedger:
+        ledger, _ = self.approve_targets(run_id, {change_id})
+        return ledger
+
+    def approve_targets(
+        self, run_id: str, change_ids: set[str]
+    ) -> tuple[ExecutionReviewLedger, int]:
+        """Atomically approve a validated set of existing-data comparisons."""
+
         with self._lock:
             ledger = self.load(run_id)
-            comparison = ledger.comparisons.get(change_id)
-            if comparison is None:
-                raise ValueError("Refresh the live FaCT comparison before approving this change")
-            if not comparison.has_existing_data or comparison.is_no_change:
-                raise ValueError("This section does not require an existing-data change approval")
-            if comparison.merge_conflicts:
-                raise ValueError("Resolve ambiguous business-type matches before approving")
-            approval = ledger.target_approvals.get(change_id)
-            if approval and (
-                approval.current_hash == comparison.current_hash
-                and approval.proposed_hash == comparison.proposed_hash
-            ):
-                return ledger
-            ledger.target_approvals[change_id] = TargetApproval(
-                change_id=change_id,
-                current_hash=comparison.current_hash,
-                proposed_hash=comparison.proposed_hash,
-            )
-            return self.save(ledger)
+            comparisons: list[TargetComparison] = []
+            for change_id in sorted(change_ids):
+                comparison = ledger.comparisons.get(change_id)
+                if comparison is None:
+                    raise ValueError(
+                        "Refresh the live FaCT comparison before approving this change"
+                    )
+                if not comparison.has_existing_data or comparison.is_no_change:
+                    raise ValueError(
+                        "This section does not require an existing-data change approval"
+                    )
+                if comparison.merge_conflicts:
+                    raise ValueError(
+                        "Resolve ambiguous business-type matches before approving"
+                    )
+                comparisons.append(comparison)
+            added = 0
+            for comparison in comparisons:
+                approval = ledger.target_approvals.get(comparison.change_id)
+                if approval and (
+                    approval.current_hash == comparison.current_hash
+                    and approval.proposed_hash == comparison.proposed_hash
+                ):
+                    continue
+                ledger.target_approvals[comparison.change_id] = TargetApproval(
+                    change_id=comparison.change_id,
+                    current_hash=comparison.current_hash,
+                    proposed_hash=comparison.proposed_hash,
+                )
+                added += 1
+            return (self.save(ledger) if added else ledger), added
 
     def invalidate_actions(
         self, run_id: str, action_ids: set[str]
@@ -266,9 +322,9 @@ def merged_target_state(
     if resource not in {"address", "contact_detail", "court_opening_hours"}:
         current_value = dict(current) if isinstance(current, dict) else {}
         submitted_value = dict(submitted) if isinstance(submitted, dict) else {}
-        effective = {**current_value, **submitted_value}
+        effective = _deep_merge(current_value, submitted_value)
         for field in action.get("clear_fields", []):
-            effective[field] = None
+            _set_nested_value(effective, str(field), None)
         effective = _apply_request_defaults(resource, effective)
         return effective, [
             {
@@ -302,9 +358,9 @@ def merged_target_state(
         item_clear_fields = clear_fields[proposed_index] if proposed_index < len(clear_fields) else []
         if existing:
             current_index = current_indexes[key][0]
-            merged = {**existing[0], **item}
+            merged = _deep_merge(existing[0], item)
             for field in item_clear_fields:
-                merged[field] = None
+                _set_nested_value(merged, str(field), None)
             effective[current_index] = merged
             item_id = existing[0].get("id")
             update_path = path
@@ -320,7 +376,7 @@ def merged_target_state(
             )
         else:
             for field in item_clear_fields:
-                item[field] = None
+                _set_nested_value(item, str(field), None)
             effective.append(item)
             operations.append(
                 {
@@ -331,6 +387,33 @@ def merged_target_state(
                 }
             )
     return effective, operations, conflicts
+
+
+def _deep_merge(current: dict[str, Any], submitted: dict[str, Any]) -> dict[str, Any]:
+    """Overlay submitted leaf values while preserving unsubmitted nested live data."""
+
+    merged = dict(current)
+    for field, submitted_value in submitted.items():
+        current_value = merged.get(field)
+        if isinstance(current_value, dict) and isinstance(submitted_value, dict):
+            merged[field] = _deep_merge(current_value, submitted_value)
+        else:
+            merged[field] = submitted_value
+    return merged
+
+
+def _set_nested_value(value: dict[str, Any], path: str, replacement: Any) -> None:
+    """Apply an explicit clear to a dotted field path."""
+
+    parts = path.split(".")
+    target = value
+    for part in parts[:-1]:
+        child = target.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            target[part] = child
+        target = child
+    target[parts[-1]] = replacement
 
 
 def _group_by_business_key(

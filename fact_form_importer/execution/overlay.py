@@ -25,12 +25,25 @@ def derive_latest_execution_overlay(
     output_root: Path,
     original: dict[str, Any],
     succeeded_action_ids: set[str] | None = None,
+    court_target_overrides: dict[int, CourtReference] | None = None,
 ) -> dict[str, Any]:
     directory = output_root / "execution-review-state"
     path = directory / f"{run_id}.plan.json"
+    overrides = court_target_overrides or {}
+    override_evidence = {
+        str(row): {
+            "court_id": reference.court_id,
+            "slug": reference.slug,
+            "name": reference.name,
+        }
+        for row, reference in sorted(overrides.items())
+    }
     if path.exists():
         derived = json.loads(path.read_text(encoding="utf-8"))
-        if derived.get("manifest_version") == API_MANIFEST_VERSION:
+        if (
+            derived.get("manifest_version") == API_MANIFEST_VERSION
+            and derived.get("court_target_overrides", {}) == override_evidence
+        ):
             return _preserve_succeeded_sections(
                 derived, original, succeeded_action_ids or set()
             )
@@ -47,6 +60,21 @@ def derive_latest_execution_overlay(
     if not submissions:
         return original
     submissions, submission_selection = select_authoritative_submissions(submissions)
+    overridden_submissions = []
+    for submission in submissions:
+        override = overrides.get(submission.source.source_row_number)
+        if override is None:
+            overridden_submissions.append(submission)
+            continue
+        changed = submission.model_copy(deep=True)
+        changed.court_slug = override.slug
+        changed.issues = [
+            issue
+            for issue in changed.issues
+            if issue.code not in {"COURT_SLUG_NOT_FOUND", "COURT_SLUG_SUGGESTED"}
+        ]
+        overridden_submissions.append(changed)
+    submissions = overridden_submissions
     by_row = {submission.source.source_row_number: submission for submission in submissions}
     vocabularies = _derive_vocabularies(original, by_row)
     court_ids = {
@@ -54,10 +82,18 @@ def derive_latest_execution_overlay(
         for record in original.get("records", [])
         if record.get("court_slug") and record.get("court_id")
     }
+    court_ids.update(
+        {reference.slug: reference.court_id for reference in overrides.values()}
+    )
+    court_names = {
+        reference.slug: reference.name for reference in overrides.values()
+    }
 
     def lookup(slug: str) -> CourtReference:
         return CourtReference(
-            court_id=court_ids.get(slug, "{court_id}"), slug=slug, name=None
+            court_id=court_ids.get(slug, "{court_id}"),
+            slug=slug,
+            name=court_names.get(slug),
         )
 
     address_report = _read_json(archive_path / "address_verification_report.json", {})
@@ -76,9 +112,23 @@ def derive_latest_execution_overlay(
         address_verifications=address_verification_batch_from_dict(address_report),
         llm_review_items=llm_items,
     ).manifest.model_dump(mode="json")
+    if overrides:
+        override_rows = set(overrides)
+        retained_records = [
+            record
+            for record in original.get("records", [])
+            if not override_rows.intersection(record.get("source_row_numbers", []))
+        ]
+        overridden_records = [
+            record
+            for record in result.get("records", [])
+            if override_rows.intersection(record.get("source_row_numbers", []))
+        ]
+        result["records"] = retained_records + overridden_records
     result["derived_execution_overlay"] = True
     result["source_manifest_version"] = original.get("manifest_version")
     result["submission_selection"] = submission_selection
+    result["court_target_overrides"] = override_evidence
     directory.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

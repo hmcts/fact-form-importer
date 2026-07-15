@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from fact_form_importer.execution.models import utc_now
 
 
-APPROVAL_LEDGER_VERSION = "1.2"
+APPROVAL_LEDGER_VERSION = "1.3"
 LEGACY_ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-single-os-candidate-v1"
 ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-supplied-os-candidate-v2"
 ADDRESS_AUTO_APPROVAL_POLICY_VERSIONS = {
@@ -53,11 +53,18 @@ class LlmApproval(BaseModel):
     decision_history: list[ApprovalDecision] = Field(default_factory=list)
 
 
+class LlmDenial(BaseModel):
+    review_id: str
+    denied_at: str = Field(default_factory=utc_now)
+    rationale: str = "Reviewer chose not to use this model-derived value"
+
+
 class LlmApprovalLedger(BaseModel):
     ledger_version: str = APPROVAL_LEDGER_VERSION
     run_id: str
     updated_at: str = Field(default_factory=utc_now)
     approvals: dict[str, LlmApproval] = Field(default_factory=dict)
+    denials: dict[str, LlmDenial] = Field(default_factory=dict)
 
 
 class LlmApprovalStore:
@@ -77,11 +84,54 @@ class LlmApprovalStore:
     def approve(self, run_id: str, review_id: str) -> LlmApprovalLedger:
         with self._lock:
             ledger = self.load(run_id)
+            changed = ledger.denials.pop(review_id, None) is not None
             if review_id not in ledger.approvals:
                 ledger.approvals[review_id] = LlmApproval(review_id=review_id)
+                changed = True
+            if changed:
                 ledger.ledger_version = APPROVAL_LEDGER_VERSION
                 self._save(ledger)
             return ledger
+
+    def approve_many(
+        self, run_id: str, review_ids: set[str]
+    ) -> tuple[LlmApprovalLedger, int]:
+        """Atomically approve pending IDs while preserving explicit denials."""
+
+        with self._lock:
+            ledger = self.load(run_id)
+            added = 0
+            for review_id in sorted(review_ids):
+                if review_id in ledger.approvals or review_id in ledger.denials:
+                    continue
+                ledger.approvals[review_id] = LlmApproval(review_id=review_id)
+                added += 1
+            if added:
+                ledger.ledger_version = APPROVAL_LEDGER_VERSION
+                self._save(ledger)
+            return ledger, added
+
+    def deny(self, run_id: str, review_id: str) -> LlmApprovalLedger:
+        """Record a final human decision not to use a pending LLM result."""
+
+        with self._lock:
+            ledger = self.load(run_id)
+            if review_id not in ledger.denials:
+                ledger.denials[review_id] = LlmDenial(review_id=review_id)
+                ledger.ledger_version = APPROVAL_LEDGER_VERSION
+                self._save(ledger)
+            return ledger
+
+    def reconsider(self, run_id: str, review_id: str) -> tuple[LlmApprovalLedger, bool]:
+        """Return a denied result to the pending queue."""
+
+        with self._lock:
+            ledger = self.load(run_id)
+            removed = ledger.denials.pop(review_id, None) is not None
+            if removed:
+                ledger.ledger_version = APPROVAL_LEDGER_VERSION
+                self._save(ledger)
+            return ledger, removed
 
     def approve_address(
         self,
@@ -120,6 +170,7 @@ class LlmApprovalStore:
                 approved_value_hash=value_hash,
                 decision_history=history,
             )
+            ledger.denials.pop(review_id, None)
             ledger.ledger_version = APPROVAL_LEDGER_VERSION
             self._save(ledger)
             return ledger
@@ -156,7 +207,7 @@ class LlmApprovalStore:
             ledger = self.load(run_id)
             added = 0
             for review_id in sorted(eligible):
-                if review_id in ledger.approvals:
+                if review_id in ledger.approvals or review_id in ledger.denials:
                     continue
                 policy_version, rationale = eligible[review_id]
                 ledger.approvals[review_id] = LlmApproval(

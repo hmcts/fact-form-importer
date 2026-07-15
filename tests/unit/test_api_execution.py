@@ -293,6 +293,22 @@ def test_refresh_all_comparisons_skips_unselected_duplicates_and_reports_failure
         authentication.refresh_all_target_comparisons(failing_run)
 
 
+def test_approve_all_target_changes_records_review_only_and_is_idempotent(tmp_path):
+    run_id = _archive(tmp_path)
+    client = FakeFactApiClient(target=ApiResponse(200, {"parking": False}))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    service.refresh_all_target_comparisons(run_id)
+
+    ledger, added = service.approve_all_target_changes(run_id)
+    repeated, repeated_added = service.approve_all_target_changes(run_id)
+
+    assert added == 1
+    assert repeated_added == 0
+    assert len(ledger.target_approvals) == 1
+    assert repeated.target_approvals.keys() == ledger.target_approvals.keys()
+    assert client.writes == []
+
+
 def test_preflight_blocks_changed_court_uuid_and_marks_unexpected_target_unknown(tmp_path):
     changed_run = _archive(
         tmp_path,
@@ -424,8 +440,9 @@ def test_llm_dependent_action_waits_for_every_approval_before_execution(tmp_path
         "auto_approved_total": 0,
         "auto_approved_addresses": 0,
         "auto_approved_unchanged_fields": 0,
-        "auto_approved_fields": 0,
-        "pending": 0,
+            "auto_approved_fields": 0,
+            "denied": 0,
+            "pending": 0,
         "already_executed": 0,
         "not_actionable": 0,
     }
@@ -686,6 +703,73 @@ def test_legacy_succeeded_action_is_not_retroactively_held_for_approval(tmp_path
     assert review["items"][0]["approval_status"] == "already_executed"
     with pytest.raises(ValueError, match="already used"):
         service.approve_llm_review(run_id, "legacy-review")
+
+
+def test_llm_actions_review_loads_the_large_execution_review_ledger_once(
+    tmp_path, monkeypatch
+):
+    action = _action("example-court-1")
+    action["llm_review_ids"] = ["field-review"]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(tmp_path, run_id, ["field-review"])
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+    service.reconcile_automatic_approvals(run_id)
+    original_load = service.review_store.load
+    load_count = 0
+
+    def counted_load(requested_run_id):
+        nonlocal load_count
+        load_count += 1
+        return original_load(requested_run_id)
+
+    monkeypatch.setattr(service.review_store, "load", counted_load)
+
+    review = service.get_llm_actions_review(run_id)
+
+    assert review["items"][0]["dependent_actions"][0]["status"] == "awaiting_approval"
+    assert load_count == 1
+
+
+def test_denied_llm_result_is_excluded_from_bulk_approval_and_keeps_action_held(
+    tmp_path
+):
+    action = _action("example-court-1")
+    action["llm_review_ids"] = ["deny-me", "approve-me"]
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(tmp_path, run_id, ["deny-me", "approve-me"])
+    review_path = tmp_path / "out" / "final" / run_id / "llm_actions_review.json"
+    report = json.loads(review_path.read_text())
+    for item in report["items"]:
+        item["model_result"]["confidence"] = "medium"
+        item["model_result"]["needs_human_review"] = True
+    review_path.write_text(json.dumps(report))
+    client = FakeFactApiClient(target=ApiResponse(204), write=ApiResponse(201))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    service.deny_llm_review(run_id, "deny-me")
+    _, approved = service.approve_all_pending_llm_reviews(run_id)
+    review = service.get_llm_actions_review(run_id)
+    status_by_id = {
+        item["review_id"]: item["approval_status"] for item in review["items"]
+    }
+    waiting = service.execute_action(run_id, "example-court", "example-court-1")
+
+    assert approved == 1
+    assert status_by_id == {"deny-me": "denied", "approve-me": "approved"}
+    assert waiting.courts["example-court"].actions["example-court-1"].status == (
+        "awaiting_approval"
+    )
+    assert service.get_execution_summary(run_id)["llm_approval_counts"]["denied"] == 1
+    assert client.writes == []
+    with pytest.raises(ValueError, match="Reconsider"):
+        service.approve_llm_review(run_id, "deny-me")
+
+    service.reconsider_llm_review(run_id, "deny-me")
+    _, newly_approved = service.approve_all_pending_llm_reviews(run_id)
+
+    assert newly_approved == 1
+    assert service.get_llm_actions_review(run_id)["approval_counts"]["review_denied"] == 0
+    assert client.writes == []
 
 
 def test_legacy_po_box_only_approval_dependency_is_ignored(tmp_path, monkeypatch):
@@ -1311,6 +1395,40 @@ def test_get_execution_summary_rebuilds_an_old_cached_report(tmp_path):
     assert summary["court_hold_counts"]["without_known_approval_hold"] == 1
     assert "review_progress_counts" in summary
     assert service.store.load_summary(run_id) == summary
+
+
+def test_cached_execution_summary_uses_current_summary_without_rebuilding(
+    tmp_path, monkeypatch
+):
+    run_id = _archive(tmp_path)
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+    cached = {
+        "summary_version": EXECUTION_SUMMARY_VERSION,
+        "run_id": run_id,
+        "planned_action_count": 123,
+    }
+    service.store.save_summary(run_id, cached)
+
+    def unexpected_rebuild(_run_id):
+        raise AssertionError("current cached summary should not be rebuilt")
+
+    monkeypatch.setattr(service, "get_execution_summary", unexpected_rebuild)
+
+    assert service.get_cached_execution_summary(run_id) == cached
+
+
+def test_cached_execution_summary_rebuilds_an_old_summary(tmp_path, monkeypatch):
+    run_id = _archive(tmp_path)
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+    service.store.save_summary(run_id, {"summary_version": "old", "run_id": run_id})
+    rebuilt = {
+        "summary_version": EXECUTION_SUMMARY_VERSION,
+        "run_id": run_id,
+        "planned_action_count": 1,
+    }
+    monkeypatch.setattr(service, "get_execution_summary", lambda _run_id: rebuilt)
+
+    assert service.get_cached_execution_summary(run_id) == rebuilt
 
 
 def test_existing_legacy_plan_overlay_remains_active_after_a_newer_run(tmp_path):

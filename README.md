@@ -89,6 +89,16 @@ Its refresh control is a retry for interrupted scans or a deliberate recheck
 after live FaCT data changes. It never writes to FaCT. High-confidence model
 values may already be policy-approved, but live-data replacement remains a
 separate decision because a complete section diff has no LLM confidence score.
+Reviewers may record every currently approvable Step 2 decision in one atomic
+operation with `Approve all approvable changes`. This applies across every page,
+excludes unchecked, empty, unchanged, already approved, and ambiguous matches,
+and performs no FaCT API writes.
+
+Singleton sections are merged recursively, including nested objects such as
+`professionalInformation`. Submitted leaf values replace their live
+counterparts while unsubmitted nested values are preserved; supplying one
+professional-information field never replaces the whole nested block. Explicit
+clear paths remain the only way to remove a preserved nested value.
 
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --verify-addresses
@@ -785,6 +795,28 @@ run. The summary separately records source submission, authoritative
 submission and superseded duplicate counts. Superseded rows remain in immutable
 audit evidence but do not contribute to operational review or execution.
 
+The LLM actions page also supports an explicit `Deny and continue` decision.
+Denied values are excluded from `Approve all remaining results`, do not count as
+pending human review, never satisfy an execution dependency, and can be returned
+to pending with `Reconsider`. Bulk approval is atomic across every LLM review
+page and includes only remaining usable pending results; it excludes denied,
+read-only, approved and already-executed results and never performs a FaCT API
+request. These decisions are stored in backward-compatible approval-ledger
+schema 1.3, while execution-summary schema 2.0 reports denied result and court
+hold counts separately.
+
+Rows whose submitted court slug does not exist can select a different existing
+FaCT court from either the LLM review or record-audit page. The reviewer enters
+the exact slug; the importer performs a read-only FaCT lookup and displays the
+returned court name, canonical slug and UUID before deriving provisional
+actions. It never selects a fuzzy suggestion automatically and never creates a
+court. A target already used by another authoritative source row is rejected so
+distinct submissions cannot be silently combined. The immutable submitted slug
+and issues remain archived; the validated choice is stored in execution-review
+ledger 1.2. Changing it is blocked after a write succeeds and otherwise
+invalidates only comparisons and target approvals belonging to that source row.
+Unrelated comparison snapshots and approvals are preserved.
+
 Operational status counts cover authoritative submissions. Source and
 superseded counts are reported separately so the original workbook row total
 remains auditable.
@@ -866,8 +898,14 @@ The run page separates immutable form-ingestion results from live review
 progress and API execution. Review-decision counts include approvable results
 without an API action, while execution-dependency counts include only results
 holding planned sections. Current-state summaries are regenerated from the
-mutable approval, comparison and execution ledgers when viewed; approving a
-result never rewrites archived ingestion counts.
+mutable approval, comparison and execution ledgers by review/execution
+mutations; approving a result never rewrites archived ingestion counts. The
+workflow landing page reads that atomically refreshed summary sidecar instead
+of rebuilding all LLM evidence and thousands of section comparisons merely to
+display its counters. It rebuilds only when the sidecar is absent or belongs to
+an older summary schema. The detailed LLM queue also loads the execution-review
+sidecar once per request and reuses an indexed action-to-review mapping; it does
+not reload the complete comparison ledger for every displayed dependency.
 The FaCT-change page labels the full action count as planned sections awaiting
 one read-only scan, not as an approval count. Its summary distinguishes
 unchecked, unchanged, empty-target, approval-required, approved and ambiguous

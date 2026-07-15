@@ -22,6 +22,8 @@
 </div>
 <nav aria-label="API change filters"><strong>Show:</strong> <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, view='pending') }}">Needs review ({{ pending_change_count }})</a> <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, view='all') }}">All sections ({{ comparison_summary.total }})</a></nav>
 {% if review_complete %}<p class="success"><strong>All matching FaCT change approvals are complete.</strong></p>{% endif %}
+{% if bulk_approved is not none %}<p class="success"><strong>{{ bulk_approved }} FaCT change approval(s) recorded.</strong> No API writes were executed.</p>{% endif %}
+{% if comparison_summary.approval_required %}<form method="post" action="{{ url_for('approve_all_api_changes', run_id=archive.manifest.run_id) }}"><button type="submit">Approve all {{ comparison_summary.approval_required }} approvable changes</button></form><p class="muted">This records one review decision for every checked, populated and unambiguous change across all pages. It excludes {{ comparison_summary.conflicts }} ambiguous match(es) and does not execute FaCT API writes.</p>{% endif %}
 {% if comparison_summary.not_checked %}
 <p><strong>{{ comparison_summary.not_checked }} sections still need the read-only check.</strong> This normally means an older run or a scan that was interrupted or could not reach FaCT.</p>
 <form method="post" action="{{ url_for('refresh_api_changes', run_id=archive.manifest.run_id) }}">
@@ -53,7 +55,7 @@
     <td>{% if change.comparison.merge_conflicts %}<p class="error"><strong>Ambiguous type match:</strong> {{ change.comparison.merge_conflicts | join('; ') }}</p>{% endif %}<pre>{{ change.comparison.proposed | tojson(indent=2) }}</pre>{% if change.comparison.differences %}<details open><summary>{{ change.comparison.differences | length }} effective difference(s)</summary><table class="compact"><thead><tr><th>Component</th><th>Before</th><th>After</th></tr></thead><tbody>{% for difference in change.comparison.differences %}<tr><td><code>{{ difference.field }}</code></td><td>{{ difference.before if difference.before is not none else 'Not supplied' }}</td><td>{{ difference.after if difference.after is not none else 'Not supplied' }}</td></tr>{% endfor %}</tbody></table></details>{% endif %}{% for operation in change.comparison.operations %}<code>{{ operation.method }} {{ operation.path }}</code><br>{{ operation.purpose }}{% if not loop.last %}<hr>{% endif %}{% else %}No write required{% endfor %}</td>
     <td>
       {% if change.source_selection_required and not change.selected_source_row_number %}<strong>Source row selection pending</strong><br>{% endif %}
-      {% for hold in change.pending_value_holds %}<a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending', q=hold.review_id) }}">LLM value approval pending</a><br>{% endfor %}
+      {% for hold in change.pending_value_holds %}<a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status=hold.decision, q=hold.review_id) }}">{% if hold.decision == 'denied' %}LLM value was denied; reconsider to release this action{% else %}LLM value approval pending{% endif %}</a><br>{% endfor %}
       {% if change.comparison.is_no_change %}<strong>No change</strong>
       {% elif change.comparison.merge_conflicts %}<strong>Resolve the ambiguous type match before approval.</strong>
       {% elif change.target_approved %}<strong>FaCT changes approved</strong>

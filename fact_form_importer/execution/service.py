@@ -26,8 +26,12 @@ from fact_form_importer.execution.models import (
     utc_now,
 )
 from fact_form_importer.execution.overlay import derive_latest_execution_overlay
-from fact_form_importer.execution.report import build_execution_summary
+from fact_form_importer.execution.report import (
+    EXECUTION_SUMMARY_VERSION,
+    build_execution_summary,
+)
 from fact_form_importer.execution.review_state import (
+    CourtTargetOverride,
     ExecutionReviewLedger,
     ExecutionReviewStore,
     TargetComparison,
@@ -46,6 +50,7 @@ from fact_form_importer.output.fact_api_manifest import (
     normalise_fact_api_action_body,
     validate_fact_api_action_body,
 )
+from fact_form_importer.validators.fact_api_courts import CourtReference
 from fact_form_importer.validators.os_addresses import RateLimitedPostcodeLookup
 
 
@@ -107,6 +112,111 @@ class ApiExecutionService:
         ledger = self.review_store.select_source(run_id, court_slug, source_row_number)
         self._save_execution_summary(run_id)
         return ledger
+
+    def get_court_target_resolution(
+        self, run_id: str, source_row_number: int
+    ) -> dict[str, Any] | None:
+        """Return immutable missing-slug evidence plus any mutable target choice."""
+
+        submission = self._submissions_by_row(run_id).get(source_row_number)
+        if submission is None:
+            return None
+        override = self.review_store.load(run_id).court_target_overrides.get(
+            str(source_row_number)
+        )
+        return _court_target_resolution_payload(submission, override)
+
+    def set_court_target_override(
+        self, run_id: str, source_row_number: int, target_slug: str
+    ) -> CourtTargetOverride:
+        """Validate and persist a reviewer-selected existing FaCT court target."""
+
+        target_slug = target_slug.strip()
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", target_slug):
+            raise ValueError(
+                "Enter a lowercase FaCT court slug using letters, numbers and hyphens"
+            )
+        resolution = self.get_court_target_resolution(run_id, source_row_number)
+        if resolution is None:
+            raise ValueError("This source row does not have a missing FaCT court target")
+        authoritative = self._authoritative_source_rows(run_id)
+        if authoritative is not None and source_row_number not in authoritative:
+            raise ValueError("A superseded source row cannot select an API court target")
+
+        current_report = self._readiness_report(run_id)
+        current_record = next(
+            (
+                record
+                for record in current_report.get("records", [])
+                if source_row_number in record.get("source_row_numbers", [])
+            ),
+            None,
+        )
+        execution = self.store.load(run_id)
+        if current_record:
+            current_state = execution.courts.get(
+                str(current_record.get("court_slug") or "")
+            )
+            if current_state and any(
+                action.status == "succeeded"
+                for action in current_state.actions.values()
+            ):
+                raise ValueError("The target court cannot change after an API action succeeds")
+
+        client, close = self._client_or_new()
+        try:
+            reference = client.lookup_court(target_slug)
+        except httpx.HTTPStatusError as exc:
+            _, reason = _preflight_error_details("court target lookup", exc)
+            raise ValueError(reason) from exc
+        finally:
+            if close:
+                client.close()
+        if reference is None:
+            raise ValueError(f"FaCT has no court with slug '{target_slug}'")
+
+        canonical_slug = reference.slug
+        conflicts = [
+            record
+            for record in current_report.get("records", [])
+            if record.get("court_slug") == canonical_slug
+            and source_row_number not in record.get("source_row_numbers", [])
+        ]
+        override_conflicts = [
+            value
+            for key, value in self.review_store.load(run_id).court_target_overrides.items()
+            if key != str(source_row_number) and value.target_slug == canonical_slug
+        ]
+        if conflicts or override_conflicts:
+            rows = sorted(
+                {
+                    int(row)
+                    for record in conflicts
+                    for row in record.get("source_row_numbers", [])
+                    if isinstance(row, int)
+                }
+                | {value.source_row_number for value in override_conflicts}
+            )
+            row_text = ", ".join(str(row) for row in rows)
+            raise ValueError(
+                f"That FaCT court is already targeted by source row(s) {row_text}. "
+                "Do not combine distinct submissions without resolving which form is authoritative."
+            )
+
+        override = CourtTargetOverride(
+            source_row_number=source_row_number,
+            submitted_slug=str(resolution["submitted_slug"]),
+            target_slug=canonical_slug,
+            target_court_id=reference.court_id,
+            target_court_name=reference.name,
+        )
+        self.review_store.set_court_target_override(run_id, override)
+        plan_path = self.output_root / "execution-review-state" / f"{run_id}.plan.json"
+        if plan_path.exists():
+            plan_path.unlink()
+        self._readiness_report(run_id)
+        self._save_execution_summary(run_id)
+        return override
 
     def refresh_target_comparison(
         self, run_id: str, court_slug: str, action_id: str
@@ -240,6 +350,30 @@ class ApiExecutionService:
         self._save_execution_summary(run_id)
         return ledger
 
+    def approve_all_target_changes(
+        self, run_id: str
+    ) -> tuple[ExecutionReviewLedger, int]:
+        """Approve every checked, unambiguous existing-data diff without executing."""
+
+        self._readiness_report(run_id)
+        review = self.review_store.load(run_id)
+        eligible = {
+            change_id
+            for change_id, comparison in review.comparisons.items()
+            if comparison.has_existing_data
+            and not comparison.is_no_change
+            and not comparison.merge_conflicts
+            and not (
+                (approval := review.target_approvals.get(change_id))
+                and approval.current_hash == comparison.current_hash
+                and approval.proposed_hash == comparison.proposed_hash
+            )
+        }
+        ledger, added = self.review_store.approve_targets(run_id, eligible)
+        if added:
+            self._save_execution_summary(run_id)
+        return ledger, added
+
     def get_api_changes_review(self, run_id: str) -> dict[str, Any]:
         report = self._readiness_report(run_id)
         review = self.review_store.load(run_id)
@@ -297,6 +431,11 @@ class ApiExecutionService:
                     {
                         "review_id": review_id,
                         "kind": "llm",
+                        "decision": (
+                            "denied"
+                            if review_id in approval_ledger.denials
+                            else "pending"
+                        ),
                     }
                     for review_id in review_ids
                     if review_id not in approval_ledger.approvals
@@ -338,12 +477,12 @@ class ApiExecutionService:
 
     def get_llm_actions_review(self, run_id: str) -> dict[str, Any]:
         report = self._llm_review_report(run_id)
-        readiness = self._readiness_report(run_id)
+        execution_review = self.review_store.load(run_id)
+        readiness = self._readiness_report(run_id, review_state=execution_review)
         approvals, added = self.approval_store.reconcile_policies(run_id, report, readiness)
         if added:
             self._save_execution_summary(run_id, approvals=approvals, review_report=report)
         execution = self.store.load(run_id)
-        execution_review = self.review_store.load(run_id)
         submissions_by_row = self._submissions_by_row(run_id)
         actions_by_id = {
             str(action.get("action_id")): (str(record.get("court_slug") or ""), action)
@@ -351,11 +490,35 @@ class ApiExecutionService:
             for action in record.get("actions", [])
             if action.get("action_id")
         }
+        obsolete_po_box_ids = {
+            str(item["review_id"])
+            for item in report.get("items", [])
+            if item.get("address_mode") == "po_box" and item.get("review_id")
+        }
+        review_ids_by_action: dict[str, set[str]] = {
+            action_id: {
+                str(review_id)
+                for review_id in action.get("llm_review_ids", [])
+                if review_id and str(review_id) not in obsolete_po_box_ids
+            }
+            for action_id, (_, action) in actions_by_id.items()
+        }
         actions_by_review_id: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         for court_slug, action in actions_by_id.values():
             for review_id in action.get("llm_review_ids", []):
                 actions_by_review_id.setdefault(str(review_id), []).append(
                     (court_slug, action)
+                )
+        for value in report.get("items", []):
+            if (
+                not value.get("actionable")
+                or value.get("address_mode") == "po_box"
+                or not value.get("review_id")
+            ):
+                continue
+            for action_id in value.get("dependent_action_ids", []):
+                review_ids_by_action.setdefault(str(action_id), set()).add(
+                    str(value["review_id"])
                 )
         items = []
         for value in report.get("items", []):
@@ -371,6 +534,7 @@ class ApiExecutionService:
             item["immutable_api_body_patch"] = item.get("api_body_patch")
             approved = item.get("review_id") in approvals.approvals
             approval = approvals.approvals.get(str(item.get("review_id") or ""))
+            denial = approvals.denials.get(str(item.get("review_id") or ""))
             item["approved_at"] = approval.approved_at if approval is not None else None
             item["approval_method"] = approval.approval_method if approval else None
             item["approval_policy_version"] = approval.policy_version if approval else None
@@ -383,6 +547,8 @@ class ApiExecutionService:
                 if approval
                 else []
             )
+            item["denied_at"] = denial.denied_at if denial else None
+            item["denial_rationale"] = denial.rationale if denial else None
             if approval and approval.approved_address_patch:
                 item["api_body_patch"] = approval.approved_address_patch
                 proposed = dict(item.get("proposed_address") or {})
@@ -423,7 +589,16 @@ class ApiExecutionService:
                         "court_slug": court_slug,
                         "resource": action.get("resource"),
                         "status": self._effective_action_status(
-                            run_id, court_slug, action, execution, approvals, report
+                            run_id,
+                            court_slug,
+                            action,
+                            execution,
+                            approvals,
+                            report,
+                            review_state=execution_review,
+                            review_ids=sorted(
+                                review_ids_by_action.get(action_id, set())
+                            ),
                         ),
                         "reason": action_reason,
                     }
@@ -440,6 +615,13 @@ class ApiExecutionService:
                 linked_actions,
                 submissions_by_row.get(item.get("source_row_number")),
             )
+            submission = submissions_by_row.get(item.get("source_row_number"))
+            item["court_target_resolution"] = _court_target_resolution_payload(
+                submission,
+                execution_review.court_target_overrides.get(
+                    str(item.get("source_row_number") or "")
+                ),
+            )
             if "approvable" not in item:
                 item["approvable"] = _is_usable_review_item(item)
             already_executed = bool(linked_actions) and all(
@@ -448,6 +630,8 @@ class ApiExecutionService:
             item["approval_status"] = (
                 "approved"
                 if approved
+                else "denied"
+                if denial
                 else "already_executed"
                 if item.get("actionable") and already_executed
                 else "pending"
@@ -495,6 +679,8 @@ class ApiExecutionService:
             raise ValueError("This LLM result is read-only and cannot be approved")
         if current_item and current_item.get("approval_status") == "already_executed":
             raise ValueError("This LLM result was already used by a succeeded API action")
+        if current_item and current_item.get("approval_status") == "denied":
+            raise ValueError("Reconsider this denied result before approving it")
         if current_item.get("kind") == "address":
             if execution_job_active:
                 raise ValueError("Wait for the active execution job to finish before editing an address")
@@ -534,6 +720,74 @@ class ApiExecutionService:
             ledger = self.approval_store.approve(run_id, review_id)
         self._save_execution_summary(run_id, approvals=ledger, review_report=report)
         return ledger
+
+    def deny_llm_review(self, run_id: str, review_id: str) -> LlmApprovalLedger:
+        """Deny one pending usable result without executing a FaCT action."""
+
+        report = self.get_llm_actions_review(run_id)
+        current_item = next(
+            (
+                value
+                for value in report.get("items", [])
+                if value.get("review_id") == review_id
+            ),
+            None,
+        )
+        if current_item is None:
+            raise ValueError(f"LLM review item '{review_id}' does not exist in run '{run_id}'")
+        if current_item.get("approval_status") != "pending":
+            raise ValueError("Only a pending LLM result can be denied")
+        ledger = self.approval_store.deny(run_id, review_id)
+        self._save_execution_summary(
+            run_id,
+            approvals=ledger,
+            review_report=self._llm_review_report(run_id),
+        )
+        return ledger
+
+    def reconsider_llm_review(self, run_id: str, review_id: str) -> LlmApprovalLedger:
+        """Move one denied result back to pending without approving or executing it."""
+
+        report = self.get_llm_actions_review(run_id)
+        current_item = next(
+            (
+                value
+                for value in report.get("items", [])
+                if value.get("review_id") == review_id
+            ),
+            None,
+        )
+        if current_item is None:
+            raise ValueError(f"LLM review item '{review_id}' does not exist in run '{run_id}'")
+        if current_item.get("approval_status") != "denied":
+            raise ValueError("Only a denied LLM result can be reconsidered")
+        ledger, _ = self.approval_store.reconsider(run_id, review_id)
+        self._save_execution_summary(
+            run_id,
+            approvals=ledger,
+            review_report=self._llm_review_report(run_id),
+        )
+        return ledger
+
+    def approve_all_pending_llm_reviews(
+        self, run_id: str
+    ) -> tuple[LlmApprovalLedger, int]:
+        """Approve every remaining pending usable result atomically, without writing."""
+
+        report = self.get_llm_actions_review(run_id)
+        review_ids = {
+            str(item["review_id"])
+            for item in report.get("items", [])
+            if item.get("review_id") and item.get("approval_status") == "pending"
+        }
+        ledger, added = self.approval_store.approve_many(run_id, review_ids)
+        if added:
+            self._save_execution_summary(
+                run_id,
+                approvals=ledger,
+                review_report=self._llm_review_report(run_id),
+            )
+        return ledger, added
 
     def _submissions_by_row(self, run_id: str) -> dict[int, dict[str, Any]]:
         archive = load_run_archive(self.output_root, run_id)
@@ -691,6 +945,14 @@ class ApiExecutionService:
         )
         return self.store.save_summary(run_id, summary)
 
+    def get_cached_execution_summary(self, run_id: str) -> dict[str, Any]:
+        """Read the mutation-refreshed summary, rebuilding only when absent or old."""
+
+        summary = self.store.load_summary(run_id)
+        if summary and summary.get("summary_version") == EXECUTION_SUMMARY_VERSION:
+            return summary
+        return self.get_execution_summary(run_id)
+
     def _record(self, run_id: str, court_slug: str) -> dict[str, Any]:
         report = self._readiness_report(run_id)
         record = next(
@@ -701,7 +963,12 @@ class ApiExecutionService:
             raise ValueError(f"Court '{court_slug}' is not in the API readiness report")
         return record
 
-    def _readiness_report(self, run_id: str) -> dict[str, Any]:
+    def _readiness_report(
+        self,
+        run_id: str,
+        *,
+        review_state: ExecutionReviewLedger | None = None,
+    ) -> dict[str, Any]:
         archive = load_run_archive(self.output_root, run_id)
         if archive is None:
             raise ValueError(f"Run '{run_id}' does not exist")
@@ -727,9 +994,21 @@ class ApiExecutionService:
         existing_overlay = (
             self.output_root / "execution-review-state" / f"{run_id}.plan.json"
         ).exists()
+        review_state = review_state or self.review_store.load(run_id)
+        target_overrides = {
+            int(row): CourtReference(
+                court_id=override.target_court_id,
+                slug=override.target_slug,
+                name=override.target_court_name,
+            )
+            for row, override in review_state.court_target_overrides.items()
+        }
         if (
-            (latest.get("run_id") == run_id or existing_overlay)
-            and str(report.get("manifest_version") or "") < API_MANIFEST_VERSION
+            (latest.get("run_id") == run_id or existing_overlay or target_overrides)
+            and (
+                str(report.get("manifest_version") or "") < API_MANIFEST_VERSION
+                or bool(target_overrides)
+            )
             and (archive["path"] / "submissions_cleaned.json").exists()
         ):
             derived = derive_latest_execution_overlay(
@@ -738,10 +1017,13 @@ class ApiExecutionService:
                 self.output_root,
                 report,
                 succeeded_action_ids,
+                target_overrides,
             )
-            self.review_store.reconcile_plan_version(
-                run_id, str(derived.get("manifest_version") or API_MANIFEST_VERSION)
-            )
+            if str(report.get("manifest_version") or "") < API_MANIFEST_VERSION:
+                self.review_store.reconcile_plan_version(
+                    run_id,
+                    str(derived.get("manifest_version") or API_MANIFEST_VERSION),
+                )
             return derived
         return report
 
@@ -1619,6 +1901,7 @@ def _approval_counts(items: list[dict[str, Any]]) -> dict[str, int]:
             for item in policy_approved
         ),
         "pending": sum(item.get("approval_status") == "pending" for item in actionable),
+        "denied": sum(item.get("approval_status") == "denied" for item in actionable),
         "already_executed": sum(
             item.get("approval_status") == "already_executed" for item in actionable
         ),
@@ -1626,6 +1909,9 @@ def _approval_counts(items: list[dict[str, Any]]) -> dict[str, int]:
         "reviewable_total": len(reviewable),
         "review_pending": sum(
             item.get("approval_status") == "pending" for item in reviewable
+        ),
+        "review_denied": sum(
+            item.get("approval_status") == "denied" for item in reviewable
         ),
     }
 
@@ -1923,6 +2209,33 @@ def _planning_blockers(
             "technical_detail": "No complete, non-empty request body was planned for this field.",
         }
     ]
+
+
+def _court_target_resolution_payload(
+    submission: dict[str, Any] | None,
+    override: CourtTargetOverride | None,
+) -> dict[str, Any] | None:
+    if not isinstance(submission, dict):
+        return None
+    issue = next(
+        (
+            value
+            for value in submission.get("issues", [])
+            if isinstance(value, dict) and value.get("code") == "COURT_SLUG_NOT_FOUND"
+        ),
+        None,
+    )
+    if issue is None and override is None:
+        return None
+    suggestion = issue.get("cleaned_value") if isinstance(issue, dict) else None
+    return {
+        "source_row_number": submission.get("source", {}).get("source_row_number"),
+        "submitted_slug": str(
+            (issue or {}).get("raw_value") or submission.get("court_slug") or ""
+        ),
+        "suggestion": suggestion if isinstance(suggestion, dict) else None,
+        "override": override.model_dump(mode="json") if override else None,
+    }
 
 
 def _plain_issue_message(issue: dict[str, Any]) -> str:

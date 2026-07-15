@@ -153,6 +153,33 @@ def test_address_override_records_hash_and_policy_decision_history(tmp_path):
     assert approval.decision_history[0].policy_version == ADDRESS_AUTO_APPROVAL_POLICY_VERSION
 
 
+def test_denial_survives_policy_and_bulk_approval_until_reconsidered(tmp_path):
+    store = LlmApprovalStore(tmp_path / "out")
+    store.deny("run-1", "denied")
+
+    policy, policy_added = store.reconcile_policies(
+        "run-1",
+        {"items": [_field_item("denied"), _field_item("automatic")]},
+        _readiness(),
+    )
+    bulk, bulk_added = store.approve_many(
+        "run-1", {"denied", "automatic", "manual"}
+    )
+    reconsidered, removed = store.reconsider("run-1", "denied")
+    final, final_added = store.approve_many("run-1", {"denied"})
+
+    assert policy_added == 1
+    assert "denied" not in policy.approvals
+    assert policy.denials["denied"].rationale
+    assert bulk_added == 1
+    assert set(bulk.approvals) == {"automatic", "manual"}
+    assert removed is True
+    assert reconsidered.denials == {}
+    assert final_added == 1
+    assert set(final.approvals) == {"automatic", "manual", "denied"}
+    assert final.ledger_version == APPROVAL_LEDGER_VERSION
+
+
 def _item(
     review_id,
     *,

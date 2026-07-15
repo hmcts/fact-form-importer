@@ -1,4 +1,7 @@
+import pytest
+
 from fact_form_importer.execution.review_state import (
+    CourtTargetOverride,
     ExecutionReviewStore,
     build_target_comparison,
 )
@@ -59,6 +62,73 @@ def test_merge_preserves_blank_optional_fields_and_applies_explicit_clear():
     assert effective["email"] == "help@example.test"
     assert effective["explanation"] is None
     assert comparison.operations[0]["body"]["explanation"] is None
+
+
+def test_singleton_merge_preserves_unsubmitted_nested_professional_fields():
+    action = {
+        "action_id": "court-professional-information",
+        "resource": "professional_information",
+        "method": "POST",
+        "path": "/courts/id/v1/professional-information",
+        "body": {
+            "professionalInformation": {
+                "accessScheme": False,
+                "interviewRoomCount": 7,
+                "interviewRooms": True,
+                "videoHearings": False,
+            }
+        },
+    }
+    comparison = build_target_comparison(
+        "court",
+        action,
+        {
+            "codes": {"familyCourtCode": 131},
+            "professionalInformation": {
+                "accessScheme": True,
+                "commonPlatform": False,
+                "interviewPhoneNumber": None,
+                "interviewRoomCount": None,
+                "interviewRoomCountConsistent": False,
+                "interviewRooms": True,
+                "videoHearings": True,
+            },
+        },
+    )
+
+    professional = comparison.proposed["professionalInformation"]
+    assert comparison.proposed["codes"] == {"familyCourtCode": 131}
+    assert professional["interviewRoomCount"] == 7
+    assert professional["interviewRoomCountConsistent"] is False
+    assert professional["interviewPhoneNumber"] is None
+    assert comparison.operations[0]["body"]["professionalInformation"] == professional
+
+
+def test_singleton_explicit_clear_supports_nested_field_paths():
+    action = {
+        "action_id": "court-professional-information",
+        "resource": "professional_information",
+        "method": "POST",
+        "path": "/courts/id/v1/professional-information",
+        "body": {"professionalInformation": {"interviewRooms": True}},
+        "clear_fields": ["professionalInformation.interviewPhoneNumber"],
+    }
+
+    comparison = build_target_comparison(
+        "court",
+        action,
+        {
+            "professionalInformation": {
+                "interviewRooms": False,
+                "interviewPhoneNumber": "020 7000 0000",
+            }
+        },
+    )
+
+    assert comparison.proposed["professionalInformation"] == {
+        "interviewRooms": True,
+        "interviewPhoneNumber": None,
+    }
 
 
 def test_merge_adds_required_zero_phone_only_when_live_and_submitted_values_are_missing():
@@ -152,6 +222,47 @@ def test_changed_live_snapshot_invalidates_previous_replacement_approval(tmp_pat
     assert changed.change_id not in store.load("run").target_approvals
 
 
+def test_court_target_override_invalidates_only_comparisons_for_its_source_row(tmp_path):
+    store = ExecutionReviewStore(tmp_path)
+    first = build_target_comparison(
+        "first-court",
+        {
+            "action_id": "first-action",
+            "resource": "building_facilities",
+            "body": {"parking": True},
+            "source_row_number": 2,
+        },
+        {"parking": False},
+    )
+    second = build_target_comparison(
+        "second-court",
+        {
+            "action_id": "second-action",
+            "resource": "building_facilities",
+            "body": {"parking": True},
+            "source_row_number": 3,
+        },
+        {"parking": False},
+    )
+    store.save_comparisons("run", [first, second])
+    store.approve_targets("run", {first.change_id, second.change_id})
+
+    ledger = store.set_court_target_override(
+        "run",
+        CourtTargetOverride(
+            source_row_number=2,
+            submitted_slug="missing-court",
+            target_slug="validated-court",
+            target_court_id="court-id",
+            target_court_name="Validated Court",
+        ),
+    )
+
+    assert set(ledger.comparisons) == {second.change_id}
+    assert set(ledger.target_approvals) == {second.change_id}
+    assert ledger.court_target_overrides["2"].target_slug == "validated-court"
+
+
 def test_bulk_comparison_save_preserves_unchanged_approval_and_invalidates_changed_one(
     tmp_path,
 ):
@@ -177,3 +288,31 @@ def test_bulk_comparison_save_preserves_unchanged_approval_and_invalidates_chang
 
     assert first.change_id in ledger.target_approvals
     assert changed_second.change_id not in ledger.target_approvals
+
+
+def test_bulk_target_approval_is_atomic_validated_and_idempotent(tmp_path):
+    store = ExecutionReviewStore(tmp_path)
+    action = {
+        "action_id": "court-valid",
+        "resource": "building_facilities",
+        "method": "POST",
+        "path": "/courts/id/v1/building-facilities",
+        "body": {"parking": True},
+    }
+    valid = build_target_comparison("court", action, {"parking": False})
+    empty = build_target_comparison(
+        "court", {**action, "action_id": "court-empty"}, {}
+    )
+    store.save_comparisons("run", [valid, empty])
+
+    with pytest.raises(ValueError, match="does not require"):
+        store.approve_targets("run", {valid.change_id, empty.change_id})
+
+    assert store.load("run").target_approvals == {}
+    approved, added = store.approve_targets("run", {valid.change_id})
+    repeated, repeated_added = store.approve_targets("run", {valid.change_id})
+    assert added == 1
+    assert repeated_added == 0
+    assert approved.target_approvals[valid.change_id].approved_at == repeated.target_approvals[
+        valid.change_id
+    ].approved_at

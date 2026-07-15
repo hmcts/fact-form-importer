@@ -1,12 +1,32 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Record {{ submission.source.source_row_number }}</h1>
-<p><a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Back to records</a>{% if submission.court_slug and submission.selection_status != 'superseded' %} · <a href="{{ url_for('court_detail', run_id=archive.manifest.run_id, court_slug=submission.court_slug) }}">Review and run this court</a>{% endif %}</p>
+<p><a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Back to records</a>{% if actions and operational_court_slug and submission.selection_status != 'superseded' %} · <a href="{{ url_for('court_detail', run_id=archive.manifest.run_id, court_slug=operational_court_slug) }}">Review and run this court</a>{% endif %}</p>
 {% if submission.selection_status == 'superseded' %}<p class="error"><strong>Superseded by later source row {{ submission.superseded_by_source_row_number }}.</strong> This row is retained for audit but has no LLM review dependencies or API actions.</p>{% endif %}
 
 <section>
   <h2>What needs attention</h2>
   <p>This list distinguishes decisions available in the workflow from source corrections and information-only audit notes.</p>
+  {% if court_target_resolution %}
+  <div class="review-task review-task-review">
+    <h3>FaCT court target</h3>
+    {% if court_target_resolution.override %}
+      <p class="success">Validated target: <strong>{{ court_target_resolution.override.target_court_name or court_target_resolution.override.target_slug }}</strong><br><code>{{ court_target_resolution.override.target_slug }}</code><br><small>{{ court_target_resolution.override.target_court_id }}</small></p>
+      <p class="muted">The original submitted slug remains unchanged in the archive. All provisional actions for this row use the validated target above.</p>
+      <details><summary>Change validated target</summary><form method="post" action="{{ url_for('select_court_target', run_id=archive.manifest.run_id, source_row_number=submission.source.source_row_number) }}"><label for="target-slug">Different existing FaCT court slug</label><input id="target-slug" name="target_slug" required><button type="submit" class="secondary">Validate and change court</button></form></details>
+    {% else %}
+      <p>The submitted slug <code>{{ court_target_resolution.submitted_slug }}</code> was not found in FaCT. Enter a different slug only when you have identified the same court in FaCT.</p>
+      {% if court_target_resolution.suggestion %}<p class="muted">Earlier automated suggestion (not selected): {{ court_target_resolution.suggestion.suggested_court_name }} · <code>{{ court_target_resolution.suggestion.suggested_slug }}</code></p>{% endif %}
+      {% if court_target_error %}<p class="error">{{ court_target_error }}</p>{% endif %}
+      <form method="post" action="{{ url_for('select_court_target', run_id=archive.manifest.run_id, source_row_number=submission.source.source_row_number) }}">
+        <label for="target-slug">Correct existing FaCT court slug</label>
+        <input id="target-slug" name="target_slug" placeholder="example-court-slug" required>
+        <button type="submit" class="secondary">Validate and use this court</button>
+      </form>
+      <p class="muted">This is a read-only FaCT lookup. A target already used by another source row is rejected to prevent two distinct forms being silently combined.</p>
+    {% endif %}
+  </div>
+  {% endif %}
   <ol class="review-checklist">{% for issue in submission.issues %}{% set guidance = issue.review_guidance %}<li class="review-task review-task-{{ guidance.state }}"><strong>{{ guidance.label }}</strong><br>{{ guidance.explanation }}<br><span class="muted">{{ guidance.remedy }}</span>{% if guidance.state == 'review' %}<br><a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending', q=submission.source.source_row_number) }}">Review this row in Step 1</a>{% elif guidance.state == 'complete' %}<br><a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=submission.source.source_row_number) }}">View the completed decision</a>{% endif %}<details><summary>Technical evidence</summary><code>{{ issue.code }}</code>{% if issue.field %}<br>Field: <code>{{ issue.field }}</code>{% endif %}{% if issue.message %}<p>{{ issue.message }}</p>{% endif %}</details></li>{% else %}<li>No issues were recorded for this row.</li>{% endfor %}</ol>
   {% for task in submission.action_review_tasks %}<p class="review-task review-task-review"><strong>{{ task.label }}</strong><br><span class="muted">{{ task.remedy }}</span><br>{% if task.state == 'changes' %}<a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">Open Step 2 changes</a>{% else %}<a href="{{ url_for('court_detail', run_id=archive.manifest.run_id, court_slug=submission.court_slug) }}">Review this court</a>{% endif %}</p>{% endfor %}
   {% if submission.planned_action_count %}<p><strong>{{ submission.planned_action_count }} FaCT section action(s) are associated with this row.</strong> Use the court workspace below to review approvals and run them.</p>{% else %}<p><strong>No FaCT API action is attached to this row.</strong> Workflow approvals cannot resolve any source corrections listed above.</p>{% endif %}
@@ -15,14 +35,14 @@
 {% if actions %}
 <section>
   <h2>FaCT API execution</h2>
-  <p>Court: <strong>{{ submission.court_slug }}</strong> · execution status: <strong>{{ court_execution.status if court_execution else 'not_started' }}</strong></p>
+  <p>Court: <strong>{{ operational_court_slug }}</strong> · execution status: <strong>{{ court_execution.status if court_execution else 'not_started' }}</strong></p>
   <p class="muted">Every action rechecks that this court exists and that the live section still matches its approved comparison. Existing data can be replaced only after the exact before/after section has been approved. This tool never creates a court.</p>
-  <form method="post" action="{{ url_for('api_check_court', run_id=archive.manifest.run_id, court_slug=submission.court_slug) }}" class="inline-form">
+  <form method="post" action="{{ url_for('api_check_court', run_id=archive.manifest.run_id, court_slug=operational_court_slug) }}" class="inline-form">
     <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
     <button type="submit" class="secondary">Check target sections</button>
   </form>
   {% if writes_enabled %}
-  <form method="post" action="{{ url_for('api_execute_court', run_id=archive.manifest.run_id, court_slug=submission.court_slug) }}" class="inline-form" onsubmit="return confirm('Run every safe and fully approved section action for this court?');">
+  <form method="post" action="{{ url_for('api_execute_court', run_id=archive.manifest.run_id, court_slug=operational_court_slug) }}" class="inline-form" onsubmit="return confirm('Run every safe and fully approved section action for this court?');">
     <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
     <button type="submit" {% if active_execution_job %}disabled{% endif %}>Run all safe actions for this court</button>
   </form>
@@ -41,7 +61,7 @@
         <td><strong>{{ action.execution.status }}</strong>{% if action.execution.reason %}<br>{{ action.execution.reason }}{% endif %}{% if action.execution.last_response_status %}<br>HTTP {{ action.execution.last_response_status }}{% endif %}</td>
         <td>
           {% if writes_enabled %}
-          <form method="post" action="{{ url_for('api_execute_action', run_id=archive.manifest.run_id, court_slug=submission.court_slug, action_id=action.action_id) }}" onsubmit="return confirm('Run this FaCT API action? It will be preflighted again before a write.');">
+          <form method="post" action="{{ url_for('api_execute_action', run_id=archive.manifest.run_id, court_slug=operational_court_slug, action_id=action.action_id) }}" onsubmit="return confirm('Run this FaCT API action? It will be preflighted again before a write.');">
             <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
             <button type="submit" {% if action.execution.status == 'succeeded' or active_execution_job %}disabled{% endif %}>Run action</button>
           </form>

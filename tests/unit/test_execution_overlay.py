@@ -1,6 +1,7 @@
 import json
 
 from fact_form_importer.execution.overlay import derive_latest_execution_overlay
+from fact_form_importer.models.issues import Issue
 from fact_form_importer.models.court_submission import (
     Address,
     ContactDetail,
@@ -9,6 +10,7 @@ from fact_form_importer.models.court_submission import (
     OpeningTime,
 )
 from fact_form_importer.models.source import SourceMetadata
+from fact_form_importer.validators.fact_api_courts import CourtReference
 
 
 def test_overlay_derives_section_plan_and_preserves_succeeded_legacy_sections(tmp_path):
@@ -144,3 +146,56 @@ def test_overlay_falls_back_for_empty_or_abbreviated_legacy_evidence(tmp_path):
         encoding="utf-8",
     )
     assert derive_latest_execution_overlay("short", archive, tmp_path, original) == original
+
+
+def test_overlay_adds_only_validated_missing_court_row_and_preserves_existing_plan(
+    tmp_path,
+):
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    missing = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="missing-court",
+        status="needs_human_review",
+        facilities={"parking_available": True},
+        issues=[
+            Issue(
+                field="court_slug",
+                code="COURT_SLUG_NOT_FOUND",
+                severity="warning",
+                message="missing",
+                raw_value="missing-court",
+            )
+        ],
+    )
+    (archive / "submissions_cleaned.json").write_text(
+        json.dumps([missing.model_dump(mode="json")]), encoding="utf-8"
+    )
+    (archive / "address_verification_report.json").write_text("{}")
+    original_record = {
+        "court_slug": "existing-court",
+        "court_id": "existing-id",
+        "source_row_numbers": [99],
+        "actions": [{"action_id": "keep-this-action", "resource": "address"}],
+    }
+    original = {"manifest_version": "1.9", "records": [original_record]}
+
+    overlay = derive_latest_execution_overlay(
+        "run",
+        archive,
+        tmp_path / "out",
+        original,
+        court_target_overrides={
+            2: CourtReference("validated-id", "validated-court", "Validated Court")
+        },
+    )
+
+    assert overlay["records"][0] == original_record
+    added = next(
+        record for record in overlay["records"] if record["court_slug"] == "validated-court"
+    )
+    assert added["court_id"] == "validated-id"
+    assert added["source_row_numbers"] == [2]
+    assert added["actions"]
+    assert all("validated-id" in action["path"] for action in added["actions"])
+    assert overlay["court_target_overrides"]["2"]["name"] == "Validated Court"

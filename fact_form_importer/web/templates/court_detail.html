@@ -14,7 +14,7 @@
 <section id="{{ action.action_id }}">
   <h2>{{ action.resource | replace('_', ' ') | title }}</h2>
   <p><code>{{ action.method }} {{ action.path }}</code> · <strong>{{ change.execution_status if change else 'planned' }}</strong></p>
-  {% if change and change.pending_value_holds %}<p><a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending', q=change.pending_value_holds[0].review_id) }}">Review pending LLM value</a></p>{% endif %}
+  {% if change and change.pending_value_holds %}{% set value_hold = change.pending_value_holds[0] %}<p><a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status=value_hold.decision, q=value_hold.review_id) }}">{% if value_hold.decision == 'denied' %}Reconsider denied LLM value{% else %}Review pending LLM value{% endif %}</a></p>{% endif %}
   {% if change and change.comparison %}
   {% if change.comparison.merge_conflicts %}<p class="error"><strong>Cannot match entries safely:</strong> {{ change.comparison.merge_conflicts | join('; ') }}</p>{% endif %}
   <table class="compact"><thead><tr><th>Current live FaCT</th><th>Submitted proposal</th><th>Effective merged result</th></tr></thead><tbody><tr><td><pre>{{ change.comparison.current | tojson(indent=2) }}</pre></td><td><pre>{{ change.comparison.submitted | tojson(indent=2) }}</pre></td><td><pre>{{ change.comparison.proposed | tojson(indent=2) }}</pre></td></tr></tbody></table>
