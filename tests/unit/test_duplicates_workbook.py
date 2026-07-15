@@ -77,13 +77,13 @@ def test_duplicate_review_workbook_groups_forms_and_marks_only_a_date_based_cand
     assert overview["E2"].value == 3
     assert overview["F2"].value == "2026-07-02 10:00"
     assert overview["G2"].value == "Completion time"
-    assert overview["E3"].value is None
+    assert overview["E3"].value == 5
     assert overview["G3"].value == "No timestamp available"
 
     form_rows = workbook["Duplicate form rows"]
     rows = {form_rows.cell(row, 4).value: row for row in range(2, form_rows.max_row + 1)}
-    assert form_rows.cell(rows[3], 3).value == "Yes - date-based candidate"
-    assert form_rows.cell(rows[2], 3).value == "No"
+    assert form_rows.cell(rows[3], 3).value == "Yes - authoritative"
+    assert form_rows.cell(rows[2], 3).value == "No - superseded"
     assert form_rows.cell(rows[3], 1).value == "D001"
     assert form_rows.cell(rows[3], 11).value == "Later"
 
@@ -96,7 +96,10 @@ def test_duplicate_review_workbook_groups_forms_and_marks_only_a_date_based_cand
     assert form_data.freeze_panes == "A2"
     assert form_data.auto_filter.ref is not None
     assert form_data.cell(data_rows[3], headers["submitted_form_answers"]).alignment.wrap_text is True
-    assert form_data.cell(data_rows[3], headers["date_based_candidate"]).value == "Yes - date-based candidate"
+    assert (
+        form_data.cell(data_rows[3], headers["authoritative_latest_form"]).value
+        == "Yes - authoritative"
+    )
     assert "Is there accessible parking?: Yes" in form_data.cell(
         data_rows[3], headers["submitted_form_answers"]
     ).value

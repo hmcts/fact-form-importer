@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Review and execute run</h1>
+<p>{{ archive.manifest.run_id }}</p>
+<nav>
+  <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
+  <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Records and audit</a>
+  <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Results</a>
+</nav>
+<p class="muted">Work through these steps in order. You may open any step at any time; execution still runs only actions whose approvals and preflights are complete.</p>
+
+<section class="workflow-step" id="step-1">
+  <h2>1. Review LLM and address results</h2>
+  <p><strong>{{ workflow.llm_pending }}</strong> approvals pending from {{ workflow.llm_total }} review results.</p>
+  <a class="button-link" href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending') if workflow.llm_pending else url_for('llm_actions_review', run_id=archive.manifest.run_id) }}">{% if workflow.llm_pending %}Continue LLM review{% else %}View completed LLM review{% endif %}</a>
+</section>
+
+<section class="workflow-step" id="step-2">
+  <h2>2. Review changes to live FaCT data</h2>
+  {% if workflow.comparison_pending %}
+  <p><strong>{{ workflow.comparison_total }}</strong> planned court sections are awaiting one read-only FaCT comparison scan. This is not an approval queue: the number of genuine existing-data approvals is unknown until the scan finishes.</p>
+  <p class="muted">{{ workflow.comparison_checked }} checked so far · {{ workflow.comparison_pending }} not checked.</p>
+  {% else %}
+  <p>All {{ workflow.comparison_total }} planned sections have been checked: <strong>{{ workflow.change_approval_pending }}</strong> existing-data changes need approval, {{ workflow.comparison_no_change }} need no change, {{ workflow.comparison_empty_target }} have an empty target, {{ workflow.comparison_approved }} are approved and {{ workflow.merge_conflicts }} have ambiguous matches.</p>
+  {% endif %}
+  <a class="button-link" href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">Review FaCT changes</a>
+</section>
+
+<section class="workflow-step" id="step-3">
+  <h2>3. Review and execute courts</h2>
+  <p><strong>{{ workflow.court_count }}</strong> courts · {{ workflow.court_counts.completed or 0 }} completed · {{ workflow.court_counts.awaiting_approval or 0 }} awaiting approval · {{ workflow.court_counts.attention_required or 0 }} need attention.</p>
+  <a class="button-link" href="{{ url_for('courts', run_id=archive.manifest.run_id) }}">Review courts and actions</a>
+  {% if writes_enabled %}
+  <form class="inline-form" method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe and fully approved action?');">
+    <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Execution in progress…{% else %}Run all safe actions{% endif %}</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

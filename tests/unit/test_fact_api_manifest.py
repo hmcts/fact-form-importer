@@ -8,6 +8,7 @@ from fact_form_importer.models.court_submission import (
 from fact_form_importer.models.source import SourceMetadata
 from fact_form_importer.models.issues import Issue
 from fact_form_importer.output.fact_api_manifest import (
+    _explicit_clear_fields,
     build_fact_api_import_manifest,
     normalise_fact_api_action_body,
     validate_fact_api_action_body,
@@ -19,6 +20,21 @@ from fact_form_importer.validators.os_addresses import (
     OsAddressCandidate,
 )
 from fact_form_importer.validators.vocabularies import Vocabularies
+
+
+def test_explicit_contact_explanation_clear_is_preserved_for_merge_execution():
+    assert _explicit_clear_fields(
+        "contact_detail",
+        [
+            {
+                "outcome": "accepted",
+                "operation": "clear",
+                "field": "contacts[6].explanation",
+            }
+        ],
+        ["contacts[6].explanation"],
+    ) == ["explanation"]
+    assert _explicit_clear_fields("address", [], []) == []
 
 
 def test_manifest_builds_ready_actions_with_preflight_and_source_evidence():
@@ -267,7 +283,7 @@ def test_manifest_plans_a_valid_section_despite_an_unrelated_source_error():
     assert manifest.records[0].actions[0].readiness == "ready"
 
 
-def test_duplicate_court_rows_have_provisional_actions_pending_source_selection():
+def test_manifest_defensively_keeps_only_the_latest_duplicate_source_row():
     submissions = [
         CourtSubmission(
             source=SourceMetadata(source_row_number=row),
@@ -285,10 +301,10 @@ def test_duplicate_court_rows_have_provisional_actions_pending_source_selection(
     ).manifest
 
     record = manifest.records[0]
-    assert record.source_row_numbers == [2, 3]
-    assert len(record.actions) == 2
-    assert all(action.source_selection_required for action in record.actions)
-    assert {action.source_row_number for action in record.actions} == {2, 3}
+    assert record.source_row_numbers == [3]
+    assert len(record.actions) == 1
+    assert record.actions[0].source_selection_required is False
+    assert record.actions[0].source_row_number == 3
 
 
 def test_po_box_address_has_no_special_manual_value_dependency():
@@ -403,7 +419,7 @@ def test_manifest_marks_contact_api_constraint_and_empty_record_states():
     assert manifest.records[0].readiness == "pending"
 
 
-def test_manifest_marks_api_required_conditional_values_as_pending():
+def test_manifest_records_missing_support_phone_request_defaults_without_mutating_source():
     submission = CourtSubmission(
         source=SourceMetadata(source_row_number=6),
         court_slug="example-court",
@@ -423,9 +439,11 @@ def test_manifest_marks_api_required_conditional_values_as_pending():
 
     action = manifest.records[0].actions[0]
     assert action.resource == "accessibility_options"
-    assert action.readiness == "pending"
-    assert "accessibleEntrancePhoneNumber" in action.reason
-    assert "liftSupportPhoneNumber" in action.reason
+    assert action.readiness == "ready"
+    assert "accessibleEntrancePhoneNumber" not in action.body
+    assert "liftSupportPhoneNumber" not in action.body
+    assert len(action.migration_assumptions) == 2
+    assert all("00000000000" in assumption for assumption in action.migration_assumptions)
 
 
 def test_manifest_uses_review_visible_defaults_for_blank_lift_measurements():

@@ -115,6 +115,20 @@ def build_llm_actions_review(
     return _report(items)
 
 
+def filter_llm_actions_review(
+    report: dict[str, Any], authoritative_source_rows: set[int]
+) -> dict[str, Any]:
+    """Return operational review counts/items for authoritative submissions only."""
+
+    return _report(
+        [
+            dict(item)
+            for item in report.get("items", [])
+            if item.get("source_row_number") in authoritative_source_rows
+        ]
+    )
+
+
 def load_or_derive_llm_actions_review(archive_path: Path) -> dict[str, Any]:
     """Load a new review artifact or derive the best safe legacy equivalent."""
 

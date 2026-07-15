@@ -63,7 +63,7 @@ INTERVIEW_ROOM_LABELS = {
 def write_duplicate_review_workbook(
     submissions: list[CourtSubmission], output_path: Path, summary: dict[str, Any]
 ) -> Path:
-    """Write duplicate groups for review without choosing a record to import."""
+    """Write duplicate groups with the authoritative latest-form selection."""
 
     output_path.mkdir(parents=True, exist_ok=True)
     groups = group_duplicate_submissions(submissions)
@@ -111,15 +111,15 @@ def _add_summary_sheet(
         [],
         [
             "How to use this workbook",
-            "Review each duplicate group in Duplicate form data. It is self-contained and does not require the NSU cleaned review workbook.",
+            "Audit each duplicate group in Duplicate form data. It is self-contained and does not require the NSU cleaned review workbook.",
         ],
         [
-            "Date-based candidate",
-            "A candidate is only a suggestion. It uses Completion time, then Last modified time, then Start time when earlier fields are blank.",
+            "Authoritative latest form",
+            "The importer selects Completion time, then Last modified time, then Start time, with the highest source row as the final fallback.",
         ],
         [
-            "Decision required",
-            "NSU/product must decide whether to keep one form, merge information, or do not import. Nothing is automatically selected or imported.",
+            "Operational effect",
+            "Only the authoritative row is validated, sent to OS/LLM review, or given API actions. Older rows remain audit evidence.",
         ],
         [
             "Raw and cleaned evidence",
@@ -143,7 +143,7 @@ def _add_group_overview_sheet(workbook: Workbook, group_rows: list[dict[str, Any
             "court_slug",
             "form_count",
             "source_row_numbers",
-            "date_based_candidate_source_row",
+            "authoritative_source_row",
             "candidate_timestamp",
             "candidate_timestamp_field",
             "decision_required",
@@ -163,9 +163,9 @@ def _add_group_overview_sheet(workbook: Workbook, group_rows: list[dict[str, Any
                 group["candidate"].source.source_row_number if group["candidate"] else None,
                 candidate_timestamp.display_value if candidate_timestamp else None,
                 candidate_timestamp.source_label if candidate_timestamp else "No timestamp available",
-                "Yes - decide with NSU/product",
-                None,
-                None,
+                "No - latest-form policy applied",
+                "Use latest completed form",
+                group["candidate"].source.source_row_number if group["candidate"] else None,
                 None,
             ]
         )
@@ -178,7 +178,7 @@ def _add_duplicate_forms_sheet(workbook: Workbook, group_rows: list[dict[str, An
         [
             "duplicate_group",
             "court_slug",
-            "date_based_candidate",
+            "authoritative_latest_form",
             "source_row_number",
             "forms_id",
             "completion_time",
@@ -209,7 +209,7 @@ def _add_duplicate_forms_sheet(workbook: Workbook, group_rows: list[dict[str, An
                 [
                     group["group"],
                     group["court_slug"],
-                    "Yes - date-based candidate" if submission is candidate else "No",
+                    "Yes - authoritative" if submission is candidate else "No - superseded",
                     row_number,
                     submission.source.forms_id,
                     _display_source_value(submission.source.completion_time),
@@ -225,7 +225,7 @@ def _add_duplicate_forms_sheet(workbook: Workbook, group_rows: list[dict[str, An
                     len(submission.addresses),
                     len(submission.contacts),
                     len(submission.opening_hours),
-                    "Compare with the other rows in this duplicate group before deciding.",
+                    "Authoritative latest form" if submission is candidate else "Superseded audit row",
                 ]
             )
     worksheet = _write_table(workbook, "Duplicate form rows", rows)
@@ -241,7 +241,7 @@ def _add_duplicate_form_data_sheet(workbook: Workbook, group_rows: list[dict[str
         [
             "duplicate_group",
             "court_slug",
-            "date_based_candidate",
+            "authoritative_latest_form",
             "source_row_number",
             "forms_id",
             "completion_time",
@@ -274,7 +274,7 @@ def _add_duplicate_form_data_sheet(workbook: Workbook, group_rows: list[dict[str
                 [
                     group["group"],
                     group["court_slug"],
-                    "Yes - date-based candidate" if submission is candidate else "No",
+                    "Yes - authoritative" if submission is candidate else "No - superseded",
                     row_number,
                     submission.source.forms_id,
                     _display_source_value(submission.source.completion_time),

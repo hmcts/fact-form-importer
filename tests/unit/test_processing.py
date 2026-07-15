@@ -8,7 +8,7 @@ from fact_form_importer.ingest.workbook_reader import IngestResult
 from fact_form_importer.models.court_submission import CourtSubmission
 from fact_form_importer.models.source import SourceMetadata
 from fact_form_importer.processing import _court_lookup, load_fact_api_services, process_workbook
-from fact_form_importer.validators.fact_api_courts import CourtReference
+from fact_form_importer.validators.fact_api_courts import CourtReference, CourtSlugSuggestion
 from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
@@ -113,6 +113,145 @@ def test_process_workbook_runs_explicit_address_verification_and_records_metrics
     assert report["enabled"] is True
 
 
+def test_process_workbook_excludes_superseded_duplicates_before_address_work(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "forms.csv"
+    source.write_text("unused")
+    submissions = [
+        CourtSubmission(
+            source=SourceMetadata(
+                source_row_number=2, completion_time="2026-01-01T12:00:00"
+            ),
+            court_slug="duplicate-court",
+        ),
+        CourtSubmission(
+            source=SourceMetadata(
+                source_row_number=3, completion_time="2026-01-02T12:00:00"
+            ),
+            court_slug="duplicate-court",
+        ),
+    ]
+    profile = WorkbookProfile(
+        source_path=source, sheet_name=None, row_count=2, column_count=1, columns=[]
+    )
+    monkeypatch.setenv("FACT_DATA_API_BASE_URL", "https://fact.example.test")
+    monkeypatch.setenv("FACT_DATA_API_BEARER_TOKEN", "token")
+    monkeypatch.setattr("fact_form_importer.processing.profile_workbook", lambda path: profile)
+
+    def fake_ingest(input_path, output_path):
+        (output_path / "submissions_raw.json").write_text("[]")
+        (output_path / "submissions_cleaned.json").write_text("[]")
+        (output_path / "ingest_summary.json").write_text("{}")
+        return IngestResult(submissions=submissions)
+
+    monkeypatch.setattr("fact_form_importer.processing.ingest_workbook", fake_ingest)
+    monkeypatch.setattr(
+        "fact_form_importer.processing.load_fact_api_services",
+        lambda **kwargs: (_vocabularies(), "fact_data_api", lambda slug: True, None),
+    )
+    monkeypatch.setattr("fact_form_importer.processing.new_run_id", lambda: "duplicate-run")
+    monkeypatch.setattr("fact_form_importer.processing._court_lookup", lambda config: None)
+    checked = []
+    monkeypatch.setattr(
+        "fact_form_importer.processing.verify_addresses_with_fact_api",
+        lambda values, config: checked.extend(values) or AddressVerificationBatch(enabled=True),
+    )
+
+    result = process_workbook(
+        source,
+        tmp_path / "out",
+        verify_addresses=True,
+        config=AppConfig(config_dir=tmp_path / "config"),
+    )
+
+    assert [submission.source.source_row_number for submission in checked] == [3]
+    selection = json.loads(
+        (result.archive.archive_path / "submission_selection.json").read_text()
+    )
+    archived = json.loads(
+        (result.archive.archive_path / "submissions_cleaned.json").read_text()
+    )
+    assert selection["authoritative_source_row_numbers"] == [3]
+    assert archived[0]["status"] == "skipped"
+    assert archived[0]["superseded_by_source_row_number"] == 3
+
+
+def test_process_workbook_selects_latest_after_fact_canonicalises_slug_aliases(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "forms.csv"
+    source.write_text("unused")
+    submissions = [
+        CourtSubmission(
+            source=SourceMetadata(
+                source_row_number=2, completion_time="2026-01-01T12:00:00"
+            ),
+            court_slug_raw="Llanelli Law Court",
+            court_slug="llanelli-law-court",
+        ),
+        CourtSubmission(
+            source=SourceMetadata(
+                source_row_number=3, completion_time="2026-01-02T12:00:00"
+            ),
+            court_slug_raw="Llanelli-law-courts",
+            court_slug="llanelli-law-courts",
+        ),
+    ]
+    profile = WorkbookProfile(
+        source_path=source, sheet_name=None, row_count=2, column_count=1, columns=[]
+    )
+    monkeypatch.setenv("FACT_DATA_API_BASE_URL", "https://fact.example.test")
+    monkeypatch.setenv("FACT_DATA_API_BEARER_TOKEN", "token")
+    monkeypatch.setattr("fact_form_importer.processing.profile_workbook", lambda path: profile)
+    monkeypatch.setattr(
+        "fact_form_importer.processing.ingest_workbook",
+        lambda input_path, output_path: _fake_ingest_many(output_path, submissions),
+    )
+
+    def exists(slug):
+        return slug == "llanelli-law-courts"
+
+    def suggest(slug, raw):
+        if slug != "llanelli-law-court":
+            return None
+        return CourtSlugSuggestion(
+            submitted_slug=slug,
+            suggested_slug="llanelli-law-courts",
+            suggested_court_name="Llanelli Law Courts",
+            confidence=1.0,
+            query=str(raw),
+            reason="Exact FaCT alias",
+        )
+
+    monkeypatch.setattr(
+        "fact_form_importer.processing.load_fact_api_services",
+        lambda **kwargs: (_vocabularies(), "fact_data_api", exists, suggest),
+    )
+    monkeypatch.setattr("fact_form_importer.processing.new_run_id", lambda: "alias-run")
+    monkeypatch.setattr("fact_form_importer.processing._court_lookup", lambda config: None)
+
+    result = process_workbook(
+        source, tmp_path / "out", config=AppConfig(config_dir=tmp_path / "config")
+    )
+
+    selection = json.loads(
+        (result.archive.archive_path / "submission_selection.json").read_text()
+    )
+    archived = json.loads(
+        (result.archive.archive_path / "submissions_cleaned.json").read_text()
+    )
+    assert selection["duplicate_court_count"] == 1
+    assert selection["authoritative_source_row_numbers"] == [3]
+    assert archived[0]["court_slug"] == "llanelli-law-courts"
+    assert archived[0]["status"] == "skipped"
+    assert all(
+        issue["code"] != "DUPLICATE_COURT_SLUG"
+        for submission in archived
+        for issue in submission["issues"]
+    )
+
+
 def test_process_workbook_requires_fact_api_configuration_for_address_verification(
     tmp_path, monkeypatch
 ):
@@ -187,6 +326,13 @@ def _fake_ingest(output_path, submission):
     (output_path / "submissions_cleaned.json").write_text("[]")
     (output_path / "ingest_summary.json").write_text("{}")
     return IngestResult(submissions=[submission])
+
+
+def _fake_ingest_many(output_path, submissions):
+    (output_path / "submissions_raw.json").write_text("[]")
+    (output_path / "submissions_cleaned.json").write_text("[]")
+    (output_path / "ingest_summary.json").write_text("{}")
+    return IngestResult(submissions=submissions)
 
 
 def test_load_fact_api_services_handles_offline_fallback_and_missing_config(tmp_path, monkeypatch):

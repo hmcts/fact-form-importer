@@ -31,7 +31,9 @@ from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.service import ApiExecutionService
 from fact_form_importer.execution.jobs import ExecutionJobRunner
 from fact_form_importer.ingest.column_mapping import load_column_mapping
+from fact_form_importer.models.court_submission import CourtSubmission
 from fact_form_importer.output.archive import load_run_archive, list_run_archives
+from fact_form_importer.output.duplicate_review import select_authoritative_submissions
 from fact_form_importer.processing import ProcessingResult, process_workbook
 from fact_form_importer.validators.base import (
     HUMAN_REVIEW_ISSUE_CODES,
@@ -281,10 +283,92 @@ def create_app(
             active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
         )
 
+    @app.get("/runs/<run_id>/workflow")
+    def workflow(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        service = app.config["EXECUTION_SERVICE"]
+        return render_template(
+            "workflow.html",
+            archive=archive,
+            workflow=_workflow_payload(run_id, service),
+            writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
+            active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
+        )
+
+    @app.get("/runs/<run_id>/courts")
+    def courts(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        summary = app.config["EXECUTION_SERVICE"].get_execution_summary(run_id)
+        status = request.args.get("status") or ""
+        query = (request.args.get("q") or "").strip().casefold()
+        court_rows = [
+            court
+            for court in summary.get("courts", [])
+            if (not status or court.get("status") == status)
+            and (not query or query in str(court.get("court_slug") or "").casefold())
+        ]
+        page, pages, court_page = _paginate(court_rows, request.args.get("page"))
+        return render_template(
+            "courts.html",
+            archive=archive,
+            courts=court_page,
+            status=status,
+            query=query,
+            page=page,
+            pages=pages,
+            execution_summary=summary,
+            writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
+            active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
+        )
+
+    @app.get("/runs/<run_id>/courts/<court_slug>")
+    def court_detail(run_id: str, court_slug: str):
+        archive = _archive_or_404(output_root, run_id)
+        service = app.config["EXECUTION_SERVICE"]
+        report = service.get_readiness_report(run_id)
+        record = next(
+            (item for item in report.get("records", []) if item.get("court_slug") == court_slug),
+            None,
+        )
+        if record is None:
+            abort(404)
+        changes = {
+            change["action"]["action_id"]: change
+            for change in service.get_api_changes_review(run_id).get("changes", [])
+            if change.get("court_slug") == court_slug
+        }
+        summary = service.get_execution_summary(run_id)
+        court_summary = next(
+            (court for court in summary.get("courts", []) if court.get("court_slug") == court_slug),
+            None,
+        )
+        submissions = _operational_submissions(archive)
+        source_rows = set(record.get("source_row_numbers", []))
+        sources = [
+            submission
+            for submission in submissions
+            if submission.get("source", {}).get("source_row_number") in source_rows
+        ]
+        return render_template(
+            "court_detail.html",
+            archive=archive,
+            record=record,
+            sources=sources,
+            changes=changes,
+            court_summary=court_summary,
+            writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
+            active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
+        )
+
     @app.get("/runs/<run_id>/records")
     def records(run_id: str):
         archive = _archive_or_404(output_root, run_id)
-        submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+        submissions = _operational_submissions(archive)
+        service = app.config["EXECUTION_SERVICE"]
+        readiness = service.get_readiness_report(run_id)
+        llm_review = service.get_llm_actions_review(run_id)
+        records_by_row = _manifest_records_by_source_row(readiness)
+        review_items_by_row = _llm_review_items_by_source_row(llm_review)
         status = request.args.get("status")
         category = request.args.get("category")
         query = (request.args.get("q") or "").strip().casefold()
@@ -295,10 +379,17 @@ def create_app(
             and (not category or _submission_has_review_category(submission, category))
             and _matches_record_query(submission, query)
         ]
-        ledger = app.config["EXECUTION_SERVICE"].get_ledger(run_id)
+        ledger = service.get_ledger(run_id)
         for submission in filtered:
             court = ledger.courts.get(submission.get("court_slug"))
             submission["execution_status"] = court.status if court else "not_started"
+            row = submission.get("source", {}).get("source_row_number")
+            _add_record_review_guidance(
+                submission,
+                review_items_by_row.get(row, []),
+                records_by_row.get(row),
+            )
+        queue_summary = _record_queue_summary(filtered)
         page, pages, records_page = _paginate(filtered, request.args.get("page"))
         return render_template(
             "records.html",
@@ -309,12 +400,13 @@ def create_app(
             query=query,
             page=page,
             pages=pages,
+            queue_summary=queue_summary,
         )
 
     @app.get("/runs/<run_id>/records/<int:source_row_number>")
     def record_detail(run_id: str, source_row_number: int):
         archive = _archive_or_404(output_root, run_id)
-        submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+        submissions = _operational_submissions(archive)
         submission = next(
             (
                 item
@@ -326,6 +418,7 @@ def create_app(
         if submission is None:
             abort(404)
         manifest = app.config["EXECUTION_SERVICE"].get_readiness_report(run_id)
+        llm_review = app.config["EXECUTION_SERVICE"].get_llm_actions_review(run_id)
         actions = next(
             (
                 item.get("actions", [])
@@ -350,6 +443,11 @@ def create_app(
             for action in actions
             if action.get("source_row_number") in {None, source_row_number}
         ]
+        _add_record_review_guidance(
+            submission,
+            _llm_review_items_by_source_row(llm_review).get(source_row_number, []),
+            _manifest_records_by_source_row(manifest).get(source_row_number),
+        )
         return render_template(
             "record_detail.html",
             archive=archive,
@@ -503,6 +601,7 @@ def create_app(
         payload = app.config["EXECUTION_SERVICE"].get_api_changes_review(run_id)
         hold = request.args.get("hold")
         changes = payload["changes"]
+        comparison_summary = _comparison_summary(changes)
         if hold:
             changes = [change for change in changes if _change_has_hold(change, hold)]
         page, pages, changes_page = _paginate(changes, request.args.get("page"))
@@ -513,6 +612,8 @@ def create_app(
             page=page,
             pages=pages,
             hold=hold,
+            filtered_change_count=len(changes),
+            comparison_summary=comparison_summary,
             comparison_job=app.config["EXECUTION_JOB_RUNNER"].latest_for_run(run_id),
             active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
         )
@@ -524,7 +625,7 @@ def create_app(
             job = app.config["EXECUTION_JOB_RUNNER"].start(run_id, "comparison")
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(url_for("api_changes_review", run_id=run_id, job_id=job.job_id))
+        return redirect(_api_changes_location(run_id, job_id=job.job_id))
 
     @app.post("/runs/<run_id>/api-changes/<action_id>/refresh")
     def refresh_api_change(run_id: str, action_id: str):
@@ -536,7 +637,7 @@ def create_app(
             )
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(url_for("api_changes_review", run_id=run_id))
+        return redirect(_api_changes_location(run_id))
 
     @app.post("/runs/<run_id>/api-changes/<change_id>/approve")
     def approve_api_change(run_id: str, change_id: str):
@@ -545,7 +646,7 @@ def create_app(
             app.config["EXECUTION_SERVICE"].approve_target_change(run_id, change_id)
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(url_for("api_changes_review", run_id=run_id))
+        return redirect(_api_changes_location(run_id))
 
     @app.post("/runs/<run_id>/courts/<court_slug>/select-source")
     def select_duplicate_source(run_id: str, court_slug: str):
@@ -649,6 +750,8 @@ def create_app(
             app.config["EXECUTION_SERVICE"].check_court(run_id, court_slug)
         except ValueError as exc:
             abort(400, str(exc))
+        if request.form.get("court_view") == "1":
+            return redirect(url_for("court_detail", run_id=run_id, court_slug=court_slug))
         return redirect(
             url_for(
                 "record_detail", run_id=run_id, source_row_number=request.form["source_row_number"]
@@ -754,6 +857,7 @@ def _artifact_groups(
         "fact_api_import_manifest.json": "Legacy API readiness report",
         "nsu_cleaned_review.xlsx": "NSU cleaned review workbook",
         "duplicate_forms_review.xlsx": "Duplicate form decision workbook",
+        "submission_selection.json": "Authoritative submission selection evidence",
         "address_verification_report.json": "Address verification report",
         "llm_actions_review.json": "LLM actions review report",
         "import_summary.json": "Import summary",
@@ -767,6 +871,7 @@ def _artifact_groups(
         "fact_api_import_manifest.json",
         "nsu_cleaned_review.xlsx",
         "duplicate_forms_review.xlsx",
+        "submission_selection.json",
         "address_verification_report.json",
         "llm_actions_review.json",
         "import_summary.json",
@@ -791,7 +896,7 @@ def _artifact_groups(
 def _run_factor_summary(archive: dict[str, Any]) -> dict[str, int]:
     """Summarise review contributors without mutating an immutable archive."""
 
-    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    submissions = _operational_submissions(archive)
     llm_factors = _llm_review_factors(archive)
     os_factors = _os_address_factors(archive)
     return {
@@ -812,7 +917,7 @@ def _run_factor_summary(archive: dict[str, Any]) -> dict[str, int]:
 
 
 def _review_overview(archive: dict[str, Any], service: ApiExecutionService) -> dict[str, Any]:
-    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    submissions = _operational_submissions(archive)
     row_groups: dict[str, set[int]] = {}
     row_issue_counts: dict[str, int] = {}
     for submission in submissions:
@@ -869,7 +974,7 @@ def _review_overview(archive: dict[str, Any], service: ApiExecutionService) -> d
         "row_categories": [
             {
                 "code": category,
-                "label": category.replace("_", " ").title(),
+                "label": _hold_category_label(category),
                 "row_count": len(rows),
                 "issue_count": row_issue_counts.get(category, 0),
             }
@@ -887,6 +992,13 @@ def _review_overview(archive: dict[str, Any], service: ApiExecutionService) -> d
             )
         ],
     }
+
+
+def _hold_category_label(category: str) -> str:
+    return {
+        "target_replacement": "Existing Data Approval",
+        "source_selection": "Legacy Source Selection",
+    }.get(category, category.replace("_", " ").title())
 
 
 def _review_category(field: str, code: str = "") -> str:
@@ -952,7 +1064,7 @@ def _change_has_hold(change: dict[str, Any], hold: str) -> bool:
 def _llm_review_factors(archive: dict[str, Any]) -> list[dict[str, Any]]:
     """Return model-specific factors that directly hold a row for review."""
 
-    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    submissions = _operational_submissions(archive)
     factors: list[dict[str, Any]] = []
     for submission in submissions:
         if submission.get("status") != "needs_human_review":
@@ -989,7 +1101,7 @@ def _os_address_factors(archive: dict[str, Any]) -> list[dict[str, Any]]:
 
     report = _load_json(archive["path"] / "address_verification_report.json", {})
     verifications = report.get("verifications", []) if isinstance(report, dict) else []
-    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    submissions = _operational_submissions(archive)
     statuses_by_row = {
         submission.get("source", {}).get("source_row_number"): submission.get("status")
         for submission in submissions
@@ -1010,6 +1122,128 @@ def _os_address_factors(archive: dict[str, Any]) -> list[dict[str, Any]]:
             factor.get("address_index") or 0,
         ),
     )
+
+
+def _workflow_payload(run_id: str, service: ApiExecutionService) -> dict[str, Any]:
+    llm = service.get_llm_actions_review(run_id)
+    changes = service.get_api_changes_review(run_id).get("changes", [])
+    execution = service.get_execution_summary(run_id)
+    llm_pending = int(llm.get("approval_counts", {}).get("pending", 0))
+    comparisons = _comparison_summary(changes)
+    comparison_pending = comparisons["not_checked"]
+    change_approval_pending = comparisons["approval_required"]
+    merge_conflicts = comparisons["conflicts"]
+    court_counts = execution.get("court_status_counts", {})
+    first_incomplete = (
+        "llm" if llm_pending else "changes" if comparison_pending or change_approval_pending else "courts"
+    )
+    return {
+        "first_incomplete": first_incomplete,
+        "llm_pending": llm_pending,
+        "llm_total": llm.get("item_count", 0),
+        "comparison_pending": comparison_pending,
+        "change_approval_pending": change_approval_pending,
+        "merge_conflicts": merge_conflicts,
+        "comparison_total": comparisons["total"],
+        "comparison_checked": comparisons["checked"],
+        "comparison_no_change": comparisons["no_change"],
+        "comparison_empty_target": comparisons["empty_target"],
+        "comparison_approved": comparisons["approved"],
+        "court_count": execution.get("selected_court_count", 0),
+        "court_counts": court_counts,
+        "action_counts": execution.get("action_status_counts", {}),
+    }
+
+
+def _comparison_summary(changes: list[dict[str, Any]]) -> dict[str, int]:
+    comparisons = [
+        change.get("comparison")
+        for change in changes
+        if isinstance(change.get("comparison"), dict)
+    ]
+    return {
+        "total": len(changes),
+        "checked": len(comparisons),
+        "not_checked": len(changes) - len(comparisons),
+        "no_change": sum(bool(comparison.get("is_no_change")) for comparison in comparisons),
+        "empty_target": sum(
+            not comparison.get("has_existing_data") and not comparison.get("is_no_change")
+            for comparison in comparisons
+        ),
+        "approval_required": sum(
+            bool(
+                (comparison := change.get("comparison"))
+                and comparison.get("has_existing_data")
+                and not comparison.get("is_no_change")
+                and not comparison.get("merge_conflicts")
+                and not change.get("target_approved")
+            )
+            for change in changes
+        ),
+        "approved": sum(bool(change.get("target_approved")) for change in changes),
+        "conflicts": sum(
+            bool(comparison.get("merge_conflicts")) for comparison in comparisons
+        ),
+    }
+
+
+def _api_changes_location(run_id: str, **extra: Any) -> str:
+    params = dict(extra)
+    page = request.form.get("page")
+    hold = request.form.get("hold")
+    if page:
+        params["page"] = page
+    if hold:
+        params["hold"] = hold
+    return url_for("api_changes_review", run_id=run_id, **params)
+
+
+def _operational_submissions(archive: dict[str, Any]) -> list[dict[str, Any]]:
+    submissions = _load_json(archive["path"] / "submissions_cleaned.json", [])
+    if not isinstance(submissions, list):
+        return []
+    selection_path = archive["path"] / "submission_selection.json"
+    selection = _load_json(selection_path, {}) if selection_path.exists() else {}
+    if not selection:
+        try:
+            models = [CourtSubmission.model_validate(item) for item in submissions]
+        except (TypeError, ValueError):
+            return submissions
+        _, selection = select_authoritative_submissions(models)
+    authoritative_rows = set(selection.get("authoritative_source_row_numbers", []))
+    superseded_by = {
+        item.get("source_row_number"): group.get("authoritative_source_row_number")
+        for group in selection.get("groups", [])
+        for item in group.get("superseded", [])
+    }
+    result = []
+    for original in submissions:
+        submission = json.loads(json.dumps(original))
+        row = submission.get("source", {}).get("source_row_number")
+        if row in superseded_by:
+            submission["selection_status"] = "superseded"
+            submission["superseded_by_source_row_number"] = superseded_by[row]
+            submission["status"] = "skipped"
+        elif not authoritative_rows or row in authoritative_rows:
+            submission["selection_status"] = "authoritative"
+            submission["issues"] = [
+                issue
+                for issue in submission.get("issues", [])
+                if issue.get("code") != "DUPLICATE_COURT_SLUG"
+            ]
+            submission["status"] = _status_from_visible_issues(submission.get("issues", []))
+        result.append(submission)
+    return result
+
+
+def _status_from_visible_issues(issues: list[dict[str, Any]]) -> str:
+    if any(issue.get("severity") == "error" for issue in issues):
+        return "failed"
+    if any(issue.get("code") in HUMAN_REVIEW_ISSUE_CODES for issue in issues):
+        return "needs_human_review"
+    if any(issue.get("severity") == "warning" for issue in issues):
+        return "processed_with_warnings"
+    return "processed"
 
 
 def _zip_archive(archive_path: Path) -> BytesIO:
@@ -1036,6 +1270,209 @@ def _matches_record_query(submission: dict[str, Any], query: str) -> bool:
         submission.get("source", {}).get("source_row_number"),
     ]
     return any(query in str(value).casefold() for value in values if value is not None)
+
+
+def _manifest_records_by_source_row(
+    readiness: dict[str, Any],
+) -> dict[int, dict[str, Any]]:
+    result: dict[int, dict[str, Any]] = {}
+    for record in readiness.get("records", []):
+        for row in record.get("source_row_numbers", []):
+            if isinstance(row, int):
+                result[row] = record
+    return result
+
+
+def _llm_review_items_by_source_row(
+    review: dict[str, Any],
+) -> dict[int, list[dict[str, Any]]]:
+    result: dict[int, list[dict[str, Any]]] = {}
+    for item in review.get("items", []):
+        row = item.get("source_row_number")
+        if isinstance(row, int):
+            result.setdefault(row, []).append(item)
+    return result
+
+
+def _add_record_review_guidance(
+    submission: dict[str, Any],
+    review_items: list[dict[str, Any]],
+    manifest_record: dict[str, Any] | None,
+) -> None:
+    """Describe whether each archived issue needs a decision, source fix, or no action."""
+
+    row = submission.get("source", {}).get("source_row_number")
+    for issue in submission.get("issues", []):
+        matching_items = _matching_llm_review_items(issue, review_items)
+        issue["review_guidance"] = _record_issue_guidance(issue, matching_items)
+
+    action_count = 0
+    if manifest_record:
+        action_count = sum(
+            action.get("source_row_number") in {None, row}
+            for action in manifest_record.get("actions", [])
+        )
+    submission["planned_action_count"] = action_count
+    submission["has_court_action_page"] = bool(manifest_record)
+    submission["pending_value_review_count"] = sum(
+        item.get("approval_status") == "pending" for item in review_items
+    )
+    submission["source_task_count"] = sum(
+        issue.get("review_guidance", {}).get("state") == "source"
+        for issue in submission.get("issues", [])
+    )
+
+
+def _matching_llm_review_items(
+    issue: dict[str, Any], review_items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    code = str(issue.get("code") or "")
+    field = str(issue.get("field") or "")
+    if code.startswith("ADDRESS_OS_"):
+        candidates = [item for item in review_items if item.get("kind") == "address"]
+    elif code.startswith("LLM_"):
+        candidates = [item for item in review_items if item.get("kind") == "field"]
+    else:
+        return []
+    overlapping = [
+        item
+        for item in candidates
+        if _review_fields_overlap(field, str(item.get("field") or ""))
+    ]
+    return overlapping or candidates
+
+
+def _review_fields_overlap(left: str, right: str) -> bool:
+    return bool(left and right) and (
+        left == right
+        or left.startswith(right + ".")
+        or left.startswith(right + "[")
+        or right.startswith(left + ".")
+        or right.startswith(left + "[")
+    )
+
+
+def _record_issue_guidance(
+    issue: dict[str, Any], review_items: list[dict[str, Any]]
+) -> dict[str, str]:
+    code = str(issue.get("code") or "")
+    explanation = _record_issue_explanation(issue)
+    pending = [item for item in review_items if item.get("approval_status") == "pending"]
+    completed = [
+        item
+        for item in review_items
+        if item.get("approval_status") in {"approved", "already_executed"}
+    ]
+    if pending:
+        return {
+            "state": "review",
+            "label": "Decision needed in Step 1",
+            "explanation": explanation,
+            "remedy": "Review the submitted and proposed value, then approve it if it is correct.",
+        }
+    if completed and len(completed) == len(review_items):
+        return {
+            "state": "complete",
+            "label": "Already handled",
+            "explanation": explanation,
+            "remedy": "The related value decision is complete; no further action is needed here.",
+        }
+
+    source_codes = {
+        "COURT_SLUG_NOT_FOUND",
+        "COURT_SLUG_SUGGESTED",
+        "MISSING_COURT_IDENTIFIER",
+        "INVALID_POSTCODE",
+        "INVALID_TIME",
+        "OPENING_HOURS_AMBIGUOUS",
+        "VOCAB_NO_MATCH",
+        "ADDRESS_OS_REVIEW_REQUIRED",
+        "ADDRESS_OS_LOOKUP_UNAVAILABLE",
+    }
+    is_unresolved_llm = code.startswith("LLM_") and code not in {
+        "LLM_FIELD_NORMALISED",
+        "LLM_MODEL_NOTE",
+        "LLM_RESPONSE_REVIEW_ADVISORY",
+    }
+    if (
+        code in source_codes
+        or is_unresolved_llm
+        or issue.get("severity") == "error"
+        or code in HUMAN_REVIEW_ISSUE_CODES
+    ):
+        remedy = "Correct the submitted value in the source workbook, then create a fresh run."
+        if code == "COURT_SLUG_NOT_FOUND":
+            remedy = (
+                "Correct the court identifier in the source workbook, then create a fresh run. "
+                "The importer cannot create or guess a court."
+            )
+        elif code.startswith("ADDRESS_OS_"):
+            remedy = (
+                "No approvable address was produced. Correct the submitted address or retry the "
+                "lookup in a fresh run before sending this address."
+            )
+        return {
+            "state": "source",
+            "label": "Fix source and rerun",
+            "explanation": explanation,
+            "remedy": remedy,
+        }
+    return {
+        "state": "information",
+        "label": "Information only",
+        "explanation": explanation,
+        "remedy": "No action is needed unless the cleaned result looks wrong.",
+    }
+
+
+def _record_issue_explanation(issue: dict[str, Any]) -> str:
+    code = str(issue.get("code") or "")
+    field = str(issue.get("field") or "this value").replace("_", " ")
+    explanations = {
+        "COURT_SLUG_NOT_FOUND": "This court could not be found in the FaCT database.",
+        "COURT_SLUG_SUGGESTED": "A possible FaCT court match was found, but it was not safe to select automatically.",
+        "COURT_SLUG_NORMALISED": "The submitted court identifier was cleaned into the displayed court slug.",
+        "COURT_SLUG_AUTO_REPAIRED": "A verified FaCT court match was used to repair the submitted court identifier.",
+        "MISSING_COURT_IDENTIFIER": "The submission does not contain a usable court identifier.",
+        "INVALID_EMAIL": f"The submitted {field} is not a valid email address and was omitted.",
+        "INVALID_PHONE": f"The submitted {field} is not a valid phone number and was omitted.",
+        "INVALID_POSTCODE": f"The submitted {field} is not a valid UK postcode.",
+        "INVALID_TIME": f"The submitted {field} could not be converted into a valid time.",
+        "OPENING_HOURS_AMBIGUOUS": "The submitted opening hours are incomplete or ambiguous.",
+        "VOCAB_NO_MATCH": f"The submitted {field} does not match an allowed FaCT option.",
+        "POSTCODE_TYPO_REPAIRED": "An unambiguous postcode typo was repaired automatically.",
+        "ADDRESS_OS_NORMALISED": "An Ordnance Survey address match was selected and used to normalise the address.",
+        "ADDRESS_OS_VERIFIED": "The submitted address matched Ordnance Survey without needing a change.",
+        "ADDRESS_OS_REVIEW_REQUIRED": "The address lookup did not produce a selection that was safe to use without review.",
+        "ADDRESS_OS_LOOKUP_UNAVAILABLE": "The address lookup was unavailable, so the address was not verified.",
+        "LLM_FIELD_NORMALISED": f"The model proposed a cleaned public-facing value for {field}.",
+        "LLM_LOW_CONFIDENCE": f"The model was not sufficiently confident about {field}.",
+        "LLM_REVIEW_REQUIRED": f"The model requested a human decision for {field}.",
+        "LLM_RESPONSE_LOW_CONFIDENCE": f"The model result for {field} was low confidence.",
+        "LLM_RESPONSE_REVIEW_ADVISORY": f"The model included a review note for {field}.",
+        "LLM_MODEL_NOTE": f"The model recorded additional context about {field}.",
+        "LLM_NORMALISATION_FAILED": f"The model could not safely normalise {field}.",
+    }
+    if code in explanations:
+        return explanations[code]
+    message = str(issue.get("message") or "This submitted value was recorded for review.")
+    return message.rstrip(".") + "."
+
+
+def _record_queue_summary(submissions: list[dict[str, Any]]) -> dict[str, int]:
+    issues = [issue for submission in submissions for issue in submission.get("issues", [])]
+    return {
+        "row_count": len(submissions),
+        "decision_rows": sum(
+            bool(submission.get("pending_value_review_count")) for submission in submissions
+        ),
+        "source_rows": sum(bool(submission.get("source_task_count")) for submission in submissions),
+        "action_rows": sum(bool(submission.get("planned_action_count")) for submission in submissions),
+        "information_issues": sum(
+            issue.get("review_guidance", {}).get("state") == "information"
+            for issue in issues
+        ),
+    }
 
 
 def _safe_job_error(exc: Exception) -> str:

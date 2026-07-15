@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Courts and API actions</h1>
+<nav>
+  <a href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}">Review workflow</a>
+  <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Results</a>
+</nav>
+<form method="get">
+  <label for="status">Court status</label>
+  <select id="status" name="status"><option value="">All</option>{% for option in ['not_started','awaiting_approval','in_progress','attention_required','completed'] %}<option value="{{ option }}" {% if status == option %}selected{% endif %}>{{ option | replace('_', ' ') }}</option>{% endfor %}</select>
+  <label for="q">Court slug</label><input id="q" name="q" value="{{ query }}"><button type="submit">Filter</button>
+</form>
+{% if writes_enabled %}<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe and fully approved action?');"><button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Execution in progress…{% else %}Run all safe actions{% endif %}</button></form>{% endif %}
+<table>
+  <thead><tr><th>Court</th><th>Authoritative source row</th><th>Status</th><th>Actions</th><th>Review</th></tr></thead>
+  <tbody>{% for court in courts %}<tr>
+    <td><strong>{{ court.court_slug }}</strong></td>
+    <td>{{ court.source_row_numbers | join(', ') }}</td>
+    <td>{{ court.status | replace('_', ' ') }}</td>
+    <td>{% for action in court.actions %}{{ action.resource | replace('_', ' ') }}: <strong>{{ action.status | replace('_', ' ') }}</strong>{% if action.hold_codes %}<br><small>{{ action.hold_codes | join(', ') | replace('_', ' ') }}</small>{% endif %}{% if not loop.last %}<hr>{% endif %}{% endfor %}</td>
+    <td><a class="button-link" href="{{ url_for('court_detail', run_id=archive.manifest.run_id, court_slug=court.court_slug) }}">Review and run</a></td>
+  </tr>{% else %}<tr><td colspan="5">No courts match.</td></tr>{% endfor %}</tbody>
+</table>
+{% if pages > 1 %}<p>Page {{ page }} of {{ pages }}</p>{% endif %}
+{% endblock %}

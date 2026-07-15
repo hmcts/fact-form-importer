@@ -64,6 +64,8 @@ class CourtSubmission(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
     cleaned: dict[str, Any] = Field(default_factory=dict)
     issues: list[Issue] = Field(default_factory=list)
+    selection_status: Literal["authoritative", "superseded"] = "authoritative"
+    superseded_by_source_row_number: Optional[int] = None
     status: Literal[
         "unprocessed",
         "processed",

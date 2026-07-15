@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -24,6 +25,7 @@ from fact_form_importer.llm.review import (
 )
 from fact_form_importer.output.archive import ArchiveResult, publish_run_archive, stage_path
 from fact_form_importer.output.duplicates_workbook import write_duplicate_review_workbook
+from fact_form_importer.output.duplicate_review import select_authoritative_submissions
 from fact_form_importer.output.fact_api_manifest import build_fact_api_import_manifest
 from fact_form_importer.output.logs import OutputResult, new_run_id, write_processing_outputs
 from fact_form_importer.output.nsu_workbook import write_nsu_review_workbook
@@ -85,14 +87,38 @@ def process_workbook(
         staging.mkdir(parents=True, exist_ok=False)
         workbook_profile = profile_workbook(input_path)
         ingest_result = ingest_workbook(input_path=input_path, output_path=staging)
+        all_submissions = ingest_result.submissions
         vocabularies, vocabulary_source, court_slug_exists, court_slug_suggester = (
             load_fact_api_services(
                 config=app_config,
                 allow_local_vocabularies=allow_local_vocabularies,
             )
         )
+        # FaCT can canonicalise a submitted alias to a slug already used by
+        # another row. Resolve that identity before choosing the latest form,
+        # then discard preliminary validation issues so only authoritative rows
+        # enter operational validation and review queues. The outer caches are
+        # shared by both passes and avoid duplicate FaCT lookups.
+        if court_slug_exists is not None:
+            court_slug_exists = lru_cache(maxsize=None)(court_slug_exists)
+        if court_slug_suggester is not None:
+            court_slug_suggester = lru_cache(maxsize=None)(court_slug_suggester)
+        validate_all_submissions(
+            all_submissions,
+            vocabularies,
+            court_slug_exists=court_slug_exists,
+            court_slug_suggester=court_slug_suggester,
+        )
+        clear_validation_issues(all_submissions)
+        authoritative_submissions, submission_selection = select_authoritative_submissions(
+            all_submissions
+        )
+        (staging / "submission_selection.json").write_text(
+            json.dumps(submission_selection, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
         submissions = validate_all_submissions(
-            ingest_result.submissions,
+            authoritative_submissions,
             vocabularies,
             court_slug_exists=court_slug_exists,
             court_slug_suggester=court_slug_suggester,
@@ -126,11 +152,18 @@ def process_workbook(
                 court_slug_suggester=court_slug_suggester,
             )
 
+        authoritative_by_row = {
+            submission.source.source_row_number: submission for submission in submissions
+        }
+        archived_submissions = [
+            authoritative_by_row.get(submission.source.source_row_number, submission)
+            for submission in all_submissions
+        ]
         # Ingestion writes this file before validation. Replace it with the final
-        # batch so archive/UI status tables agree with all review outputs.
+        # audit batch, retaining superseded rows while excluding them operationally.
         (staging / "submissions_cleaned.json").write_text(
             json.dumps(
-                [submission.model_dump(mode="json") for submission in submissions],
+                [submission.model_dump(mode="json") for submission in archived_submissions],
                 indent=2,
                 ensure_ascii=False,
             )
@@ -199,6 +232,7 @@ def process_workbook(
             vocabularies=vocabularies,
             court_lookup=court_lookup,
             address_verification_metrics=address_verifications.summary_metrics(),
+            submission_selection_metrics=submission_selection,
         )
         review_workbook_path = write_nsu_review_workbook(
             submissions=submissions,
@@ -207,7 +241,7 @@ def process_workbook(
             address_verifications=address_verifications.verifications,
         )
         duplicate_review_workbook_path = write_duplicate_review_workbook(
-            submissions=submissions,
+            submissions=archived_submissions,
             output_path=staging,
             summary=output_result.summary,
         )

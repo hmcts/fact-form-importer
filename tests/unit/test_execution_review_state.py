@@ -1,11 +1,10 @@
 from fact_form_importer.execution.review_state import (
     ExecutionReviewStore,
     build_target_comparison,
-    replacement_operations,
 )
 
 
-def test_replacement_operations_update_and_create_before_deleting_surplus():
+def test_merge_operations_update_and_create_while_preserving_unmatched_live_entries():
     action = {
         "action_id": "court-address",
         "resource": "address",
@@ -21,14 +20,91 @@ def test_replacement_operations_update_and_create_before_deleting_surplus():
         {"addressType": "Other", "addressLine1": "Created"},
     ]
 
-    operations = replacement_operations(action, current, proposed)
+    comparison = build_target_comparison("court", {**action, "proposed_items": proposed}, current)
+    operations = comparison.operations
 
-    assert [operation["purpose"] for operation in operations] == [
-        "create",
-        "update",
-        "delete_surplus",
-    ]
-    assert operations[-1]["path"].endswith("/postal-id")
+    assert [operation["purpose"] for operation in operations] == ["create", "update"]
+    assert all(operation["method"] != "DELETE" for operation in operations)
+    assert {item["addressType"] for item in comparison.proposed} == {"Visit", "Post", "Other"}
+    assert next(
+        item for item in comparison.proposed if item["addressType"] == "Post"
+    )["addressLine1"] == "Surplus"
+
+
+def test_merge_preserves_blank_optional_fields_and_applies_explicit_clear():
+    action = {
+        "action_id": "court-contact",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/id/v1/contact-details",
+        "proposed_items": [
+            {"courtContactDescriptionId": "type", "phoneNumber": "020 7000 0000"}
+        ],
+        "proposed_item_clear_fields": [["explanation"]],
+    }
+    comparison = build_target_comparison(
+        "court",
+        action,
+        [
+            {
+                "id": "contact-id",
+                "courtContactDescriptionId": "type",
+                "email": "help@example.test",
+                "explanation": "Remove me",
+            }
+        ],
+    )
+
+    effective = comparison.proposed[0]
+    assert effective["email"] == "help@example.test"
+    assert effective["explanation"] is None
+    assert comparison.operations[0]["body"]["explanation"] is None
+
+
+def test_merge_adds_required_zero_phone_only_when_live_and_submitted_values_are_missing():
+    action = {
+        "action_id": "court-accessibility",
+        "resource": "accessibility_options",
+        "method": "POST",
+        "path": "/courts/id/v1/accessibility-options",
+        "body": {"accessibleEntrance": False, "lift": False},
+    }
+
+    missing = build_target_comparison("court", action, {})
+    preserved = build_target_comparison(
+        "court",
+        action,
+        {
+            "accessibleEntrancePhoneNumber": "020 7000 0001",
+            "liftSupportPhoneNumber": "020 7000 0002",
+        },
+    )
+
+    assert missing.proposed["accessibleEntrancePhoneNumber"] == "00000000000"
+    assert missing.proposed["liftSupportPhoneNumber"] == "00000000000"
+    assert preserved.proposed["accessibleEntrancePhoneNumber"] == "020 7000 0001"
+    assert preserved.proposed["liftSupportPhoneNumber"] == "020 7000 0002"
+
+
+def test_merge_blocks_ambiguous_business_type_matches():
+    action = {
+        "action_id": "court-contact",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/id/v1/contact-details",
+        "proposed_items": [{"courtContactDescriptionId": "type", "explanation": "New"}],
+    }
+    comparison = build_target_comparison(
+        "court",
+        action,
+        [
+            {"id": "one", "courtContactDescriptionId": "type"},
+            {"id": "two", "courtContactDescriptionId": "type"},
+        ],
+    )
+
+    assert comparison.merge_conflicts
+    assert comparison.operations == []
 
 
 def test_target_approval_is_hash_bound_and_source_change_invalidates_it(tmp_path):

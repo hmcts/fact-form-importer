@@ -22,6 +22,7 @@
 {%- endmacro %}
 <h1>LLM Actions Review: {{ archive.manifest.run_id }}</h1>
 <nav>
+  <a href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}">Review workflow</a>
   <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
   <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">All records</a>
   <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Execution summary</a>

@@ -5,6 +5,7 @@
 <h1>Run {{ archive.manifest.run_id }}</h1>
 <p>{{ archive.manifest.source_name }} · {{ archive.manifest.completed_at }}</p>
 <nav>
+  <a href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}"><strong>Review workflow</strong></a>
   <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">All records</a>
   <a href="{{ url_for('records', run_id=archive.manifest.run_id, status='needs_human_review') }}">Needs review</a>
   <a href="{{ url_for('review_overview', run_id=archive.manifest.run_id) }}">Review overview</a>
@@ -16,12 +17,13 @@
   <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">API changes review</a>
   <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Execution summary</a>
 </nav>
+<p><a class="button-link" href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}">Start or continue review</a></p>
 <div class="summary">
-  {% for label, value in [('Form rows', summary.get('submission_count', status_total)),('Unique court slugs', summary.get('unique_court_slug_count', factor_summary.unique_court_slug_count)),('Processed rows', summary.get('processed_count', 0)),('Warning rows', summary.get('processed_with_warnings_count', 0)),('Needs review rows', summary.get('needs_human_review_count', 0)),('Failed rows', summary.get('failed_count', 0)),('Duplicate rows', summary.get('duplicate_slug_affected_record_count', 0)),('Addresses checked', summary.get('address_verification_count', 0)),('Address actions held', summary.get('address_verification_action_blocking_count', 0)),('Ready API actions', summary.get('api_manifest_ready_action_count', 0)),('Pending API actions', summary.get('api_manifest_pending_action_count', 0)),('Review-required defaults', summary.get('api_manifest_review_required_default_count', 0)),('LLM calls', summary.get('llm_calls', 0))] %}
+  {% for label, value in [('Form rows', summary.get('source_submission_count', summary.get('submission_count', status_total))),('Authoritative rows', summary.get('authoritative_submission_count', summary.get('submission_count', status_total))),('Superseded duplicate rows', summary.get('superseded_submission_count', 0)),('Unique court slugs', summary.get('unique_court_slug_count', factor_summary.unique_court_slug_count)),('Processed rows', summary.get('processed_count', 0)),('Warning rows', summary.get('processed_with_warnings_count', 0)),('Needs review rows', summary.get('needs_human_review_count', 0)),('Failed rows', summary.get('failed_count', 0)),('Addresses checked', summary.get('address_verification_count', 0)),('Address actions held', summary.get('address_verification_action_blocking_count', 0)),('Ready API actions', summary.get('api_manifest_ready_action_count', 0)),('Pending API actions', summary.get('api_manifest_pending_action_count', 0)),('Review-required defaults', summary.get('api_manifest_review_required_default_count', 0)),('LLM calls', summary.get('llm_calls', 0))] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
-<p class="muted">The four status counts are form-row counts and sum to Form rows. Unique court slugs can be lower because duplicate submissions remain separate for review.</p>
+<p class="muted">Operational status counts cover authoritative rows. Older duplicate submissions remain available in Records/Audit with a superseded label.</p>
 {% if factor_summary.llm_review_submission_count or factor_summary.os_action_blocking_submission_count %}
 <h2>Review Factors</h2>
 <div class="summary">
@@ -32,12 +34,12 @@
 {% endif %}
 <h2>API execution</h2>
 <div class="summary">
-  {% for label, value in [('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Target replacements pending', execution_summary.replacement_approval_counts.pending), ('Duplicate courts needing source selection', execution_summary.duplicate_source_selection_counts.pending_courts), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  {% for label, value in [('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('Unchanged fields auto-approved', execution_summary.llm_approval_counts.auto_approved_unchanged_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Existing-data approvals pending', execution_summary.replacement_approval_counts.pending), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
 {% if writes_enabled %}
-<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe and fully approved action? Approved existing sections may be replaced, including removal of surplus collection entries.');">
+<form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe and fully approved action? Submitted values will be merged into current FaCT data.');">
   <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Execution in progress…{% else %}Run all safe actions{% endif %}</button>
 </form>
 {% else %}

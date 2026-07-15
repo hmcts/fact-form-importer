@@ -4,6 +4,8 @@ header a { color: #fff; text-decoration: none; }
 main { max-width: 1200px; margin: 0 auto; padding: 2rem; }
 nav { margin: 0 0 1.5rem; }
 nav a { margin-right: 1rem; }
+.pagination { display: flex; align-items: center; gap: 1rem; margin: 1rem 0; }
+.pagination a { margin-right: 0; font-weight: bold; }
 table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.92rem; }
 th, td { border: 1px solid #b1b4b6; padding: 0.55rem; text-align: left; vertical-align: top; }
 th { background: #f3f2f1; }
@@ -37,3 +39,10 @@ pre { background: #f3f2f1; padding: 1rem; overflow: auto; white-space: pre-wrap;
 table.compact { font-size: 0.82rem; }
 mark.diff-removed { background: #f6d7d2; color: #942514; text-decoration: line-through; }
 mark.diff-added { background: #cce2d8; color: #005a30; }
+.review-checklist { margin: 0; padding-left: 1.4rem; }
+.review-task { border-left: 4px solid #b1b4b6; margin-bottom: 0.8rem; padding: 0.25rem 0.5rem; }
+.review-task-review { border-color: #d4351c; }
+.review-task-source { border-color: #f47738; }
+.review-task-complete { border-color: #00703c; }
+.review-task-information { border-color: #1d70b8; }
+.review-task details { margin: 0.4rem 0 0; }

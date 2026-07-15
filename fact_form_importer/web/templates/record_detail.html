@@ -1,7 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Record {{ submission.source.source_row_number }}</h1>
-<p><a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Back to records</a></p>
+<p><a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Back to records</a>{% if submission.court_slug and submission.selection_status != 'superseded' %} · <a href="{{ url_for('court_detail', run_id=archive.manifest.run_id, court_slug=submission.court_slug) }}">Review and run this court</a>{% endif %}</p>
+{% if submission.selection_status == 'superseded' %}<p class="error"><strong>Superseded by later source row {{ submission.superseded_by_source_row_number }}.</strong> This row is retained for audit but has no LLM review dependencies or API actions.</p>{% endif %}
+
+<section>
+  <h2>What needs attention</h2>
+  <p>This list distinguishes decisions available in the workflow from source corrections and information-only audit notes.</p>
+  <ol class="review-checklist">{% for issue in submission.issues %}{% set guidance = issue.review_guidance %}<li class="review-task review-task-{{ guidance.state }}"><strong>{{ guidance.label }}</strong><br>{{ guidance.explanation }}<br><span class="muted">{{ guidance.remedy }}</span>{% if guidance.state == 'review' %}<br><a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending', q=submission.source.source_row_number) }}">Review this row in Step 1</a>{% elif guidance.state == 'complete' %}<br><a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, q=submission.source.source_row_number) }}">View the completed decision</a>{% endif %}<details><summary>Technical evidence</summary><code>{{ issue.code }}</code>{% if issue.field %}<br>Field: <code>{{ issue.field }}</code>{% endif %}{% if issue.message %}<p>{{ issue.message }}</p>{% endif %}</details></li>{% else %}<li>No issues were recorded for this row.</li>{% endfor %}</ol>
+  {% if submission.planned_action_count %}<p><strong>{{ submission.planned_action_count }} FaCT section action(s) are associated with this row.</strong> Use the court workspace below to review approvals and run them.</p>{% else %}<p><strong>No FaCT API action is attached to this row.</strong> Workflow approvals cannot resolve any source corrections listed above.</p>{% endif %}
+</section>
 
 {% if actions %}
 <section>

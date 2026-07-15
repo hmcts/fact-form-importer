@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from zipfile import ZIP_STORED, ZipFile
 
+import httpx
+
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.fact_api import ApiResponse
 from fact_form_importer.execution.models import ExecutionLedger
@@ -17,11 +19,15 @@ from fact_form_importer.web.app import (
     _action_execution_status,
     _change_has_hold,
     _load_readiness_report,
+    _operational_submissions,
     _raw_evidence_for_fields,
     _review_category,
+    _review_overview,
     _safe_job_error,
+    _status_from_visible_issues,
     _submission_has_review_category,
     _value_at_path,
+    _workflow_payload,
     create_app,
     run_server,
 )
@@ -37,6 +43,18 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     run_page = client.get(f"/runs/{run_id}")
     assert run_page.status_code == 200
     assert b"Download this run (.zip)" in run_page.data
+    workflow = client.get(f"/runs/{run_id}/workflow")
+    assert workflow.status_code == 200
+    assert b"1. Review LLM and address results" in workflow.data
+    assert b"2. Review changes to live FaCT data" in workflow.data
+    assert b"3. Review and execute courts" in workflow.data
+    assert b"This is not an approval queue" in workflow.data
+    courts = client.get(f"/runs/{run_id}/courts")
+    assert courts.status_code == 200
+    assert b"Review and run" in courts.data
+    court = client.get(f"/runs/{run_id}/courts/example-court")
+    assert court.status_code == 200
+    assert b"Check all target sections" in court.data
     assert client.get(f"/runs/{run_id}/records?status=processed").status_code == 200
     review = client.get(f"/runs/{run_id}/records?status=needs_human_review")
     assert b"review-court" in review.data
@@ -56,6 +74,97 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert b"Duplicate form decision workbook" in client.get(f"/runs/{run_id}").data
     assert b"LLM review rows" in client.get("/").data
     assert b"OS-held address rows" in client.get("/").data
+
+
+def test_records_page_is_a_plain_language_todo_list_with_action_links(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    submissions_path = archive_path / "submissions_cleaned.json"
+    submissions = json.loads(submissions_path.read_text())
+    submissions[1]["issues"] = [
+        {
+            "field": "facilities.accessible_toilet_description",
+            "code": "LLM_LOW_CONFIDENCE",
+            "severity": "warning",
+            "message": "Review the model result",
+        },
+        {
+            "field": "opening_hours[1].opening_time",
+            "code": "INVALID_TIME",
+            "severity": "warning",
+            "message": "Time is invalid",
+        },
+        {
+            "field": "court_slug",
+            "code": "COURT_SLUG_NORMALISED",
+            "severity": "info",
+            "message": "Court slug was cleaned",
+        },
+    ]
+    submissions_path.write_text(json.dumps(submissions))
+    readiness_path = archive_path / "api_readiness_report.json"
+    readiness = json.loads(readiness_path.read_text())
+    readiness["manifest_version"] = "99.0"
+    review_action = dict(readiness["records"][0]["actions"][0])
+    review_action.update(
+        {
+            "action_id": "review-court-1",
+            "source_row_number": 3,
+            "llm_review_ids": ["review-value"],
+        }
+    )
+    readiness["records"].append(
+        {
+            "court_slug": "review-court",
+            "source_row_numbers": [3],
+            "actions": [review_action],
+        }
+    )
+    readiness_path.write_text(json.dumps(readiness))
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "review-value",
+                        "kind": "field",
+                        "source_row_number": 3,
+                        "court_slug": "review-court",
+                        "field": "facilities.accessible_toilet_description",
+                        "model_result": {
+                            "operation": "set",
+                            "value": "Available on the ground floor.",
+                            "confidence": "low",
+                            "needs_human_review": True,
+                        },
+                        "outcome": "accepted",
+                        "dependent_action_ids": ["review-court-1"],
+                        "actionable": True,
+                        "approvable": True,
+                    }
+                ],
+            }
+        )
+    )
+
+    client = create_app(output_root).test_client()
+    page = client.get(f"/runs/{run_id}/records?status=needs_human_review")
+    detail = client.get(f"/runs/{run_id}/records/3")
+
+    assert page.status_code == 200
+    assert b"complete source-review checklist" in page.data
+    assert b"Decision needed in Step 1" in page.data
+    assert b"Fix source and rerun" in page.data
+    assert b"Information only" in page.data
+    assert b"Review this row in Step 1" in page.data
+    assert b"1 section action(s) planned" in page.data
+    assert b"Review and run this court" in page.data
+    assert b"/llm-actions?status=pending&amp;q=3" in page.data
+    assert b"/courts/review-court" in page.data
+    assert detail.status_code == 200
+    assert b"What needs attention" in detail.data
+    assert b"1 FaCT section action(s) are associated with this row" in detail.data
 
 
 def test_review_queue_classification_and_hold_filters():
@@ -487,7 +596,9 @@ def test_review_overview_and_api_change_routes_cover_value_source_and_target_gat
     assert {selected.status_code, approved_value.status_code, refreshed.status_code} == {302}
     assert approved_target.status_code == 302
     assert changes_page.status_code == 200
-    assert b"component difference" in changes_page.data
+    assert b"This is not a 1-item approval queue" in changes_page.data
+    assert b"Run one read-only scan" in changes_page.data
+    assert b"effective difference" in changes_page.data
     assert execution_client.writes == []
     assert client.get(
         f"/runs/{run_id}/api-changes?hold=target_replacement"
@@ -513,6 +624,75 @@ def test_review_overview_and_api_change_routes_cover_value_source_and_target_gat
     scan_job = _wait_for_execution_job(app)
     assert scan_job.state == "completed"
     assert client.get(f"/execution-jobs/{scan_job.job_id}/status.json").status_code == 200
+
+
+def test_api_changes_review_has_previous_and_next_navigation(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    changes = [
+        {
+            "change_id": f"change-{index}",
+            "court_slug": f"court-{index}",
+            "source_row_number": index + 2,
+            "source_selection_required": False,
+            "selected_source_row_number": None,
+            "action": {
+                "action_id": f"action-{index}",
+                "resource": "building_facilities",
+                "readiness": "ready",
+            },
+            "comparison": None,
+            "target_approved": False,
+            "pending_value_holds": [],
+            "execution_status": "planned",
+        }
+        for index in range(51)
+    ]
+
+    class ChangesService:
+        def get_api_changes_review(self, requested_run_id):
+            return {"changes": changes}
+
+    client = create_app(output_root, execution_service=ChangesService()).test_client()
+
+    first = client.get(f"/runs/{run_id}/api-changes?hold=target_not_checked")
+    second = client.get(f"/runs/{run_id}/api-changes?hold=target_not_checked&page=2")
+
+    assert first.status_code == 200
+    assert b"Page 1 of 2" in first.data
+    assert b"Next page" in first.data
+    assert b"Previous page" not in first.data
+    assert b"page=2" in first.data
+    assert b"hold=target_not_checked" in first.data
+    assert second.status_code == 200
+    assert b"Page 2 of 2" in second.data
+    assert b"Previous page" in second.data
+    assert b"Next page" not in second.data
+
+
+def test_api_change_refresh_explains_fact_authentication_failure(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    request_value = httpx.Request("GET", "http://fact.test/courts/slug/example-court/v1")
+    response = httpx.Response(401, request=request_value)
+    lookup_error = httpx.HTTPStatusError(
+        "Client error '401 Unauthorized'",
+        request=request_value,
+        response=response,
+    )
+    service = ApiExecutionService(
+        output_root,
+        AppConfig(),
+        _FakeExecutionClientWithLookupError(lookup_error),
+    )
+    client = create_app(output_root, execution_service=service).test_client()
+
+    refreshed = client.post(
+        f"/runs/{run_id}/api-changes/example-court-1/refresh",
+        data={"court_slug": "example-court", "page": "3", "hold": "target_not_checked"},
+    )
+
+    assert refreshed.status_code == 400
+    assert b"HTTP 401" in refreshed.data
+    assert b"Refresh FACT_DATA_API_BEARER_TOKEN" in refreshed.data
 
 
 def test_review_ui_allows_only_manifested_artifact_downloads(tmp_path):
@@ -623,9 +803,164 @@ def test_review_ui_handles_missing_resources_filters_and_pagination(tmp_path):
     assert client.get("/jobs/missing").status_code == 404
     assert client.get("/runs/missing-records/records").status_code == 404
     assert client.get(f"/runs/{run_id}/records/999").status_code == 404
+    assert client.get(f"/runs/{run_id}/courts/missing-court").status_code == 404
     assert client.get(f"/runs/{run_id}/issues?code=UNKNOWN").status_code == 200
     assert client.get(f"/runs/{run_id}/records?q=2&page=not-a-page").status_code == 200
     assert client.get(f"/runs/{run_id}/download/not-in-manifest.json").status_code == 404
+
+
+def test_operational_submissions_derives_latest_row_and_visible_statuses(tmp_path):
+    archive_path = tmp_path / "archive"
+    archive_path.mkdir()
+    submissions = [
+        {
+            "source": {
+                "source_row_number": 2,
+                "completion_time": "2026-07-01T10:00:00Z",
+            },
+            "court_slug": "duplicate-court",
+            "status": "needs_human_review",
+                "issues": [
+                    {
+                        "field": "court_slug",
+                        "code": "DUPLICATE_COURT_SLUG",
+                    "severity": "warning",
+                    "message": "duplicate",
+                }
+            ],
+        },
+        {
+            "source": {
+                "source_row_number": 3,
+                "completion_time": "2026-07-02T10:00:00Z",
+            },
+            "court_slug": "duplicate-court",
+            "status": "needs_human_review",
+                "issues": [
+                    {
+                        "field": "court_slug",
+                        "code": "DUPLICATE_COURT_SLUG",
+                    "severity": "warning",
+                    "message": "duplicate",
+                }
+            ],
+        },
+    ]
+    (archive_path / "submissions_cleaned.json").write_text(json.dumps(submissions))
+
+    operational = _operational_submissions({"path": archive_path})
+
+    assert operational[0]["selection_status"] == "superseded"
+    assert operational[0]["superseded_by_source_row_number"] == 3
+    assert operational[0]["status"] == "skipped"
+    assert operational[1]["selection_status"] == "authoritative"
+    assert operational[1]["issues"] == []
+    assert operational[1]["status"] == "processed"
+    assert _status_from_visible_issues([{"severity": "error"}]) == "failed"
+    assert _status_from_visible_issues([{"code": "LLM_LOW_CONFIDENCE"}]) == "needs_human_review"
+    assert _status_from_visible_issues([{"severity": "warning"}]) == "processed_with_warnings"
+
+    (archive_path / "submissions_cleaned.json").write_text(json.dumps({"not": "a list"}))
+    assert _operational_submissions({"path": archive_path}) == []
+
+
+def test_workflow_and_review_overview_count_all_hold_types(tmp_path):
+    archive_path = tmp_path / "archive"
+    archive_path.mkdir()
+    (archive_path / "submissions_cleaned.json").write_text(
+        json.dumps(
+            [
+                {
+                    "source": {"source_row_number": 2},
+                    "court_slug": "example-court",
+                    "status": "needs_human_review",
+                    "issues": [
+                        {
+                            "field": "contacts[1].email",
+                            "code": "LLM_LOW_CONFIDENCE",
+                            "severity": "warning",
+                            "message": "review",
+                        },
+                        {
+                            "field": "contacts[1].phone",
+                            "code": "INFORMATION_ONLY",
+                            "severity": "info",
+                            "message": "ignore",
+                        },
+                    ],
+                }
+            ]
+        )
+    )
+    archive = {"path": archive_path, "manifest": {"run_id": "run-1"}}
+    changes = [
+        {
+            "change_id": "source",
+            "source_row_number": 2,
+            "source_selection_required": True,
+            "selected_source_row_number": None,
+            "comparison": None,
+            "action": {"readiness": "pending", "reason": "invalid request"},
+            "execution_status": "blocked",
+        },
+        {
+            "change_id": "replacement",
+            "source_row_number": None,
+            "comparison": {
+                "has_existing_data": True,
+                "is_no_change": False,
+                "merge_conflicts": ["ambiguous type"],
+            },
+            "target_approved": False,
+            "action": {
+                "readiness": "pending",
+                "reason": "Address verification requires review",
+            },
+            "execution_status": "unknown",
+        },
+    ]
+
+    class ReviewService:
+        def get_llm_actions_review(self, run_id):
+            return {
+                "item_count": 1,
+                "approval_counts": {"pending": 1},
+                "items": [
+                    {
+                        "review_id": "llm-1",
+                        "source_row_number": 2,
+                        "approval_status": "pending",
+                        "actionable": True,
+                    }
+                ],
+            }
+
+        def get_api_changes_review(self, run_id):
+            return {"changes": changes}
+
+        def get_execution_summary(self, run_id):
+            return {
+                "selected_court_count": 1,
+                "court_status_counts": {"pending": 1},
+                "action_status_counts": {"blocked": 1},
+            }
+
+    service = ReviewService()
+    overview = _review_overview(archive, service)
+    workflow = _workflow_payload("run-1", service)
+
+    assert overview["needs_review_rows"] == 1
+    assert {item["code"] for item in overview["hold_categories"]} >= {
+        "llm_approval",
+        "source_selection",
+        "target_not_checked",
+        "target_replacement",
+        "invalid_request",
+        "os_resolution",
+        "execution_attention",
+    }
+    assert workflow["first_incomplete"] == "llm"
+    assert workflow["merge_conflicts"] == 1
 
 
 def test_local_job_runner_restores_interrupted_job_and_server_refuses_network_bind(tmp_path):
@@ -1027,6 +1362,15 @@ class _FakeExecutionClient:
 class _ExistingTargetExecutionClient(_FakeExecutionClient):
     def get(self, path):
         return ApiResponse(200, {"parking": False})
+
+
+class _FakeExecutionClientWithLookupError(_FakeExecutionClient):
+    def __init__(self, lookup_error):
+        super().__init__()
+        self.lookup_error = lookup_error
+
+    def lookup_court(self, slug):
+        raise self.lookup_error
 
 
 def _wait_for_execution_job(app):

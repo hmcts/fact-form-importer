@@ -34,7 +34,7 @@ _COURT_STATUSES = (
     "completed",
 )
 _ATTENTION_ACTION_STATUSES = {"blocked", "failed", "unknown"}
-EXECUTION_SUMMARY_VERSION = "1.6"
+EXECUTION_SUMMARY_VERSION = "1.7"
 _COURT_UUID_IN_PATH = re.compile(
     r"(?<=/courts/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/)",
     re.IGNORECASE,

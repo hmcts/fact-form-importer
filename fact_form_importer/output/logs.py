@@ -45,6 +45,7 @@ def write_processing_outputs(
     vocabularies: Vocabularies | None = None,
     court_lookup: Callable[[str], CourtReference | None] | None = None,
     address_verification_metrics: dict[str, Any] | None = None,
+    submission_selection_metrics: dict[str, Any] | None = None,
 ) -> OutputResult:
     output_path.mkdir(parents=True, exist_ok=True)
     current_run_id = run_id or _new_run_id()
@@ -70,6 +71,7 @@ def write_processing_outputs(
         api_manifest_metrics=api_manifest_metrics,
         address_verification_metrics=address_verification_metrics,
         source_name=source_name,
+        submission_selection_metrics=submission_selection_metrics,
     )
 
     _write_json(output_path / "fact_import_payload.json", fact_import_payload)
@@ -108,6 +110,7 @@ def build_import_summary(
     api_manifest_metrics: dict[str, int] | None = None,
     source_name: str | None = None,
     address_verification_metrics: dict[str, Any] | None = None,
+    submission_selection_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status_counts = Counter(submission.status for submission in submissions)
     issue_counts = Counter(
@@ -190,6 +193,26 @@ def build_import_summary(
         summary.update(api_manifest_metrics)
     if address_verification_metrics:
         summary.update(address_verification_metrics)
+    if submission_selection_metrics:
+        summary.update(
+            {
+                key: submission_selection_metrics[key]
+                for key in (
+                    "source_submission_count",
+                    "authoritative_submission_count",
+                    "duplicate_court_count",
+                    "superseded_submission_count",
+                    "duplicate_source_row_count",
+                )
+                if key in submission_selection_metrics
+            }
+        )
+        summary["duplicate_slug_group_count"] = int(
+            submission_selection_metrics.get("duplicate_court_count", 0)
+        )
+        summary["duplicate_slug_affected_record_count"] = int(
+            submission_selection_metrics.get("duplicate_source_row_count", 0)
+        )
     return summary
 
 

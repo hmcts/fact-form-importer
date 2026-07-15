@@ -491,6 +491,7 @@ out/issue_report.json
 out/import_summary.json
 out/api_readiness_report.json
 out/address_verification_report.json
+out/submission_selection.json
 out/run_manifest.json
 out/llm_request_review.json
 out/nsu_cleaned_review.xlsx
@@ -499,9 +500,16 @@ out/read_only_approval_users.json
 out/read_only_approval_users.xlsx
 ```
 
-`submissions_cleaned.json` contains every final validated submission, including
-its final status and issues. It is the all-record source used by the local
-review UI; `submissions_raw.json` remains the unmodified row extraction.
+`submissions_cleaned.json` contains every submitted row. The latest completed
+row for each cleaned court slug is authoritative; older duplicates are retained
+with `selection_status=superseded`, a link to the selected row, and operational
+status `skipped`. `submission_selection.json` is the immutable, versioned
+evidence for that decision. Only authoritative rows proceed through validation,
+OS/LLM work, approvals, API planning and execution.
+Court identity is first canonicalised through FaCT so aliases such as a singular
+court name or dotted slug cannot evade duplicate grouping. Preliminary issues
+from that identity pass are discarded; operational validation still runs only
+for the selected latest rows.
 
 `fact_import_payload.json` is a versioned, API-aligned JSON snapshot for
 inspection and possible future bulk-import work. It is not used by the current
@@ -522,14 +530,15 @@ does not call FaCT. Do not use an offline-fallback payload as controller input.
 
 `api_readiness_report.json` is the immutable, endpoint-shaped action plan for
 the reviewed run. It is not a new FaCT controller payload and it does not
-create courts. Manifest version 1.7 plans complete, valid sections independently,
+create courts. Manifest version 1.9 plans complete, valid sections independently,
 so an unrelated source issue does not hide a safe proposal. Address, contact,
 and opening-hours entries are grouped into one logical section action. Duplicate
-court rows retain provisional actions for every candidate row until a reviewer
-selects one authoritative source. Before each write, execution re-resolves the
-court by slug, validates the full proposal and compares it with the live target.
-A populated target can be replaced only after every contained value is approved
-and the exact current-versus-proposed section diff is separately approved.
+court rows use the latest completion time, then last-modified/start time and
+finally the highest source row. Before each write, execution compares the
+submitted proposal with the live target. Submitted values overwrite matching
+live values; blanks preserve live data unless an approved explicit clear exists.
+Collection entries match by business type. Unmatched live entries are
+preserved, new types are added, and ambiguous duplicate types are held.
 
 For professional information, the form supplies only interview-room values.
 The approved migration policy sets `videoHearings`, `commonPlatform`, and
@@ -540,15 +549,14 @@ and review UI.
 
 ### API-required values not collected by the form
 
-The importer does **not** invent text, telephone numbers, times, or a missing
-controlling Yes/No answer merely to satisfy a FaCT API constraint. In
-particular, when a court has no lift, FaCT currently requires
-`liftSupportPhoneNumber`, but the Microsoft Form has no lift-specific
-support-number question. That field is a validated public telephone number, not
-free text: values such as `unknown`, `N/A`, or a numeric placeholder would
-either be rejected or displayed to court users as a misleading phone number.
-The action therefore remains pending. The same rule applies to a missing
-accessible-entrance support number.
+The importer does not change a submitted accessibility Yes/No answer merely to
+satisfy the API. A supplied accessible-entrance support number is used. When
+the unchanged FaCT API requires an accessible-entrance or lift-support number,
+the form and live FaCT section are checked first. A real live number is
+preserved when the form is blank. If neither source has a number, the reviewed
+effective request uses the product-approved request-only placeholder
+`00000000000`. This never changes raw or cleaned evidence and is displayed in
+the action's migration assumptions and live comparison before approval.
 
 There is one narrow, reviewed numeric-default policy for dependent fields where
 the controlling Yes/No answer is present and FaCT requires a numeric value:
@@ -572,12 +580,6 @@ They are never used for an explicit zero, an unrecognised or ambiguous value,
 or a missing parent Yes/No answer; those actions remain pending. The data is
 then reviewed through the existing approval feature in `fact-admin-frontend`.
 
-The public FaCT frontend already has a safe no-number fallback for a court with
-no lift. To unblock these actions without inventing data, either provide a
-verified court-specific support number through a reviewed override, or relax
-the existing FaCT API conditional validation to permit a null value. Neither
-option requires a new API endpoint.
-
 The action report is generated against the FaCT API contract in use at the
 time of the run. Before a write, the execution layer validates the body again
 with the freshly resolved court UUID. This protects older archives from being
@@ -600,11 +602,13 @@ Execution state is written separately to
 `out/execution-state/<run-id>.json`, never back into the archived action plan.
 It records local preflight and write outcomes only; it is not a replacement for
 the existing review and approval workflow in `fact-admin-frontend`. Every write
-still repeats the live target comparison. Replacement approval is bound to
-canonical hashes of both snapshots; a changed live target or proposal returns
-the action to review. Collection writes update/create first and delete surplus
-entries last. A failed or unknown update/create stops before deletion, re-reads
-FaCT and records the partial state for attention.
+still repeats the live target comparison. Existing-data change approval is
+bound to canonical hashes of the live before state and effective merged after
+state; a changed target or proposal returns the action to review. Singletons
+are overlaid field by field. Collections update matching typed entries and
+create new types while preserving every unmatched live entry. No surplus
+DELETE operations are generated. A failed or unknown multi-operation update
+re-reads FaCT and records the partial state for attention.
 Action status is one of `planned`, `awaiting_approval`, `ready`, `blocked`,
 `running`, `succeeded`, `failed`, or `unknown`. A court is `completed` only
 once every planned action has succeeded. `blocked` means no write was attempted for that action because
@@ -654,19 +658,27 @@ PO Box addresses are allowed and have no separate manual-only dependency. They
 follow the same OS lookup, LLM confidence, approval-policy, and execution rules
 as every other address.
 
-Verification for this workflow: 332 unit tests pass, Ruff is clean, global
-coverage is 90.22%, and every configured 95% core coverage gate passes.
+Verification for this workflow: 347 unit tests pass, Ruff is clean, exact global
+coverage is 90.26%, and every configured 95% core coverage gate passes
+(API manifest 95.12% and web 96.63%).
+
+The latest full OS/LLM run is `20260715T120042Z-979a4cb6`: 423 source rows,
+369 authoritative rows, 54 superseded rows across 50 duplicate courts, 97
+operational review rows, and no duplicate-slug issues on authoritative rows.
+Compared with the original `20260714T171215Z-f001d1e3` archive, the Records
+review queue fell from 188 rows to 97 and LLM calls fell from 422 to 368.
 
 Each check or write also creates
 `out/execution-state/<run-id>.summary.json` and refreshes the latest
 `out/execution_summary.json`. These mutable reports contain per-court action
 outcomes, an explicit list of actions needing attention, and grouped error
-themes such as pending target replacement, address verification, missing
+themes such as pending existing-data approval, address verification, missing
 accessibility details, inconsistent interview-room data, opening-hours
 constraints, API validation, and authentication failures. They intentionally
 contain no action bodies or raw form data. The `attention_by_request_type`
 section is the product-decision report: it distinguishes
-`target_replacement`, `address_review`, `missing_or_invalid_form_data`,
+`target_replacement` (the compatibility code for existing-data approval),
+`address_review`, `missing_or_invalid_form_data`,
 `invalid_form_data`, `api_rejection`, and `execution_uncertain` outcomes.
 `blocked` means the importer did not attempt a write. `failed` means a request
 was sent and FaCT rejected it. A dependent numeric field reported as required
@@ -685,10 +697,10 @@ unknown outcome without changing the generated run evidence or its integrity
 hashes. Other mutable, versioned sidecars are:
 
 - `out/llm-approval-state/<run-id>.json` for manual/policy value approvals
-- `out/execution-review-state/<run-id>.json` for duplicate source selection,
-  live comparisons and hash-bound replacement approvals
+- `out/execution-review-state/<run-id>.json` for live submitted/effective
+  comparisons and hash-bound existing-data change approvals
 - `out/execution-review-state/<run-id>.plan.json` for a derived current-run
-  section-plan overlay when the immutable archive predates manifest 1.7
+  section-plan overlay when the immutable archive predates the current manifest
 - `out/.execution-jobs/<job-id>.json` for queued, running, completed, failed or
   interrupted comparison/execution jobs
 
@@ -699,14 +711,11 @@ hashes.
 `failed_records.json` contains records that cannot progress because required
 data is missing or schema-critical validation failed.
 
-`duplicate_forms_review.xlsx` is the dedicated decision workbook for duplicate
-court-slug forms. It keeps every competing form together under a duplicate
-group, with one row per form and the relevant Microsoft Forms completion,
-last-modified, and start timestamps. It identifies a date-based candidate using
-completion time, falling back to last-modified then start time only when an
-earlier value is blank. This is a review aid, not an automatic import choice:
-the `Decision log` tab is where NSU/product can record whether to keep a row,
-merge values, or not import the group.
+`duplicate_forms_review.xlsx` keeps every competing form together for audit.
+The importer automatically selects the latest completed form, falling back to
+last-modified, start time and then the highest source row. The workbook and
+`submission_selection.json` show the authoritative and superseded rows; older
+rows are not review blockers and cannot produce API actions.
 
 The `Duplicate form data` tab is self-contained: it has one row for each
 competing form, with the duplicate group, source row number, timestamps, the
@@ -716,8 +725,8 @@ contacts, and court opening hours. It is the primary tab for deciding between
 duplicates and does not require `nsu_cleaned_review.xlsx`; the latter can still
 be used for a wider review of validation issues if useful.
 
-`records_needing_human_review.json` contains records blocked from automatic
-import by issues such as duplicate court slugs, invalid populated postcodes,
+`records_needing_human_review.json` contains authoritative records blocked from
+automatic import by issues such as invalid populated postcodes,
 ambiguous opening hours, or controlled-list mismatches.
 
 `issue_report.json` is a flat issue list with source row numbers and court
@@ -747,19 +756,16 @@ medium/low-confidence and changed results remain manual or read-only. Exact
 unchanged high-confidence fields use a separate policy, including when another
 blocker means no API action currently depends on the result.
 Automatic approval never executes a FaCT request, and address execution still
-performs the fresh-UPRN, target-section and snapshot-bound replacement preflights. In a
+performs the fresh-UPRN, target-section and snapshot-bound effective-change preflights. In a
 normal run, `vocabulary_source` should be
 `fact_data_api`. The CLI prints duplicate and LLM metrics at the end of each
-run. Duplicate groups remain in the human-review count and are excluded from
-`fact_import_payload.json`, but the execution overlay creates provisional
-section proposals. A reviewer must explicitly choose the authoritative row;
-changing it invalidates target-diff approvals, and it cannot be changed after
-any section for that court succeeds. The importer never chooses a winner.
+run. The summary separately records source submission, authoritative
+submission and superseded duplicate counts. Superseded rows remain in immutable
+audit evidence but do not contribute to operational review or execution.
 
-The status counts are counts of submitted form rows and always add up to
-`submission_count`. `unique_court_slug_count` is reported separately because a
-single court can have multiple submitted forms while duplicate handling remains
-awaiting an NSU decision.
+Operational status counts cover authoritative submissions. Source and
+superseded counts are reported separately so the original workbook row total
+remains auditable.
 
 `llm_review_submission_count` counts rows with an LLM-specific issue that
 contributes to `needs_human_review`. Address verification is deliberately
@@ -779,9 +785,9 @@ failures, `review_reason` identifies the specific field and submitted value that
 did not match, while the `Issues` tab provides one row per issue with raw and
 cleaned values. The `Duplicate courts` tab includes the duplicate source rows,
 completion/start/last-modified dates, submitter names and emails, and a
-`candidate_most_recent_row` based on the available form timestamps. This is
-review evidence for NSU/product decisions; the importer still does not
-automatically migrate only the latest duplicate until that rule is confirmed.
+`candidate_most_recent_row` based on the available form timestamps. That row is
+now the authoritative submission used operationally; the other rows remain
+visible only as immutable audit evidence.
 
 ### 7. Review archived runs locally
 
@@ -792,16 +798,26 @@ python3 -m fact_form_importer serve --output "./out"
 ```
 
 The landing page lists every valid `out/final/<run_id>/run_manifest.json` from
-newest to oldest. Select a run to inspect its summary, records, raw submitted
-values, cleaned values, issues, duplicate status and API readiness report. A
-record with an action plan has a FaCT API execution table showing the request
-body, relevant cleaned values, mapped raw source values, preflight outcome and
-current execution state. The record page can check target sections, inspect
+newest to oldest. Each run has a primary `/workflow` page with three guided,
+non-locking steps: review LLM/address values, refresh and approve FaCT changes,
+then review and execute courts. `/courts` lists one authoritative row per court
+and links to `/courts/<court_slug>`, the canonical per-court comparison and
+execution page. Source record pages remain available for audit, including a
+plain superseded-row explanation. The Records view is also the complete
+source-review checklist: every issue has a plain-English explanation and is
+labelled as a Step 1 decision, a source-workbook correction requiring a fresh
+run, an already-handled decision, or an information-only note. Where a row has
+planned section actions it shows the count and links directly to the canonical
+court workspace; where no action is possible it says so explicitly. Internal
+issue codes remain available only inside expandable technical evidence. The
+court page shows request bodies, relevant
+cleaned values, mapped raw values, preflight outcomes and current execution
+state. The court page can check target sections, inspect
 request-only migration assumptions, and run one action or all safe actions for
 that court. The run page also offers run-level execution. Write buttons appear only when
 `FACT_DATA_API_WRITES_ENABLED=true`; server-side checks enforce the same rule.
 The run-level write control prompts for confirmation and uses the same
-value-approval and snapshot-bound replacement gates as the record controls.
+value-approval and snapshot-bound effective-change gates as the court controls.
 Action-, court-, run-, and comparison scans share one persistent background
 queue. While a job is active every execution control is disabled; the execution
 summary polls safe JSON progress, refreshes action/court outcomes, and becomes
@@ -816,8 +832,15 @@ approvals, and provides one approval button per pending actionable result. Use
 read-only explanation of why rows need review. The per-run Review overview
 separates overlapping form-row blocker counts from API hold work items and links
 to category queues. LLM rows show highlighted submitted-versus-proposed text;
-addresses mark line one as a weaker matching signal; API changes show the live
-complete before/after section, component differences and resulting operations.
+addresses mark line one as a weaker matching signal; API changes show current
+live data, the submitted proposal, the effective merged result, preserved
+values, component differences and resulting POST/PUT operations.
+The FaCT-change page labels the full action count as planned sections awaiting
+one read-only scan, not as an approval count. Its summary distinguishes
+unchecked, unchanged, empty-target, approval-required, approved and ambiguous
+sections. Previous/next controls retain the active hold filter and individual
+checks/approvals retain the current page. FaCT 401/403 responses are shown as
+actionable authentication errors instead of internal server errors.
 Policy-approved addresses do not contribute to “LLM approvals pending”. LLM factors are model-specific
 causes of human review; OS factors hold only the affected address action. Each
 run has a single ZIP download containing

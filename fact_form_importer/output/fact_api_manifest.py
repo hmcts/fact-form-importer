@@ -26,10 +26,11 @@ from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "1.8"
+API_MANIFEST_VERSION = "1.9"
 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
+MISSING_SUPPORT_PHONE_PLACEHOLDER = "00000000000"
 _REVIEW_REQUIRED_MIGRATION_DEFAULT_PREFIX = "Review-required migration default:"
 
 # These expressions deliberately mirror the public FaCT Data API request
@@ -71,6 +72,7 @@ class FactApiAction(BaseModel):
     source_selection_required: bool = False
     section_id: Optional[str] = None
     proposed_items: list[dict[str, Any]] = Field(default_factory=list)
+    proposed_item_clear_fields: list[list[str]] = Field(default_factory=list)
     address_verifications: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -246,6 +248,9 @@ def _build_record(
                     f"{submission.court_slug}:{resource}:{submission.source.source_row_number}"
                 ),
                 proposed_items=[body],
+                proposed_item_clear_fields=[
+                    _explicit_clear_fields(resource, llm_review_items, source_fields or [])
+                ],
                 address_verifications=[address_verification] if address_verification else [],
             )
         )
@@ -393,6 +398,9 @@ def _group_collection_actions(actions: list[FactApiAction]) -> list[FactApiActio
             grouped.append(action)
             continue
         existing.proposed_items.extend(action.proposed_items or [action.body])
+        existing.proposed_item_clear_fields.extend(
+            action.proposed_item_clear_fields or [[]]
+        )
         existing.source_fields = sorted(set(existing.source_fields + action.source_fields))
         existing.llm_review_ids = sorted(set(existing.llm_review_ids + action.llm_review_ids))
         existing.address_verifications.extend(action.address_verifications)
@@ -405,7 +413,7 @@ def _group_collection_actions(actions: list[FactApiAction]) -> list[FactApiActio
 
 
 def _merge_duplicate_records(records: list[FactApiRecord]) -> list[FactApiRecord]:
-    """Keep duplicate submissions reviewable while requiring one source owner."""
+    """Defensively retain only the latest row if a caller supplies duplicates."""
 
     grouped: dict[str, list[FactApiRecord]] = {}
     order: list[str] = []
@@ -421,24 +429,31 @@ def _merge_duplicate_records(records: list[FactApiRecord]) -> list[FactApiRecord
         if len(candidates) == 1:
             merged.append(candidates[0])
             continue
-        rows = sorted(row for candidate in candidates for row in candidate.source_row_numbers)
-        actions: list[FactApiAction] = []
-        for candidate in candidates:
-            for action in candidate.actions:
-                action.source_selection_required = True
-                action.action_id = f"{slug}-row-{action.source_row_number}-{action.resource}"
-                actions.append(action)
         merged.append(
-            FactApiRecord(
-                court_slug=slug,
-                court_id=next((candidate.court_id for candidate in candidates if candidate.court_id), None),
-                source_row_numbers=rows,
-                status="needs_human_review",
-                readiness=_record_readiness(actions),
-                actions=actions,
+            max(
+                candidates,
+                key=lambda candidate: max(candidate.source_row_numbers or [0]),
             )
         )
     return merged
+
+
+def _explicit_clear_fields(
+    resource: str,
+    review_items: list[dict[str, Any]],
+    source_fields: list[str],
+) -> list[str]:
+    if resource != "contact_detail":
+        return []
+    if any(
+        item.get("outcome") == "accepted"
+        and item.get("operation") == "clear"
+        and item.get("field") in source_fields
+        and str(item.get("field") or "").endswith(".explanation")
+        for item in review_items
+    ):
+        return ["explanation"]
+    return []
 
 
 def _building_facilities_body(facilities: dict[str, Any]) -> dict[str, Any]:
@@ -506,18 +521,34 @@ def _accessibility_options_body(facilities: dict[str, Any]) -> dict[str, Any]:
 
 
 def _accessibility_options_assumptions(facilities: dict[str, Any]) -> list[str]:
-    """Describe approved request-only defaults for incomplete lift measurements."""
-
-    if facilities.get("lift_available") is not True:
-        return []
+    """Describe approved request-only defaults for incomplete accessibility data."""
 
     assumptions = []
-    if _is_missing_form_value(facilities.get("lift_door_width")):
+    if (
+        facilities.get("accessible_entrance") is False
+        and _is_missing_form_value(facilities.get("accessible_entrance_support_phone"))
+    ):
+        assumptions.append(
+            "Migration policy: accessible entrance is marked unavailable and the source has no "
+            "support phone. If live FaCT has no number to preserve, the effective request uses "
+            f"{MISSING_SUPPORT_PHONE_PLACEHOLDER}. It does not amend the source or cleaned data."
+        )
+    if facilities.get("lift_available") is False:
+        assumptions.append(
+            "Migration policy: lift is marked unavailable and the form has no lift-support phone "
+            "field. If live FaCT has no number to preserve, the effective request uses "
+            f"{MISSING_SUPPORT_PHONE_PLACEHOLDER}. It does not amend the source or cleaned data."
+        )
+    if facilities.get("lift_available") is True and _is_missing_form_value(
+        facilities.get("lift_door_width")
+    ):
         assumptions.append(
             "Review-required migration default: lift is marked available but the source has no "
             "door width, so this FaCT request uses 1 cm. It does not amend the source or cleaned data."
         )
-    if _is_missing_form_value(facilities.get("lift_weight_limit")):
+    if facilities.get("lift_available") is True and _is_missing_form_value(
+        facilities.get("lift_weight_limit")
+    ):
         assumptions.append(
             "Review-required migration default: lift is marked available but the source has no "
             "weight limit, so this FaCT request uses 1 kg. It does not amend the source or cleaned data."
@@ -814,21 +845,10 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
                 not isinstance(phone, str) or not _FACT_API_PHONE_PATTERN.fullmatch(phone)
             ):
                 errors.append(f"{field} does not match the FaCT API phone format")
-        if body.get("accessibleEntrance") is False and not body.get(
-            "accessibleEntrancePhoneNumber"
-        ):
-            errors.append(
-                "accessibleEntrancePhoneNumber is required by the FaCT API when accessibleEntrance is false"
-            )
         if body.get("lift") is True:
             for field in ("liftDoorWidth", "liftDoorLimit"):
                 if body.get(field) is None:
                     errors.append(f"{field} is required by the FaCT API when lift is true")
-        if body.get("lift") is False and not body.get("liftSupportPhoneNumber"):
-            errors.append(
-                "liftSupportPhoneNumber is required by the FaCT API when lift is false; "
-                "the form does not collect this value"
-            )
 
     if resource == "address":
         errors.extend(_address_validation_errors(body))

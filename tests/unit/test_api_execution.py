@@ -67,7 +67,7 @@ def test_check_court_requires_approval_for_an_existing_target_section(tmp_path, 
 
     action = ledger.courts["example-court"].actions["example-court-1"]
     assert action.status == "awaiting_approval"
-    assert "replacement requires approval" in action.reason
+    assert "effective after values" in action.reason
     assert ledger.courts["example-court"].status == "awaiting_approval"
     assert client.writes == []
 
@@ -106,7 +106,7 @@ def test_exact_target_replacement_approval_is_separate_and_hash_bound(tmp_path, 
     assert changed_client.writes == []
 
 
-def test_collection_replacement_updates_and_creates_before_surplus_deletion(
+def test_collection_merge_updates_and_creates_without_deleting_unmatched_entries(
     tmp_path, monkeypatch
 ):
     contact_type = "00000000-0000-0000-0000-000000000001"
@@ -161,8 +161,8 @@ def test_collection_replacement_updates_and_creates_before_surplus_deletion(
     assert completed.courts["example-court"].actions[
         "example-contact-section"
     ].status == "succeeded"
-    assert [method for method, _, _ in client.writes] == ["PUT", "POST", "DELETE"]
-    assert client.writes[-1][1].endswith("/surplus-contact")
+    assert [method for method, _, _ in client.writes] == ["PUT", "POST"]
+    assert all(not path.endswith("/surplus-contact") for _, path, _ in client.writes)
 
 
 def test_partial_collection_failure_stops_deletion_and_refreshes_live_state(
@@ -276,6 +276,19 @@ def test_refresh_all_comparisons_skips_unselected_duplicates_and_reports_failure
     )
     with pytest.raises(ValueError, match="1 court error"):
         failing.refresh_all_target_comparisons(failing_run)
+
+    request = httpx.Request("GET", "http://fact.test/courts/slug/example-court/v1")
+    response = httpx.Response(401, request=request)
+    authentication_error = httpx.HTTPStatusError(
+        "Client error '401 Unauthorized'", request=request, response=response
+    )
+    authentication = ApiExecutionService(
+        failing_root / "out",
+        AppConfig(),
+        FakeFactApiClient(lookup_error=authentication_error),
+    )
+    with pytest.raises(ValueError, match="Refresh FACT_DATA_API_BEARER_TOKEN"):
+        authentication.refresh_all_target_comparisons(failing_run)
 
 
 def test_preflight_blocks_changed_court_uuid_and_marks_unexpected_target_unknown(tmp_path):
@@ -1291,6 +1304,38 @@ def test_get_execution_summary_rebuilds_an_old_cached_report(tmp_path):
     assert summary["summary_version"] == EXECUTION_SUMMARY_VERSION
     assert summary["planned_action_count"] == 1
     assert service.store.load_summary(run_id) == summary
+
+
+def test_existing_legacy_plan_overlay_remains_active_after_a_newer_run(tmp_path):
+    run_id = _archive(tmp_path)
+    output_root = tmp_path / "out"
+    archive = output_root / "final" / run_id
+    report_path = archive / "api_readiness_report.json"
+    report = json.loads(report_path.read_text())
+    report["manifest_version"] = "1.8"
+    report_path.write_text(json.dumps(report))
+    (archive / "submissions_cleaned.json").write_text("[]")
+    overlay = {
+        "manifest_version": "1.9",
+        "run_id": run_id,
+        "derived_execution_overlay": True,
+        "records": [
+            {
+                "court_slug": "overlay-court",
+                "source_row_numbers": [9],
+                "actions": [_action("overlay-action")],
+            }
+        ],
+    }
+    overlay_directory = output_root / "execution-review-state"
+    overlay_directory.mkdir(parents=True, exist_ok=True)
+    (overlay_directory / f"{run_id}.plan.json").write_text(json.dumps(overlay))
+    (output_root / "latest_run.json").write_text(json.dumps({"run_id": "newer-run"}))
+
+    readiness = ApiExecutionService(output_root).get_readiness_report(run_id)
+
+    assert readiness["derived_execution_overlay"] is True
+    assert readiness["records"][0]["court_slug"] == "overlay-court"
 
 
 def _archive(tmp_path, actions=None, records=None):

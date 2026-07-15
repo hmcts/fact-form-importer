@@ -2,6 +2,8 @@
 {% block content %}
 <h1>API execution summary: {{ archive.manifest.run_id }}</h1>
 <nav>
+  <a href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}">Review workflow</a>
+  <a href="{{ url_for('courts', run_id=archive.manifest.run_id) }}">Courts and actions</a>
   <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
   <a href="{{ url_for('execution_summary_json', run_id=archive.manifest.run_id) }}">Download JSON</a>
   <a href="#request-types">By request type</a>
@@ -21,7 +23,7 @@
 </form>
 {% endif %}
 <div class="summary">
-  {% for label, value in [('Courts considered', execution_summary.selected_court_count), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('Unchanged fields auto-approved', execution_summary.llm_approval_counts.auto_approved_unchanged_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Target replacements pending', execution_summary.replacement_approval_counts.pending), ('Duplicate courts needing source selection', execution_summary.duplicate_source_selection_counts.pending_courts), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  {% for label, value in [('Courts considered', execution_summary.selected_court_count), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('Unchanged fields auto-approved', execution_summary.llm_approval_counts.auto_approved_unchanged_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Existing-data approvals pending', execution_summary.replacement_approval_counts.pending), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>

@@ -205,15 +205,19 @@ def run(
     print(f"Run ID: {result.run_id}")
     print(f"Source file: {input_path}")
     print(f"Workbook rows: {summary['row_count']}")
-    print(f"Validated submissions: {summary['submission_count']}")
+    print(
+        "Authoritative submissions: "
+        f"{summary.get('authoritative_submission_count', summary['submission_count'])}"
+    )
     print(f"Processed: {summary['processed_count']}")
     print(f"Processed with warnings: {summary['processed_with_warnings_count']}")
     print(f"Needs human review: {summary['needs_human_review_count']}")
     print(f"Failed: {summary['failed_count']}")
     print(f"Duplicate court groups: {summary['duplicate_slug_group_count']}")
     print(
-        "Duplicate affected records "
-        f"(included in needs human review): {summary['duplicate_slug_affected_record_count']}"
+        "Superseded duplicate submissions: "
+        f"{summary.get('superseded_submission_count', 0)} "
+        f"of {summary['duplicate_slug_affected_record_count']} duplicate source rows"
     )
     print(f"Skipped empty rows: {summary['skipped_count']}")
     print(f"Read-only approval users: {result.submitters.user_count}")

@@ -5,12 +5,11 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from openpyxl.utils.datetime import from_excel
 
 from fact_form_importer.models.court_submission import CourtSubmission
-from fact_form_importer.validators.base import DUPLICATE_COURT_SLUG
 
 
 DATE_FIELDS = (
@@ -18,6 +17,8 @@ DATE_FIELDS = (
     ("last_modified_time", "Last modified time"),
     ("start_time", "Start time"),
 )
+SUBMISSION_SELECTION_VERSION = "1.0"
+LATEST_SUBMISSION_POLICY_VERSION = "latest-completed-submission-v1"
 
 
 @dataclass(frozen=True)
@@ -34,13 +35,13 @@ class DuplicateTimestamp:
 def group_duplicate_submissions(
     submissions: Iterable[CourtSubmission],
 ) -> dict[str, list[CourtSubmission]]:
-    """Group only records explicitly flagged as duplicate court submissions."""
+    """Group repeated cleaned court slugs independently of validation issues."""
 
     groups: dict[str, list[CourtSubmission]] = defaultdict(list)
     for submission in submissions:
-        if any(issue.code == DUPLICATE_COURT_SLUG for issue in submission.issues):
+        if submission.court_slug:
             groups[submission.court_slug or "(no cleaned court slug)"].append(submission)
-    return dict(groups)
+    return {slug: rows for slug, rows in groups.items() if len(rows) > 1}
 
 
 def duplicate_timestamp(submission: CourtSubmission) -> DuplicateTimestamp | None:
@@ -63,18 +64,103 @@ def duplicate_timestamp(submission: CourtSubmission) -> DuplicateTimestamp | Non
 def most_recent_duplicate_submission(
     submissions: Iterable[CourtSubmission],
 ) -> CourtSubmission | None:
-    """Return a date-based candidate only; it never makes an import decision."""
+    """Return the latest submission, using the source row as a safe final fallback."""
 
-    dated = [submission for submission in submissions if duplicate_timestamp(submission)]
-    if not dated:
+    candidates = list(submissions)
+    if not candidates:
         return None
     return max(
-        dated,
+        candidates,
         key=lambda submission: (
-            duplicate_timestamp(submission).sort_key,  # type: ignore[union-attr]
+            duplicate_timestamp(submission).sort_key
+            if duplicate_timestamp(submission)
+            else (0, 0.0, ""),
             submission.source.source_row_number,
         ),
     )
+
+
+def select_authoritative_submissions(
+    submissions: Iterable[CourtSubmission],
+) -> tuple[list[CourtSubmission], dict[str, Any]]:
+    """Apply the immutable latest-form policy and mark older duplicate rows skipped."""
+
+    all_submissions = list(submissions)
+    groups = group_duplicate_submissions(all_submissions)
+    selected_by_slug = {
+        slug: most_recent_duplicate_submission(rows) for slug, rows in groups.items()
+    }
+    evidence_groups: list[dict[str, Any]] = []
+    superseded_rows: list[int] = []
+    for slug, rows in sorted(groups.items()):
+        selected = selected_by_slug[slug]
+        if selected is None:
+            continue
+        selected_row = selected.source.source_row_number
+        selected_timestamp = duplicate_timestamp(selected)
+        superseded: list[dict[str, Any]] = []
+        for submission in sort_duplicate_submissions(rows):
+            row = submission.source.source_row_number
+            timestamp = duplicate_timestamp(submission)
+            if row == selected_row:
+                submission.selection_status = "authoritative"
+                submission.superseded_by_source_row_number = None
+                continue
+            submission.selection_status = "superseded"
+            submission.superseded_by_source_row_number = selected_row
+            submission.status = "skipped"
+            superseded_rows.append(row)
+            superseded.append(_selection_row_evidence(submission, timestamp))
+        evidence_groups.append(
+            {
+                "court_slug": slug,
+                "authoritative_source_row_number": selected_row,
+                "authoritative_timestamp": _timestamp_evidence(selected_timestamp),
+                "superseded": superseded,
+            }
+        )
+
+    authoritative = [
+        submission
+        for submission in all_submissions
+        if submission.selection_status == "authoritative"
+    ]
+    return authoritative, {
+        "selection_version": SUBMISSION_SELECTION_VERSION,
+        "policy_version": LATEST_SUBMISSION_POLICY_VERSION,
+        "source_submission_count": len(all_submissions),
+        "authoritative_submission_count": len(authoritative),
+        "duplicate_court_count": len(evidence_groups),
+        "duplicate_source_row_count": sum(
+            1 + len(group["superseded"]) for group in evidence_groups
+        ),
+        "superseded_submission_count": len(superseded_rows),
+        "authoritative_source_row_numbers": sorted(
+            submission.source.source_row_number for submission in authoritative
+        ),
+        "superseded_source_row_numbers": sorted(superseded_rows),
+        "groups": evidence_groups,
+    }
+
+
+def _selection_row_evidence(
+    submission: CourtSubmission, timestamp: DuplicateTimestamp | None
+) -> dict[str, Any]:
+    return {
+        "source_row_number": submission.source.source_row_number,
+        "timestamp": _timestamp_evidence(timestamp),
+    }
+
+
+def _timestamp_evidence(timestamp: DuplicateTimestamp | None) -> dict[str, str] | None:
+    if timestamp is None:
+        return None
+    return {
+        "source_field": timestamp.source_field,
+        "source_label": timestamp.source_label,
+        "raw_value": timestamp.raw_value,
+        "display_value": timestamp.display_value,
+    }
 
 
 def sort_duplicate_submissions(submissions: Iterable[CourtSubmission]) -> list[CourtSubmission]:

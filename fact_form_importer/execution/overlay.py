@@ -14,6 +14,7 @@ from fact_form_importer.output.fact_api_manifest import (
     API_MANIFEST_VERSION,
     build_fact_api_import_manifest,
 )
+from fact_form_importer.output.duplicate_review import select_authoritative_submissions
 from fact_form_importer.validators.fact_api_courts import CourtReference
 from fact_form_importer.validators.vocabularies import Vocabularies
 
@@ -45,6 +46,7 @@ def derive_latest_execution_overlay(
         return original
     if not submissions:
         return original
+    submissions, submission_selection = select_authoritative_submissions(submissions)
     by_row = {submission.source.source_row_number: submission for submission in submissions}
     vocabularies = _derive_vocabularies(original, by_row)
     court_ids = {
@@ -60,16 +62,23 @@ def derive_latest_execution_overlay(
 
     address_report = _read_json(archive_path / "address_verification_report.json", {})
     llm_report = _read_json(archive_path / "llm_actions_review.json", {})
+    authoritative_rows = set(submission_selection["authoritative_source_row_numbers"])
+    llm_items = [
+        item
+        for item in llm_report.get("items", [])
+        if item.get("source_row_number") in authoritative_rows
+    ]
     result = build_fact_api_import_manifest(
         submissions,
         run_id,
         vocabularies,
         court_lookup=lookup,
         address_verifications=address_verification_batch_from_dict(address_report),
-        llm_review_items=list(llm_report.get("items", [])),
+        llm_review_items=llm_items,
     ).manifest.model_dump(mode="json")
     result["derived_execution_overlay"] = True
     result["source_manifest_version"] = original.get("manifest_version")
+    result["submission_selection"] = submission_selection
     directory.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

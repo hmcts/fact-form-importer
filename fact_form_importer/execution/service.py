@@ -37,7 +37,12 @@ from fact_form_importer.execution.review_state import (
     build_target_comparison,
     target_change_id,
 )
-from fact_form_importer.llm.review import load_or_derive_llm_actions_review
+from fact_form_importer.llm.review import (
+    filter_llm_actions_review,
+    load_or_derive_llm_actions_review,
+)
+from fact_form_importer.models.court_submission import CourtSubmission
+from fact_form_importer.output.duplicate_review import select_authoritative_submissions
 from fact_form_importer.output.archive import load_run_archive
 from fact_form_importer.output.fact_api_manifest import (
     API_MANIFEST_VERSION,
@@ -135,6 +140,12 @@ class ApiExecutionService:
                     run_id, action, court.court_id
                 )
             response = client.get(_preflight_path(str(action["path"])))
+            if response.status_code in {401, 403}:
+                raise ValueError(
+                    f"FaCT API rejected the target section comparison "
+                    f"(HTTP {response.status_code}). Refresh FACT_DATA_API_BEARER_TOKEN "
+                    "and restart the importer UI."
+                )
             if response.status_code not in {200, 204, 404}:
                 raise ValueError(
                     f"Target section comparison returned HTTP {response.status_code}"
@@ -143,6 +154,9 @@ class ApiExecutionService:
             self.review_store.save_comparison(run_id, comparison)
             self._save_execution_summary(run_id)
             return comparison
+        except httpx.HTTPStatusError as exc:
+            _, reason = _preflight_error_details("court lookup", exc)
+            raise ValueError(reason) from exc
         finally:
             if close:
                 client.close()
@@ -163,6 +177,8 @@ class ApiExecutionService:
                         run_id, court_slug, str(action.get("action_id") or "")
                     )
             except (ValueError, httpx.HTTPError) as exc:
+                if "Refresh FACT_DATA_API_BEARER_TOKEN" in str(exc):
+                    raise ValueError(str(exc)) from exc
                 failures.append(f"{court_slug}: {type(exc).__name__}")
         self._save_execution_summary(run_id)
         if failures:
@@ -192,9 +208,15 @@ class ApiExecutionService:
                 approval = review.target_approvals.get(change_id)
                 comparison_payload = comparison.model_dump(mode="json") if comparison else None
                 if comparison_payload is not None:
-                    comparison_payload["differences"] = _component_differences(
+                    comparison_payload["effective_differences"] = _component_differences(
                         comparison.current, comparison.proposed
                     )
+                    comparison_payload["submitted_differences"] = _component_differences(
+                        comparison.current, comparison.submitted
+                    )
+                    comparison_payload["differences"] = comparison_payload[
+                        "effective_differences"
+                    ]
                 review_ids = self._action_review_ids(action, llm_report)
                 pending_value_holds = [
                     {
@@ -631,18 +653,25 @@ class ApiExecutionService:
             for action_id, action in court.actions.items()
             if action.status == "succeeded"
         }
+        existing_overlay = (
+            self.output_root / "execution-review-state" / f"{run_id}.plan.json"
+        ).exists()
         if (
-            latest.get("run_id") == run_id
+            (latest.get("run_id") == run_id or existing_overlay)
             and str(report.get("manifest_version") or "") < API_MANIFEST_VERSION
             and (archive["path"] / "submissions_cleaned.json").exists()
         ):
-            return derive_latest_execution_overlay(
+            derived = derive_latest_execution_overlay(
                 run_id,
                 archive["path"],
                 self.output_root,
                 report,
                 succeeded_action_ids,
             )
+            self.review_store.reconcile_plan_version(
+                run_id, str(derived.get("manifest_version") or API_MANIFEST_VERSION)
+            )
+            return derived
         return report
 
     def _llm_review_report(self, run_id: str) -> dict[str, Any]:
@@ -652,8 +681,37 @@ class ApiExecutionService:
         if archive is None:
             raise ValueError(f"Run '{run_id}' does not exist")
         report = load_or_derive_llm_actions_review(archive["path"])
+        authoritative_rows = self._authoritative_source_rows(run_id)
+        if authoritative_rows is not None:
+            report = filter_llm_actions_review(report, authoritative_rows)
         self._llm_review_cache[run_id] = report
         return report
+
+    def _authoritative_source_rows(self, run_id: str) -> set[int] | None:
+        archive = load_run_archive(self.output_root, run_id)
+        if archive is None:
+            return None
+        selection_path = archive["path"] / "submission_selection.json"
+        if selection_path.exists():
+            try:
+                payload = json.loads(selection_path.read_text(encoding="utf-8"))
+                return {
+                    int(row) for row in payload.get("authoritative_source_row_numbers", [])
+                }
+            except (OSError, TypeError, ValueError):
+                return None
+        submissions_path = archive["path"] / "submissions_cleaned.json"
+        if not submissions_path.exists():
+            return None
+        try:
+            submissions = [
+                CourtSubmission.model_validate(item)
+                for item in json.loads(submissions_path.read_text(encoding="utf-8"))
+            ]
+        except (OSError, TypeError, ValueError):
+            return None
+        _, selection = select_authoritative_submissions(submissions)
+        return set(selection["authoritative_source_row_numbers"])
 
     def _save_with_summary(
         self,
@@ -856,12 +914,7 @@ class ApiExecutionService:
                     )
                 ]
             )
-            body_reasons = [
-                validate_fact_api_action_body(str(action.get("resource") or ""), body)
-                for body in bodies
-            ]
-            body_reason = next((reason for reason in body_reasons if reason), None)
-            if body_reason or not bodies:
+            if not bodies:
                 self._set_action(
                     ledger,
                     court_slug,
@@ -869,7 +922,7 @@ class ApiExecutionService:
                     "blocked",
                     "preflight",
                     None,
-                    f"Action body cannot be sent to FaCT: {body_reason or 'empty section'}",
+                    "Action body cannot be sent to FaCT: empty section",
                 )
                 continue
             approved_addresses = self._approved_address_items(
@@ -922,7 +975,32 @@ class ApiExecutionService:
             else:
                 comparison = None
                 review_state = self.review_store.load(run_id)
-            if comparison and comparison.is_no_change:
+            operation_reason = (
+                _comparison_operation_validation_reason(action, comparison, court.court_id)
+                if comparison
+                else None
+            )
+            if comparison and comparison.merge_conflicts:
+                self._set_action(
+                    ledger,
+                    court_slug,
+                    action,
+                    "blocked",
+                    "preflight",
+                    target.status_code,
+                    "; ".join(comparison.merge_conflicts),
+                )
+            elif comparison and operation_reason:
+                self._set_action(
+                    ledger,
+                    court_slug,
+                    action,
+                    "blocked",
+                    "preflight",
+                    target.status_code,
+                    f"Merged action cannot be sent to FaCT: {operation_reason}",
+                )
+            elif comparison and comparison.is_no_change:
                 self._set_action(
                     ledger,
                     court_slug,
@@ -930,7 +1008,7 @@ class ApiExecutionService:
                     "succeeded",
                     "preflight",
                     target.status_code,
-                    "FaCT already contains the reviewed proposed section; no write was required",
+                    "FaCT already contains the effective merged section; no write was required",
                 )
             elif comparison and comparison.has_existing_data:
                 target_approval = review_state.target_approvals.get(comparison.change_id)
@@ -942,7 +1020,7 @@ class ApiExecutionService:
                         "awaiting_approval",
                         "preflight",
                         target.status_code,
-                        "Existing FaCT section replacement requires approval of the displayed before and after values",
+                        "Changes to the existing FaCT section require approval of the displayed before and effective after values",
                     )
                 else:
                     self._set_action(
@@ -986,11 +1064,7 @@ class ApiExecutionService:
                 None,
                 "Court UUID was unavailable after a successful preflight",
             )
-        elif action.get("resource") in {
-            "address",
-            "contact_detail",
-            "court_opening_hours",
-        }:
+        else:
             change_id = target_change_id(court_slug, str(action["action_id"]))
             comparison = self.review_store.load(run_id).comparisons.get(change_id)
             if comparison is None:
@@ -1025,7 +1099,7 @@ class ApiExecutionService:
                                 "blocked",
                                 "execute",
                                 None,
-                                f"Replacement operation cannot be sent to FaCT: {body_reason}",
+                                f"Merged operation cannot be sent to FaCT: {body_reason}",
                             )
                             break
                     try:
@@ -1038,12 +1112,12 @@ class ApiExecutionService:
                             "unknown",
                             "execute",
                             None,
-                            "Section replacement timed out; outcome is unknown and surplus entries were not deleted",
+                            "Merged section update timed out; outcome is unknown",
                         )
                         break
                     except httpx.HTTPError as exc:
                         http_status, reason = _preflight_error_details(
-                            "section replacement request", exc
+                            "merged section request", exc
                         )
                         self._set_action(
                             ledger, court_slug, action, "failed", "execute", http_status, reason
@@ -1070,9 +1144,11 @@ class ApiExecutionService:
                         "succeeded",
                         "execute",
                         200,
-                        f"Completed {completed_operations} reviewed section replacement operation(s)",
+                        f"Completed {completed_operations} reviewed merged-section operation(s)",
                     )
-                if state.status in {"blocked", "failed", "unknown"}:
+                if state.status in {"blocked", "failed", "unknown"} and (
+                    state.status == "unknown" or completed_operations
+                ):
                     self._capture_partial_section_state(
                         run_id,
                         ledger,
@@ -1082,58 +1158,6 @@ class ApiExecutionService:
                         completed_operations,
                         client,
                     )
-        else:
-            body = self._execution_body(run_id, action, court_id)
-            body_reason = validate_fact_api_action_body(str(action.get("resource") or ""), body)
-            if body_reason:
-                self._set_action(
-                    ledger,
-                    court_slug,
-                    action,
-                    "blocked",
-                    "execute",
-                    None,
-                    f"Action body cannot be sent to FaCT: {body_reason}",
-                )
-            else:
-                try:
-                    response = client.write(action["method"], action["path"], body)
-                except httpx.TimeoutException:
-                    self._set_action(
-                        ledger,
-                        court_slug,
-                        action,
-                        "unknown",
-                        "execute",
-                        None,
-                        "Write timed out; outcome is unknown",
-                    )
-                except httpx.HTTPError as exc:
-                    http_status, reason = _preflight_error_details("write request", exc)
-                    self._set_action(
-                        ledger, court_slug, action, "failed", "execute", http_status, reason
-                    )
-                else:
-                    if 200 <= response.status_code < 300:
-                        self._set_action(
-                            ledger,
-                            court_slug,
-                            action,
-                            "succeeded",
-                            "execute",
-                            response.status_code,
-                            None,
-                        )
-                    else:
-                        self._set_action(
-                            ledger,
-                            court_slug,
-                            action,
-                            "failed",
-                            "execute",
-                            response.status_code,
-                            _write_rejection_reason(response.status_code, response.body),
-                        )
         self._update_court_status(
             self._court_state(ledger, court_slug), self._active_actions(run_id, record)
         )
@@ -1152,33 +1176,43 @@ class ApiExecutionService:
         try:
             response = client.get(_preflight_path(str(action["path"])))
         except (httpx.HTTPError, RuntimeError, ValueError):
-            note = "Live FaCT could not be re-read after the partial replacement."
+            note = "Live FaCT could not be re-read after the partial merged update."
         else:
             if response.status_code in {200, 204, 404}:
-                effective_action = {
-                    **action,
-                    "proposed_items": comparison.proposed,
-                }
+                effective_action = dict(action)
+                court_id = self._court_state(ledger, court_slug).court_id or "{court_id}"
+                if action.get("resource") in {
+                    "address",
+                    "contact_detail",
+                    "court_opening_hours",
+                }:
+                    effective_action["proposed_items"] = self._execution_items(
+                        run_id, action, court_id
+                    )
+                else:
+                    effective_action["body"] = self._execution_body(
+                        run_id, action, court_id
+                    )
                 refreshed = build_target_comparison(
                     court_slug, effective_action, response.body
                 )
                 self.review_store.save_comparison(run_id, refreshed)
                 note = (
-                    "Live FaCT was re-read after the partial replacement; "
-                    "the replacement approval was invalidated for a new review."
+                    "Live FaCT was re-read after the partial merged update; "
+                    "the change approval was invalidated for a new review."
                 )
             else:
                 note = (
                     "Live FaCT returned an unexpected response when re-read after "
-                    "the partial replacement."
+                    "the partial merged update."
                 )
-        state.reason = f"{state.reason or 'Section replacement stopped.'} {note}"
+        state.reason = f"{state.reason or 'Merged section update stopped.'} {note}"
         state.attempts.append(
             ActionAttempt(
                 operation="preflight",
                 outcome=state.status,
                 http_status=None,
-                message=f"{completed_operations} replacement operation(s) completed. {note}",
+                message=f"{completed_operations} merged operation(s) completed. {note}",
             )
         )
 
@@ -1955,6 +1989,21 @@ def _legacy_address_reason_is_only_blocker(action: dict[str, Any]) -> bool:
         return False
     expected = f"Address verification requires review: {evidence.get('message') or ''}"
     return str(action.get("reason") or "").strip() == expected.strip()
+
+
+def _comparison_operation_validation_reason(
+    action: dict[str, Any], comparison: TargetComparison, court_id: str
+) -> str | None:
+    resource = str(action.get("resource") or "")
+    for operation in comparison.operations:
+        body = dict(operation.get("body") or {})
+        if resource != "professional_information":
+            body["courtId"] = court_id
+        body = normalise_fact_api_action_body(resource, body)
+        reason = validate_fact_api_action_body(resource, body)
+        if reason:
+            return reason
+    return None
 
 
 def _preflight_error_details(operation: str, exc: Exception) -> tuple[int | None, str]:

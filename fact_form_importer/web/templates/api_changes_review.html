@@ -2,17 +2,33 @@
 {% block content %}
 <h1>API changes review: {{ archive.manifest.run_id }}</h1>
 <nav>
+  <a href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}">Review workflow</a>
   <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
   <a href="{{ url_for('review_overview', run_id=archive.manifest.run_id) }}">Review overview</a>
   <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id) }}">LLM and address values</a>
 </nav>
-<p>Existing FaCT data is replaced only after the exact before and after section is approved. A later target change invalidates that approval.</p>
+<section>
+  <h2>What this step does</h2>
+  <p><strong>This is not a {{ comparison_summary.total }}-item approval queue.</strong> Run one read-only scan to fetch current FaCT sections and compare them with the submitted proposals. You do not need to click “Check current FaCT data” for every row.</p>
+  <ul>
+    <li>No approval is needed when FaCT is empty or the effective result is unchanged.</li>
+    <li>An approval is requested only when submitted values would change a populated live section.</li>
+    <li>LLM approval accepts a proposed value; this separate approval protects existing live FaCT data from an unintended overwrite.</li>
+    <li>Submitted values are merged into live FaCT data. Blank and unmatched live values are preserved, and a later live or proposed change invalidates approval.</li>
+  </ul>
+</section>
+<div class="summary">
+  {% for label, value in [('Planned sections', comparison_summary.total), ('Checked', comparison_summary.checked), ('Not checked', comparison_summary.not_checked), ('No change', comparison_summary.no_change), ('Empty target', comparison_summary.empty_target), ('Need approval', comparison_summary.approval_required), ('Approved', comparison_summary.approved), ('Ambiguous matches', comparison_summary.conflicts)] %}<div><strong>{{ label }}</strong><br>{{ value }}</div>{% endfor %}
+</div>
 <form method="post" action="{{ url_for('refresh_api_changes', run_id=archive.manifest.run_id) }}">
-  <button type="submit" class="secondary" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}API job in progress…{% else %}Refresh all FaCT comparisons{% endif %}</button>
+  <input type="hidden" name="page" value="{{ page }}"><input type="hidden" name="hold" value="{{ hold or '' }}">
+  <button type="submit" class="secondary" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Read-only scan in progress…{% elif comparison_summary.not_checked %}Run read-only comparison scan for all sections{% else %}Refresh all FaCT comparisons{% endif %}</button>
 </form>
-{% if hold %}<p>Filtered by <strong>{{ hold | replace('_', ' ') }}</strong>. <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">Clear filter</a></p>{% endif %}
+{% if comparison_job and comparison_job.scope == 'comparison' %}<p>Latest comparison scan: <strong>{{ comparison_job.state }}</strong>{% if comparison_job.error %}. {{ comparison_job.error }}{% endif %}</p>{% endif %}
+{% if hold %}<p>Filtered by <strong>{% if hold == 'target_replacement' %}existing-data approval{% elif hold == 'source_selection' %}legacy source selection{% else %}{{ hold | replace('_', ' ') }}{% endif %}</strong>. <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">Clear filter</a></p>{% endif %}
+{% if pages > 1 %}<nav class="pagination" aria-label="FaCT changes pages"><strong>Page {{ page }} of {{ pages }}</strong>{% if page > 1 %}<a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, hold=hold, page=page-1) }}">Previous page</a>{% endif %}{% if page < pages %}<a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, hold=hold, page=page+1) }}">Next page</a>{% endif %}</nav>{% endif %}
 <table>
-  <thead><tr><th>Court and source</th><th>Section</th><th>Current FaCT value</th><th>Proposed replacement</th><th>Operations</th><th>Approval/status</th></tr></thead>
+  <thead><tr><th>Court and source</th><th>Section</th><th>Current FaCT value</th><th>Submitted proposal</th><th>Effective merged result and operations</th><th>Approval/status</th></tr></thead>
   <tbody>{% for change in changes %}
   <tr>
     <td><strong>{{ change.court_slug }}</strong><br>Row {{ change.source_row_number or 'unavailable' }}
@@ -26,24 +42,25 @@
     <td><strong>{{ change.action.resource }}</strong><br><code>{{ change.action.action_id }}</code><br>{{ change.execution_status }}</td>
     {% if change.comparison %}
     <td><pre>{{ change.comparison.current | tojson(indent=2) }}</pre></td>
-    <td><pre>{{ change.comparison.proposed | tojson(indent=2) }}</pre></td>
-    <td>{% if change.comparison.differences %}<details open><summary>{{ change.comparison.differences | length }} component difference(s)</summary><table class="compact"><thead><tr><th>Component</th><th>Before</th><th>After</th></tr></thead><tbody>{% for difference in change.comparison.differences %}<tr><td><code>{{ difference.field }}</code></td><td>{{ difference.before if difference.before is not none else 'Not supplied' }}</td><td>{{ difference.after if difference.after is not none else 'Not supplied' }}</td></tr>{% endfor %}</tbody></table></details>{% endif %}{% for operation in change.comparison.operations %}<code>{{ operation.method }} {{ operation.path }}</code><br>{{ operation.purpose }}{% if not loop.last %}<hr>{% endif %}{% else %}No write required{% endfor %}</td>
+    <td><pre>{{ change.comparison.submitted | tojson(indent=2) }}</pre></td>
+    <td>{% if change.comparison.merge_conflicts %}<p class="error"><strong>Ambiguous type match:</strong> {{ change.comparison.merge_conflicts | join('; ') }}</p>{% endif %}<pre>{{ change.comparison.proposed | tojson(indent=2) }}</pre>{% if change.comparison.differences %}<details open><summary>{{ change.comparison.differences | length }} effective difference(s)</summary><table class="compact"><thead><tr><th>Component</th><th>Before</th><th>After</th></tr></thead><tbody>{% for difference in change.comparison.differences %}<tr><td><code>{{ difference.field }}</code></td><td>{{ difference.before if difference.before is not none else 'Not supplied' }}</td><td>{{ difference.after if difference.after is not none else 'Not supplied' }}</td></tr>{% endfor %}</tbody></table></details>{% endif %}{% for operation in change.comparison.operations %}<code>{{ operation.method }} {{ operation.path }}</code><br>{{ operation.purpose }}{% if not loop.last %}<hr>{% endif %}{% else %}No write required{% endfor %}</td>
     <td>
       {% if change.source_selection_required and not change.selected_source_row_number %}<strong>Source row selection pending</strong><br>{% endif %}
       {% for hold in change.pending_value_holds %}<a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending', q=hold.review_id) }}">LLM value approval pending</a><br>{% endfor %}
       {% if change.comparison.is_no_change %}<strong>No change</strong>
-      {% elif change.target_approved %}<strong>Replacement approved</strong>
+      {% elif change.comparison.merge_conflicts %}<strong>Resolve the ambiguous type match before approval.</strong>
+      {% elif change.target_approved %}<strong>FaCT changes approved</strong>
       {% elif change.comparison.has_existing_data %}
-      <form method="post" action="{{ url_for('approve_api_change', run_id=archive.manifest.run_id, change_id=change.change_id) }}" onsubmit="return confirm('Approve replacing this complete FaCT section with the displayed proposal, including the displayed deletions?');"><button type="submit">Approve replacement</button></form>
-      {% else %}<span class="muted">Target is empty; no overwrite approval required.</span>{% endif %}
+      <form method="post" action="{{ url_for('approve_api_change', run_id=archive.manifest.run_id, change_id=change.change_id) }}"><input type="hidden" name="page" value="{{ page }}"><input type="hidden" name="hold" value="{{ hold or '' }}"><button type="submit">Approve these FaCT changes</button></form>
+      {% else %}<span class="muted">Target is empty; no existing-data approval required.</span>{% endif %}
     </td>
     {% else %}
     <td colspan="3"><span class="muted">Live target not checked.</span></td>
-    <td><form method="post" action="{{ url_for('refresh_api_change', run_id=archive.manifest.run_id, action_id=change.action.action_id) }}"><input type="hidden" name="court_slug" value="{{ change.court_slug }}"><button type="submit" class="secondary">Check current FaCT data</button></form></td>
+    <td><form method="post" action="{{ url_for('refresh_api_change', run_id=archive.manifest.run_id, action_id=change.action.action_id) }}"><input type="hidden" name="court_slug" value="{{ change.court_slug }}"><input type="hidden" name="page" value="{{ page }}"><input type="hidden" name="hold" value="{{ hold or '' }}"><button type="submit" class="secondary">Check this section only</button></form></td>
     {% endif %}
   </tr>
   {% else %}<tr><td colspan="6">No section changes match this filter.</td></tr>{% endfor %}</tbody>
 </table>
-{% if pages > 1 %}<p>Page {{ page }} of {{ pages }}</p>{% endif %}
+{% if pages > 1 %}<nav class="pagination" aria-label="FaCT changes pages"><strong>Page {{ page }} of {{ pages }}</strong>{% if page > 1 %}<a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, hold=hold, page=page-1) }}">Previous page</a>{% endif %}{% if page < pages %}<a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, hold=hold, page=page+1) }}">Next page</a>{% endif %}</nav>{% endif %}
 {% if comparison_job and comparison_job.scope == 'comparison' and comparison_job.state in ['queued', 'running'] %}<script>window.setTimeout(function(){ window.location.reload(); }, 1200);</script>{% endif %}
 {% endblock %}

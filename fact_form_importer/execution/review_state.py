@@ -11,9 +11,38 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from fact_form_importer.execution.models import utc_now
+from fact_form_importer.output.fact_api_manifest import MISSING_SUPPORT_PHONE_PLACEHOLDER
 
 
-EXECUTION_REVIEW_LEDGER_VERSION = "1.0"
+EXECUTION_REVIEW_LEDGER_VERSION = "1.1"
+_REQUEST_FIELDS_BY_RESOURCE = {
+    "building_facilities": {
+        "courtId", "parking", "freeWaterDispensers", "snackVendingMachines",
+        "drinkVendingMachines", "cafeteria", "waitingArea", "waitingAreaChildren",
+        "quietRoom", "babyChanging", "wifi",
+    },
+    "accessibility_options": {
+        "courtId", "accessibleParking", "accessibleParkingPhoneNumber",
+        "accessibleToiletDescription", "accessibleEntrance",
+        "accessibleEntrancePhoneNumber", "hearingEnhancementEquipment", "lift",
+        "liftDoorWidth", "liftDoorLimit", "liftSupportPhoneNumber", "quietRoom",
+    },
+    "translation_services": {"courtId", "phoneNumber", "email"},
+    "professional_information": {"professionalInformation"},
+    "counter_service_opening_hours": {
+        "courtId", "counterService", "assistWithForms", "assistWithDocuments",
+        "assistWithSupport", "appointmentNeeded", "appointmentContact", "courtTypes",
+        "openingTimesDetails",
+    },
+    "address": {
+        "courtId", "addressLine1", "addressLine2", "townCity", "county", "postcode",
+        "addressType", "areasOfLaw", "courtTypes",
+    },
+    "contact_detail": {
+        "courtId", "courtContactDescriptionId", "explanation", "phoneNumber", "email",
+    },
+    "court_opening_hours": {"courtId", "openingHourTypeId", "openingTimesDetails"},
+}
 
 
 def canonical_hash(value: Any) -> str:
@@ -40,12 +69,14 @@ class TargetComparison(BaseModel):
     source_row_number: Optional[int] = None
     captured_at: str = Field(default_factory=utc_now)
     current: Any
+    submitted: Any = None
     proposed: Any
     current_hash: str
     proposed_hash: str
     operations: list[dict[str, Any]] = Field(default_factory=list)
     has_existing_data: bool = False
     is_no_change: bool = False
+    merge_conflicts: list[str] = Field(default_factory=list)
 
 
 class TargetApproval(BaseModel):
@@ -62,6 +93,7 @@ class ExecutionReviewLedger(BaseModel):
     source_selections: dict[str, SourceSelection] = Field(default_factory=dict)
     comparisons: dict[str, TargetComparison] = Field(default_factory=dict)
     target_approvals: dict[str, TargetApproval] = Field(default_factory=dict)
+    plan_manifest_version: Optional[str] = None
 
 
 class ExecutionReviewStore:
@@ -116,7 +148,9 @@ class ExecutionReviewStore:
             if comparison is None:
                 raise ValueError("Refresh the live FaCT comparison before approving this change")
             if not comparison.has_existing_data or comparison.is_no_change:
-                raise ValueError("This section does not require an overwrite approval")
+                raise ValueError("This section does not require an existing-data change approval")
+            if comparison.merge_conflicts:
+                raise ValueError("Resolve ambiguous business-type matches before approving")
             approval = ledger.target_approvals.get(change_id)
             if approval and (
                 approval.current_hash == comparison.current_hash
@@ -146,6 +180,21 @@ class ExecutionReviewStore:
                 changed = True
             return self.save(ledger) if changed else ledger
 
+    def reconcile_plan_version(
+        self, run_id: str, manifest_version: str
+    ) -> ExecutionReviewLedger:
+        """Discard mutable comparisons when a derived operational plan changes."""
+
+        with self._lock:
+            ledger = self.load(run_id)
+            if ledger.plan_manifest_version == manifest_version:
+                return ledger
+            ledger.comparisons.clear()
+            ledger.target_approvals.clear()
+            ledger.source_selections.clear()
+            ledger.plan_manifest_version = manifest_version
+            return self.save(ledger)
+
     def save(self, ledger: ExecutionReviewLedger) -> ExecutionReviewLedger:
         ledger.updated_at = utc_now()
         ledger.ledger_version = EXECUTION_REVIEW_LEDGER_VERSION
@@ -167,12 +216,14 @@ def build_target_comparison(
 ) -> TargetComparison:
     proposed_items = action.get("proposed_items")
     if action.get("resource") in {"address", "contact_detail", "court_opening_hours"}:
-        proposed: Any = proposed_items if isinstance(proposed_items, list) else [action.get("body", {})]
+        submitted: Any = (
+            proposed_items if isinstance(proposed_items, list) else [action.get("body", {})]
+        )
         current_value = current if isinstance(current, list) else []
     else:
-        proposed = action.get("body", {})
+        submitted = action.get("body", {})
         current_value = current if isinstance(current, dict) else {}
-    operations = replacement_operations(action, current_value, proposed)
+    proposed, operations, conflicts = merged_target_state(action, current_value, submitted)
     return TargetComparison(
         change_id=target_change_id(court_slug, str(action["action_id"])),
         court_slug=court_slug,
@@ -180,68 +231,98 @@ def build_target_comparison(
         resource=str(action.get("resource") or ""),
         source_row_number=action.get("source_row_number"),
         current=current_value,
+        submitted=submitted,
         proposed=proposed,
         current_hash=canonical_hash(current_value),
         proposed_hash=canonical_hash(proposed),
         operations=operations,
         has_existing_data=bool(current_value),
         is_no_change=_without_server_ids(current_value) == _without_server_ids(proposed),
+        merge_conflicts=conflicts,
     )
 
 
 def replacement_operations(
     action: dict[str, Any], current: Any, proposed: Any
 ) -> list[dict[str, Any]]:
+    """Backward-compatible operation helper using the merged update policy."""
+
+    return merged_target_state(action, current, proposed)[1]
+
+
+def merged_target_state(
+    action: dict[str, Any], current: Any, submitted: Any
+) -> tuple[Any, list[dict[str, Any]], list[str]]:
     resource = str(action.get("resource") or "")
     path = str(action.get("path") or "")
     if resource not in {"address", "contact_detail", "court_opening_hours"}:
-        return [
+        current_value = dict(current) if isinstance(current, dict) else {}
+        submitted_value = dict(submitted) if isinstance(submitted, dict) else {}
+        effective = {**current_value, **submitted_value}
+        for field in action.get("clear_fields", []):
+            effective[field] = None
+        effective = _apply_request_defaults(resource, effective)
+        return effective, [
             {
                 "method": str(action.get("method") or "POST"),
                 "path": path,
-                "body": proposed,
-                "purpose": "update" if current else "create",
+                "body": _operation_body(resource, effective),
+                "purpose": "update" if current_value else "create",
             }
-        ]
+        ], []
 
     current_items = list(current) if isinstance(current, list) else []
-    proposed_items = list(proposed) if isinstance(proposed, list) else []
+    proposed_items = list(submitted) if isinstance(submitted, list) else []
     current_groups = _group_by_business_key(resource, current_items)
     proposed_groups = _group_by_business_key(resource, proposed_items)
     operations: list[dict[str, Any]] = []
-    deletions: list[dict[str, Any]] = []
-    for key in sorted(set(current_groups) | set(proposed_groups)):
-        existing = sorted(current_groups.get(key, []), key=lambda item: str(item.get("id") or ""))
-        wanted = proposed_groups.get(key, [])
-        paired = min(len(existing), len(wanted))
-        for index in range(paired):
-            item_id = existing[index].get("id")
+    conflicts: list[str] = []
+    effective = [dict(item) for item in current_items]
+    current_indexes = _group_indexes_by_business_key(resource, current_items)
+    proposed_indexes = _group_indexes_by_business_key(resource, proposed_items)
+    clear_fields = action.get("proposed_item_clear_fields") or []
+    for key in sorted(proposed_groups):
+        existing = current_groups.get(key, [])
+        wanted = proposed_groups[key]
+        if len(existing) > 1 or len(wanted) > 1:
+            conflicts.append(
+                f"Multiple {resource.replace('_', ' ')} entries use business type '{key}'"
+            )
+            continue
+        proposed_index = proposed_indexes[key][0]
+        item = dict(wanted[0])
+        item_clear_fields = clear_fields[proposed_index] if proposed_index < len(clear_fields) else []
+        if existing:
+            current_index = current_indexes[key][0]
+            merged = {**existing[0], **item}
+            for field in item_clear_fields:
+                merged[field] = None
+            effective[current_index] = merged
+            item_id = existing[0].get("id")
             update_path = path
             if resource in {"address", "contact_detail"} and item_id:
                 update_path = f"{path}/{item_id}"
             operations.append(
-                {"method": "PUT", "path": update_path, "body": wanted[index], "purpose": "update"}
+                {
+                    "method": "PUT",
+                    "path": update_path,
+                    "body": _operation_body(resource, merged),
+                    "purpose": "update",
+                }
             )
-        for item in wanted[paired:]:
+        else:
+            for field in item_clear_fields:
+                item[field] = None
+            effective.append(item)
             operations.append(
                 {
                     "method": str(action.get("method") or "POST"),
                     "path": path,
-                    "body": item,
+                    "body": _operation_body(resource, item),
                     "purpose": "create",
                 }
             )
-        for item in existing[paired:]:
-            if item.get("id"):
-                deletions.append(
-                    {
-                        "method": "DELETE",
-                        "path": f"{path}/{item['id']}",
-                        "body": {},
-                        "purpose": "delete_surplus",
-                    }
-                )
-    return operations + deletions
+    return effective, operations, conflicts
 
 
 def _group_by_business_key(
@@ -264,6 +345,41 @@ def _group_by_business_key(
         business_key = str(value) if value is not None else f"untyped-{index}"
         grouped.setdefault(business_key, []).append(item)
     return grouped
+
+
+def _group_indexes_by_business_key(
+    resource: str, items: list[dict[str, Any]]
+) -> dict[str, list[int]]:
+    grouped_items = _group_by_business_key(resource, items)
+    indexes: dict[str, list[int]] = {key: [] for key in grouped_items}
+    for index, item in enumerate(items):
+        for key, candidates in grouped_items.items():
+            if any(candidate is item for candidate in candidates):
+                indexes[key].append(index)
+                break
+    return indexes
+
+
+def _operation_body(resource: str, value: dict[str, Any]) -> dict[str, Any]:
+    allowed = _REQUEST_FIELDS_BY_RESOURCE.get(resource)
+    return {
+        key: item
+        for key, item in value.items()
+        if key not in {"id", "court"} and (allowed is None or key in allowed)
+    }
+
+
+def _apply_request_defaults(resource: str, value: dict[str, Any]) -> dict[str, Any]:
+    effective = dict(value)
+    if resource != "accessibility_options":
+        return effective
+    if effective.get("accessibleEntrance") is False and not effective.get(
+        "accessibleEntrancePhoneNumber"
+    ):
+        effective["accessibleEntrancePhoneNumber"] = MISSING_SUPPORT_PHONE_PLACEHOLDER
+    if effective.get("lift") is False and not effective.get("liftSupportPhoneNumber"):
+        effective["liftSupportPhoneNumber"] = MISSING_SUPPORT_PHONE_PLACEHOLDER
+    return effective
 
 
 def _without_server_ids(value: Any) -> Any:
