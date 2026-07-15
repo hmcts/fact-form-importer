@@ -618,11 +618,28 @@ def create_app(
         archive = _archive_or_404(output_root, run_id)
         payload = app.config["EXECUTION_SERVICE"].get_api_changes_review(run_id)
         hold = request.args.get("hold")
-        changes = payload["changes"]
-        comparison_summary = _comparison_summary(changes)
+        view = request.args.get("view") or "pending"
+        if view not in {"pending", "all"}:
+            view = "pending"
+        all_changes = payload["changes"]
+        pending_change_count = sum(_change_needs_review(change) for change in all_changes)
+        changes = (
+            [change for change in all_changes if _change_needs_review(change)]
+            if view == "pending"
+            else all_changes
+        )
+        comparison_summary = _comparison_summary(all_changes)
         if hold:
             changes = [change for change in changes if _change_has_hold(change, hold)]
         page, pages, changes_page = _paginate(changes, request.args.get("page"))
+        comparison_job = app.config["EXECUTION_JOB_RUNNER"].latest_for_run(run_id)
+        if (
+            comparison_job
+            and comparison_job.scope == "comparison"
+            and comparison_job.state == "interrupted"
+            and comparison_summary["not_checked"] == 0
+        ):
+            comparison_job = None
         return render_template(
             "api_changes_review.html",
             archive=archive,
@@ -630,10 +647,13 @@ def create_app(
             page=page,
             pages=pages,
             hold=hold,
+            view=view,
             filtered_change_count=len(changes),
             comparison_summary=comparison_summary,
-            comparison_job=app.config["EXECUTION_JOB_RUNNER"].latest_for_run(run_id),
+            pending_change_count=pending_change_count,
+            comparison_job=comparison_job,
             active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
+            review_complete=request.args.get("completed") == "1",
         )
 
     @app.post("/runs/<run_id>/api-changes/refresh")
@@ -664,7 +684,11 @@ def create_app(
             app.config["EXECUTION_SERVICE"].approve_target_change(run_id, change_id)
         except ValueError as exc:
             abort(400, str(exc))
-        return redirect(_api_changes_location(run_id))
+        return redirect(
+            _next_api_change_location(
+                app.config["EXECUTION_SERVICE"], run_id, change_id
+            )
+        )
 
     @app.post("/runs/<run_id>/courts/<court_slug>/select-source")
     def select_duplicate_source(run_id: str, court_slug: str):
@@ -1210,14 +1234,76 @@ def _comparison_summary(changes: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def _change_needs_review(change: dict[str, Any]) -> bool:
+    """Return only Step 2 work; empty, unchanged, and approved targets are done."""
+
+    comparison = change.get("comparison")
+    if not isinstance(comparison, dict):
+        return True
+    if comparison.get("merge_conflicts"):
+        return True
+    return bool(
+        comparison.get("has_existing_data")
+        and not comparison.get("is_no_change")
+        and not change.get("target_approved")
+    )
+
+
+def _next_api_change_location(
+    service: ApiExecutionService, run_id: str, approved_change_id: str
+) -> str:
+    """Advance an approval to the next pending Step 2 item."""
+
+    changes = service.get_api_changes_review(run_id)["changes"]
+    approved_index = next(
+        (
+            index
+            for index, change in enumerate(changes)
+            if change.get("change_id") == approved_change_id
+        ),
+        -1,
+    )
+    hold = request.form.get("hold") or None
+    pending = [
+        (index, change)
+        for index, change in enumerate(changes)
+        if _change_needs_review(change)
+        and (not hold or _change_has_hold(change, hold))
+    ]
+    if not pending:
+        return url_for(
+            "api_changes_review",
+            run_id=run_id,
+            view="pending",
+            completed=1,
+        )
+    next_position = next(
+        (position for position, (index, _) in enumerate(pending) if index > approved_index),
+        0,
+    )
+    next_change = pending[next_position][1]
+    params: dict[str, Any] = {
+        "run_id": run_id,
+        "view": "pending",
+        "page": next_position // PAGE_SIZE + 1,
+        "_anchor": f"change-{next_change['change_id']}",
+    }
+    if hold:
+        params["hold"] = hold
+    return url_for("api_changes_review", **params)
+
+
 def _api_changes_location(run_id: str, **extra: Any) -> str:
     params = dict(extra)
     page = request.form.get("page")
     hold = request.form.get("hold")
+    view = request.form.get("view")
     if page:
         params["page"] = page
     if hold:
         params["hold"] = hold
+    if view:
+        params["view"] = view
     return url_for("api_changes_review", run_id=run_id, **params)
 
 

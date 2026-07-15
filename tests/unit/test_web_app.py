@@ -742,10 +742,12 @@ def test_review_overview_and_api_change_routes_cover_value_source_and_target_gat
     approved_target = client.post(
         f"/runs/{run_id}/api-changes/{change['change_id']}/approve"
     )
-    changes_page = client.get(f"/runs/{run_id}/api-changes")
+    changes_page = client.get(f"/runs/{run_id}/api-changes?view=all")
 
     assert {selected.status_code, approved_value.status_code, refreshed.status_code} == {302}
     assert approved_target.status_code == 302
+    assert "view=pending" in approved_target.headers["Location"]
+    assert "completed=1" in approved_target.headers["Location"]
     assert changes_page.status_code == 200
     assert b"This is not a 1-item approval queue" in changes_page.data
     assert b"New workbook runs fetch current FaCT sections automatically" in changes_page.data
@@ -818,6 +820,91 @@ def test_api_changes_review_has_previous_and_next_navigation(tmp_path):
     assert b"Page 2 of 2" in second.data
     assert b"Previous page" in second.data
     assert b"Next page" not in second.data
+
+
+def test_api_changes_defaults_to_pending_advances_approval_and_hides_stale_job(
+    tmp_path,
+):
+    output_root, run_id = _archive(tmp_path)
+
+    def change(index, *, existing=True):
+        return {
+            "change_id": f"change-{index}",
+            "court_slug": f"court-{index}",
+            "source_row_number": index + 2,
+            "source_selection_required": False,
+            "selected_source_row_number": None,
+            "action": {
+                "action_id": f"action-{index}",
+                "resource": "building_facilities",
+                "readiness": "ready",
+            },
+            "comparison": {
+                "current": {"parking": False} if existing else {},
+                "submitted": {"parking": True},
+                "proposed": {"parking": True},
+                "operations": [],
+                "differences": [],
+                "has_existing_data": existing,
+                "is_no_change": False,
+                "merge_conflicts": [],
+            },
+            "target_approved": False,
+            "pending_value_holds": [],
+            "execution_status": "planned",
+        }
+
+    changes = [change(1), change(2), change(3, existing=False)]
+
+    class ChangesService:
+        def get_api_changes_review(self, requested_run_id):
+            assert requested_run_id == run_id
+            return {"changes": changes}
+
+        def approve_target_change(self, requested_run_id, change_id):
+            assert requested_run_id == run_id
+            target = next(item for item in changes if item["change_id"] == change_id)
+            target["target_approved"] = True
+
+    jobs = output_root / ".execution-jobs"
+    jobs.mkdir(parents=True)
+    (jobs / "stale.json").write_text(
+        json.dumps(
+            {
+                "job_id": "stale",
+                "run_id": run_id,
+                "scope": "comparison",
+                "state": "interrupted",
+                "created_at": "2026-07-15T10:00:00Z",
+                "completed_at": "2026-07-15T10:01:00Z",
+                "error": "Server restarted before the execution job completed",
+            }
+        )
+    )
+    client = create_app(output_root, execution_service=ChangesService()).test_client()
+
+    pending = client.get(f"/runs/{run_id}/api-changes")
+    all_sections = client.get(f"/runs/{run_id}/api-changes?view=all")
+    advanced = client.post(
+        f"/runs/{run_id}/api-changes/change-1/approve",
+        data={"view": "pending"},
+    )
+
+    assert pending.status_code == 200
+    assert b"Needs review (2)" in pending.data
+    assert b"court-1" in pending.data
+    assert b"court-3" not in pending.data
+    assert b"Approve and continue" in pending.data
+    assert b"Latest comparison scan" not in pending.data
+    assert b"court-3" in all_sections.data
+    assert "view=pending" in advanced.headers["Location"]
+    assert "#change-change-2" in advanced.headers["Location"]
+
+    completed = client.post(
+        f"/runs/{run_id}/api-changes/change-2/approve",
+        data={"view": "pending"},
+    )
+    assert "completed=1" in completed.headers["Location"]
 
 
 def test_api_change_refresh_explains_fact_authentication_failure(tmp_path):

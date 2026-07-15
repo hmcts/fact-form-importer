@@ -82,9 +82,13 @@ outputs.
 When the run uses live FaCT vocabularies, successful archive publication is
 followed by the required read-only live-section comparison scan. The API
 changes page therefore opens with current/submitted/effective results already
-prepared; reviewers approve only actual changes to populated sections. Its
-refresh control is a retry for interrupted scans or a deliberate recheck after
-live FaCT data changes. It never writes to FaCT.
+prepared and defaults to `Needs review`; empty, unchanged, and already approved
+sections remain available through `All sections` but do not clutter the working
+queue. Approving a live-data change advances to the next pending comparison.
+Its refresh control is a retry for interrupted scans or a deliberate recheck
+after live FaCT data changes. It never writes to FaCT. High-confidence model
+values may already be policy-approved, but live-data replacement remains a
+separate decision because a complete section diff has no LLM confidence score.
 
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --verify-addresses
