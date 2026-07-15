@@ -48,7 +48,7 @@ VerificationStatus = Literal[
 _ADDRESS_WORD_PATTERN = re.compile(r"[a-z0-9]+")
 _CARE_OF_PATTERN = re.compile(r"\bc\s*/\s*o\b", re.IGNORECASE)
 _UNSUPPORTED_POSTCODE_PREFIXES = re.compile(
-    r"^(?:ZE|KW|IV|HS|PH|AB|DD|PA|FK|G\d|KY|KA|DG|EH|ML|TD|BT|IM|JE|GY)",
+    r"^(?:BT|IM|JE|GY)",
     re.IGNORECASE,
 )
 

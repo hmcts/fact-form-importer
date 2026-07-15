@@ -13,6 +13,7 @@ from fact_form_importer.execution.report import (
 )
 from fact_form_importer.execution.service import ApiExecutionService
 from fact_form_importer.output.archive import publish_run_archive, stage_path
+from fact_form_importer.output.fact_api_manifest import API_MANIFEST_VERSION
 from fact_form_importer.validators.fact_api_courts import CourtReference
 
 
@@ -1011,6 +1012,113 @@ def test_preflight_blocks_historic_action_body_that_no_longer_meets_api_contract
     state = ledger.courts["example-court"].actions["example-court-1"]
     assert state.status == "blocked"
     assert "freeWaterDispensers" in state.reason
+    assert client.writes == []
+
+
+def test_execution_applies_blank_lift_minimums_to_a_legacy_action(tmp_path, monkeypatch):
+    reason = (
+        "liftDoorWidth is required by the FaCT API when lift is true; "
+        "liftDoorLimit is required by the FaCT API when lift is true"
+    )
+    action = {
+        "action_id": "example-court-1",
+        "resource": "accessibility_options",
+        "method": "POST",
+        "path": "/courts/court-id/v1/accessibility-options",
+        "readiness": "pending",
+        "reason": reason,
+        "source_row_number": 2,
+        "body": {
+            "courtId": "court-id",
+            "accessibleParking": False,
+            "accessibleEntrance": True,
+            "hearingEnhancementEquipment": "HEARING_LOOP_SYSTEMS",
+            "lift": True,
+            "quietRoom": False,
+        },
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    archive = tmp_path / "out" / "final" / run_id
+    report_path = archive / "api_readiness_report.json"
+    report = json.loads(report_path.read_text())
+    report["manifest_version"] = API_MANIFEST_VERSION
+    report_path.write_text(json.dumps(report))
+    (archive / "submissions_cleaned.json").write_text(
+        json.dumps(
+            [
+                {
+                    "source": {"source_row_number": 2},
+                    "facilities": {
+                        "lift_available": True,
+                        "lift_door_width": "n/k",
+                        "lift_weight_limit": "n/k",
+                    },
+                }
+            ]
+        )
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(target=ApiResponse(204), write=ApiResponse(201))
+
+    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).execute_action(
+        run_id, "example-court", "example-court-1"
+    )
+
+    state = ledger.courts["example-court"].actions["example-court-1"]
+    assert state.status == "succeeded"
+    assert client.writes[0][2]["liftDoorWidth"] == 1
+    assert client.writes[0][2]["liftDoorLimit"] == 1
+
+
+def test_execution_does_not_default_explicitly_invalid_legacy_lift_values(
+    tmp_path, monkeypatch
+):
+    action = {
+        "action_id": "example-court-1",
+        "resource": "accessibility_options",
+        "method": "POST",
+        "path": "/courts/court-id/v1/accessibility-options",
+        "readiness": "pending",
+        "reason": "liftDoorWidth is required by the FaCT API when lift is true",
+        "source_row_number": 2,
+        "body": {
+            "courtId": "court-id",
+            "accessibleParking": False,
+            "accessibleEntrance": True,
+            "hearingEnhancementEquipment": "HEARING_LOOP_SYSTEMS",
+            "lift": True,
+            "quietRoom": False,
+        },
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    archive = tmp_path / "out" / "final" / run_id
+    report_path = archive / "api_readiness_report.json"
+    report = json.loads(report_path.read_text())
+    report["manifest_version"] = API_MANIFEST_VERSION
+    report_path.write_text(json.dumps(report))
+    (archive / "submissions_cleaned.json").write_text(
+        json.dumps(
+            [
+                {
+                    "source": {"source_row_number": 2},
+                    "facilities": {
+                        "lift_available": True,
+                        "lift_door_width": "approximately wheelchair width",
+                    },
+                }
+            ]
+        )
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(target=ApiResponse(204), write=ApiResponse(201))
+
+    ledger = ApiExecutionService(tmp_path / "out", AppConfig(), client).execute_action(
+        run_id, "example-court", "example-court-1"
+    )
+
+    state = ledger.courts["example-court"].actions["example-court-1"]
+    assert state.status == "blocked"
+    assert "liftDoorWidth" in state.reason
     assert client.writes == []
 
 

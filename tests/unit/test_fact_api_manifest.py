@@ -1,3 +1,5 @@
+import pytest
+
 from fact_form_importer.models.court_submission import (
     Address,
     ContactDetail,
@@ -482,6 +484,39 @@ def test_manifest_uses_review_visible_defaults_for_blank_lift_measurements():
     assert manifest.summary["api_manifest_review_required_default_action_count"] == 1
 
 
+@pytest.mark.parametrize(
+    "unavailable_value", ["n/k", "u/k", "unknown", "Not known", "not sure", "N/A"]
+)
+def test_manifest_uses_minimum_for_known_unavailable_lift_measurements(unavailable_value):
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=7),
+        court_slug="example-court",
+        status="processed",
+        facilities={
+            "accessible_parking": True,
+            "accessible_entrance": True,
+            "hearing_enhancement_equipment": "Hearing loop systems are available at this court.",
+            "lift_available": True,
+            "lift_door_width": unavailable_value,
+            "lift_weight_limit": unavailable_value,
+            "quiet_room_available": False,
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+
+    action = next(
+        action
+        for action in manifest.records[0].actions
+        if action.resource == "accessibility_options"
+    )
+    assert action.readiness == "ready"
+    assert action.body["liftDoorWidth"] == 1
+    assert action.body["liftDoorLimit"] == 1
+
+
 def test_manifest_normalises_explicit_lift_measurement_units():
     submission = CourtSubmission(
         source=SourceMetadata(source_row_number=8),
@@ -557,7 +592,7 @@ def test_manifest_does_not_default_explicitly_invalid_or_missing_lift_answers():
             "hearing_enhancement_equipment": "Hearing loop systems are available at this court.",
             "lift_available": True,
             "lift_door_width": "0",
-            "lift_weight_limit": "not recorded",
+            "lift_weight_limit": "approximately several people",
             "quiet_room_available": False,
         },
     )
@@ -685,18 +720,6 @@ def test_fact_api_contract_validation_blocks_known_unrepresentable_values():
         == "care of Court and Tribunal"
     )
 
-    address_reason = validate_fact_api_action_body(
-        "address",
-        {
-            "courtId": "court-id",
-            "addressLine1": "1 Main Street",
-            "townCity": "Edinburgh",
-            "postcode": "EH1 1AA",
-            "addressType": "VISIT_US",
-        },
-    )
-    assert "Scotland" in address_reason
-
     contact_reason = validate_fact_api_action_body(
         "contact_detail",
         {
@@ -708,6 +731,20 @@ def test_fact_api_contract_validation_blocks_known_unrepresentable_values():
     )
     assert "phoneNumber" in contact_reason
     assert "email" in contact_reason
+
+
+def test_fact_api_contract_validation_allows_scottish_postcodes():
+    address_reason = validate_fact_api_action_body(
+        "address",
+        {
+            "courtId": "court-id",
+            "addressLine1": "1 Main Street",
+            "townCity": "Aberdeen",
+            "postcode": "AB10 1SH",
+            "addressType": "VISIT_US",
+        },
+    )
+    assert address_reason is None
 
     empty_times_reason = validate_fact_api_action_body(
         "counter_service_opening_hours",

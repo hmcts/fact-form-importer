@@ -32,6 +32,21 @@ _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
 MISSING_SUPPORT_PHONE_PLACEHOLDER = "00000000000"
 _REVIEW_REQUIRED_MIGRATION_DEFAULT_PREFIX = "Review-required migration default:"
+_UNAVAILABLE_LIFT_MEASUREMENT_MARKERS = {
+    "na",
+    "nk",
+    "uk",
+    "unknown",
+    "notknown",
+    "notsure",
+    "dontknow",
+    "donotknow",
+    "notrecorded",
+    "notprovided",
+    "notavailable",
+    "noidea",
+    "noideal",
+}
 
 # These expressions deliberately mirror the public FaCT Data API request
 # constraints. Keeping them here makes a rejected action reviewable before a
@@ -42,9 +57,6 @@ _FACT_API_EMAIL_PATTERN = re.compile(
     r"^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$"
 )
 _FACT_API_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-_FACT_API_SCOTLAND_POSTCODE_PATTERN = re.compile(
-    r"^(?:ZE|KW|IV|HS|PH|AB|DD|PA|FK|G\d|KY|KA|DG|EH|ML|TD)", re.IGNORECASE
-)
 _FACT_API_CI_IOM_POSTCODE_PATTERN = re.compile(r"^(?:IM|JE|GY)", re.IGNORECASE)
 _ADDRESS_CARE_OF_PATTERN = re.compile(r"\bc\s*/\s*o\b", re.IGNORECASE)
 _FACT_API_OPENING_DAYS = {"EVERYDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"}
@@ -539,14 +551,14 @@ def _accessibility_options_assumptions(facilities: dict[str, Any]) -> list[str]:
             "field. If live FaCT has no number to preserve, the effective request uses "
             f"{MISSING_SUPPORT_PHONE_PLACEHOLDER}. It does not amend the source or cleaned data."
         )
-    if facilities.get("lift_available") is True and _is_missing_form_value(
+    if facilities.get("lift_available") is True and is_unavailable_lift_measurement(
         facilities.get("lift_door_width")
     ):
         assumptions.append(
             "Review-required migration default: lift is marked available but the source has no "
             "door width, so this FaCT request uses 1 cm. It does not amend the source or cleaned data."
         )
-    if facilities.get("lift_available") is True and _is_missing_form_value(
+    if facilities.get("lift_available") is True and is_unavailable_lift_measurement(
         facilities.get("lift_weight_limit")
     ):
         assumptions.append(
@@ -1000,8 +1012,6 @@ def _address_validation_errors(body: dict[str, Any]) -> list[str]:
 
 def _fact_api_postcode_reason(postcode: str) -> str | None:
     compact = re.sub(r"\s+", "", postcode).upper()
-    if _FACT_API_SCOTLAND_POSTCODE_PATTERN.match(compact):
-        return "postcode is in Scotland, which the FaCT API does not support"
     if compact.startswith("BT"):
         return "postcode is in Northern Ireland, which the FaCT API does not support"
     if _FACT_API_CI_IOM_POSTCODE_PATTERN.match(compact):
@@ -1104,6 +1114,17 @@ def _is_missing_form_value(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+def is_unavailable_lift_measurement(value: Any) -> bool:
+    """Recognise a blank or explicit not-known answer, without accepting arbitrary prose."""
+
+    if _is_missing_form_value(value):
+        return True
+    if not isinstance(value, str):
+        return False
+    marker = re.sub(r"[^a-z0-9]+", "", value.casefold())
+    return marker in _UNAVAILABLE_LIFT_MEASUREMENT_MARKERS
+
+
 def _lift_measurement_for_request(
     value: Any,
     lift_available: Any,
@@ -1124,7 +1145,7 @@ def _lift_measurement_for_request(
     parsed = _parse_lift_measurement(value, measurement)
     if parsed is not None:
         return parsed
-    if lift_available is True and _is_missing_form_value(value):
+    if lift_available is True and is_unavailable_lift_measurement(value):
         return migration_default
     return None
 

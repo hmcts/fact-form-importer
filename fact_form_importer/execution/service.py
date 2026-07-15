@@ -47,6 +47,7 @@ from fact_form_importer.output.duplicate_review import select_authoritative_subm
 from fact_form_importer.output.archive import load_run_archive
 from fact_form_importer.output.fact_api_manifest import (
     API_MANIFEST_VERSION,
+    is_unavailable_lift_measurement,
     normalise_fact_api_action_body,
     validate_fact_api_action_body,
 )
@@ -83,6 +84,7 @@ class ApiExecutionService:
         self.approval_store = LlmApprovalStore(output_root)
         self.review_store = ExecutionReviewStore(output_root)
         self._llm_review_cache: dict[str, dict[str, Any]] = {}
+        self._submission_cache: dict[str, dict[int, dict[str, Any]]] = {}
         self._client = client
         self._postcode_lookup = RateLimitedPostcodeLookup(
             _unconfigured_postcode_lookup,
@@ -790,6 +792,9 @@ class ApiExecutionService:
         return ledger, added
 
     def _submissions_by_row(self, run_id: str) -> dict[int, dict[str, Any]]:
+        cached = self._submission_cache.get(run_id)
+        if cached is not None:
+            return cached
         archive = load_run_archive(self.output_root, run_id)
         if archive is None:
             return {}
@@ -800,7 +805,7 @@ class ApiExecutionService:
             submissions = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
-        return {
+        result = {
             int(row): submission
             for submission in submissions
             if isinstance(submission, dict)
@@ -808,6 +813,8 @@ class ApiExecutionService:
                 row := submission.get("source", {}).get("source_row_number"), int
             )
         }
+        self._submission_cache[run_id] = result
+        return result
 
     def _reset_dependent_actions(self, run_id: str, action_ids: set[str]) -> None:
         if not action_ids:
@@ -1254,9 +1261,11 @@ class ApiExecutionService:
                 )
                 continue
             approved_address = self._approved_address_item(action, review_report, approvals)
-            if action.get("readiness") != "ready" and not (
+            request_defaults = self._request_only_defaults(run_id, action)
+            legacy_reason_is_resolved = bool(
                 approved_address and _legacy_address_reason_is_only_blocker(action)
-            ):
+            ) or _legacy_lift_reason_is_only_blocker(action, request_defaults)
+            if action.get("readiness") != "ready" and not legacy_reason_is_resolved:
                 self._set_action(
                     ledger,
                     court_slug,
@@ -1613,6 +1622,7 @@ class ApiExecutionService:
                     body.pop(field, None)
                 else:
                     body[field] = value
+        body.update(self._request_only_defaults(run_id, action))
         if action.get("resource") != "professional_information":
             body["courtId"] = court_id
         return normalise_fact_api_action_body(str(action.get("resource") or ""), body)
@@ -1638,13 +1648,24 @@ class ApiExecutionService:
                         items[index].pop(field, None)
                     else:
                         items[index][field] = value
+        request_defaults = self._request_only_defaults(run_id, action)
         for item in items:
+            item.update(request_defaults)
             if action.get("resource") != "professional_information":
                 item["courtId"] = court_id
         return [
             normalise_fact_api_action_body(str(action.get("resource") or ""), item)
             for item in items
         ]
+
+    def _request_only_defaults(
+        self, run_id: str, action: dict[str, Any]
+    ) -> dict[str, int]:
+        source_row = action.get("source_row_number")
+        if not isinstance(source_row, int):
+            return {}
+        submission = self._submissions_by_row(run_id).get(source_row)
+        return _legacy_lift_request_defaults(action, submission)
 
     def _active_actions(
         self, run_id: str, record: dict[str, Any]
@@ -2403,6 +2424,55 @@ def _legacy_address_reason_is_only_blocker(action: dict[str, Any]) -> bool:
         return False
     expected = f"Address verification requires review: {evidence.get('message') or ''}"
     return str(action.get("reason") or "").strip() == expected.strip()
+
+
+def _legacy_lift_request_defaults(
+    action: dict[str, Any], submission: dict[str, Any] | None
+) -> dict[str, int]:
+    """Recover approved blank lift defaults for reports created before the policy."""
+
+    if action.get("resource") != "accessibility_options" or not isinstance(
+        submission, dict
+    ):
+        return {}
+    body = action.get("body")
+    if not isinstance(body, dict) or body.get("lift") is not True:
+        return {}
+    facilities = submission.get("facilities")
+    if not isinstance(facilities, dict):
+        cleaned = submission.get("cleaned")
+        facilities = cleaned.get("facilities") if isinstance(cleaned, dict) else None
+    if not isinstance(facilities, dict) or facilities.get("lift_available") is not True:
+        return {}
+
+    defaults = {}
+    for api_field, source_field in (
+        ("liftDoorWidth", "lift_door_width"),
+        ("liftDoorLimit", "lift_weight_limit"),
+    ):
+        source_value = facilities.get(source_field)
+        if body.get(api_field) is None and is_unavailable_lift_measurement(source_value):
+            defaults[api_field] = 1
+    return defaults
+
+
+def _legacy_lift_reason_is_only_blocker(
+    action: dict[str, Any], request_defaults: dict[str, int]
+) -> bool:
+    if not request_defaults:
+        return False
+    required_field_by_reason = {
+        "liftDoorWidth is required by the FaCT API when lift is true": "liftDoorWidth",
+        "liftDoorLimit is required by the FaCT API when lift is true": "liftDoorLimit",
+    }
+    reasons = {
+        reason.strip()
+        for reason in str(action.get("reason") or "").split(";")
+        if reason.strip()
+    }
+    return bool(reasons) and all(
+        required_field_by_reason.get(reason) in request_defaults for reason in reasons
+    )
 
 
 def _comparison_operation_validation_reason(

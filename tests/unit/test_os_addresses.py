@@ -132,6 +132,25 @@ def test_verification_handles_invalid_postcodes_and_unavailable_service_without_
     assert calls == ["SW1A 1AA"]
 
 
+def test_scottish_postcode_reaches_the_os_lookup():
+    submission = _submission(
+        Address(
+            index=1,
+            line_1="Court House",
+            town_or_city="Aberdeen",
+            postcode="AB10 1SH",
+        )
+    )
+    calls = []
+
+    batch = verify_submission_addresses(
+        [submission], lambda postcode: calls.append(postcode) or _Response(200, {})
+    )
+
+    assert calls == ["AB10 1SH"]
+    assert batch.verifications[0].status == "no_os_result"
+
+
 @pytest.mark.parametrize("line", ["PO Box 12", "P.O. Box 12", "P O Box 12", "P.O Box 12"])
 def test_po_box_variants_follow_the_ordinary_os_lookup(line):
     submission = _submission(

@@ -594,12 +594,21 @@ sent as integer centimetres, and limits carrying `kg`/`kgs` are sent as integer
 kilograms (for example, `800 mm` becomes `80` cm and `650KG` becomes `650` kg).
 Ambiguous prose, conflicting measurements, zero, and values that cannot be
 represented exactly as the required positive integer remain pending.
+Recognised whole-value unavailable answers such as `n/k`, `u/k`, `unknown`,
+`not known`, `not sure`, and `N/A` follow the blank-value minimum policy. Other
+unparseable descriptive text, conflicting measurements, and explicit zero do
+not.
 
 These defaults are request-only: raw and cleaned source data are unchanged, and
 each action displays a `Migration assumptions` entry in the UI/action plan.
 They are never used for an explicit zero, an unrecognised or ambiguous value,
 or a missing parent Yes/No answer; those actions remain pending. The data is
 then reviewed through the existing approval feature in `fact-admin-frontend`.
+Execution derives the same lift minimums for older archived actions created
+before this policy, but only when immutable cleaned source evidence confirms
+that `lift=true` and the dependent answer was blank or a recognised unavailable
+marker. Explicit invalid text remains blocked. A refreshed FaCT comparison displays the resulting
+effective request without modifying the archived action or submission.
 
 The action report is generated against the FaCT API contract in use at the
 time of the run. Before a write, the execution layer validates the body again
@@ -614,6 +623,10 @@ address action with the API's reason. A 429, timeout, or service outage is
 `unknown` and can be checked again later. The only request-body text repair is
 conventional address notation that FaCT rejects: `C/o` becomes `care of` and
 `&` becomes `and`; the archived raw submission is never changed.
+Scottish postcodes are supported following the FaCT Data API contract change in
+PR #313. The importer only pre-classifies `BT`, `IM`, `JE`, and `GY` postcode
+regions as unsupported; all valid Scottish postcodes proceed to the FaCT/OS
+lookup and normal address validation.
 Invalid API phone/email formats and unrepresentable opening-time data are also
 blocked before a write. A new `run` is still the best way to see these reasons
 in the immutable plan, while the same checks protect historic reports at
