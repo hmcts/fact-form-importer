@@ -9,7 +9,7 @@
 </nav>
 <section>
   <h2>What this step does</h2>
-  <p><strong>This is not a {{ comparison_summary.total }}-item approval queue.</strong> Run one read-only scan to fetch current FaCT sections and compare them with the submitted proposals. You do not need to click “Check current FaCT data” for every row.</p>
+  <p><strong>This is not a {{ comparison_summary.total }}-item approval queue.</strong> New workbook runs fetch current FaCT sections automatically after publishing the archive. This page shows those prepared comparisons; you review only real changes to populated live sections.</p>
   <ul>
     <li>No approval is needed when FaCT is empty or the effective result is unchanged.</li>
     <li>An approval is requested only when submitted values would change a populated live section.</li>
@@ -20,10 +20,15 @@
 <div class="summary">
   {% for label, value in [('Planned sections', comparison_summary.total), ('Checked', comparison_summary.checked), ('Not checked', comparison_summary.not_checked), ('No change', comparison_summary.no_change), ('Empty target', comparison_summary.empty_target), ('Need approval', comparison_summary.approval_required), ('Approved', comparison_summary.approved), ('Ambiguous matches', comparison_summary.conflicts)] %}<div><strong>{{ label }}</strong><br>{{ value }}</div>{% endfor %}
 </div>
+{% if comparison_summary.not_checked %}
+<p><strong>{{ comparison_summary.not_checked }} sections still need the read-only check.</strong> This normally means an older run or a scan that was interrupted or could not reach FaCT.</p>
 <form method="post" action="{{ url_for('refresh_api_changes', run_id=archive.manifest.run_id) }}">
   <input type="hidden" name="page" value="{{ page }}"><input type="hidden" name="hold" value="{{ hold or '' }}">
-  <button type="submit" class="secondary" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Read-only scan in progress…{% elif comparison_summary.not_checked %}Run read-only comparison scan for all sections{% else %}Refresh all FaCT comparisons{% endif %}</button>
+  <button type="submit" class="secondary" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Read-only scan in progress…{% else %}Retry the read-only comparison scan{% endif %}</button>
 </form>
+{% else %}
+<details><summary>Refresh because live FaCT data has changed since this run</summary><p>Refreshing is not part of ordinary review. Use it only to replace the prepared snapshots with current live data; changed snapshots invalidate their existing-data approvals.</p><form method="post" action="{{ url_for('refresh_api_changes', run_id=archive.manifest.run_id) }}"><input type="hidden" name="page" value="{{ page }}"><input type="hidden" name="hold" value="{{ hold or '' }}"><button type="submit" class="secondary" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Read-only scan in progress…{% else %}Refresh all FaCT comparisons{% endif %}</button></form></details>
+{% endif %}
 {% if comparison_job and comparison_job.scope == 'comparison' %}<p>Latest comparison scan: <strong>{{ comparison_job.state }}</strong>{% if comparison_job.error %}. {{ comparison_job.error }}{% endif %}</p>{% endif %}
 {% if hold %}<p>Filtered by <strong>{% if hold == 'target_replacement' %}existing-data approval{% elif hold == 'source_selection' %}legacy source selection{% else %}{{ hold | replace('_', ' ') }}{% endif %}</strong>. <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">Clear filter</a></p>{% endif %}
 {% if pages > 1 %}<nav class="pagination" aria-label="FaCT changes pages"><strong>Page {{ page }} of {{ pages }}</strong>{% if page > 1 %}<a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, hold=hold, page=page-1) }}">Previous page</a>{% endif %}{% if page < pages %}<a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, hold=hold, page=page+1) }}">Next page</a>{% endif %}</nav>{% endif %}

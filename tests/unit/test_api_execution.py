@@ -239,6 +239,7 @@ def test_partial_collection_failure_stops_deletion_and_refreshes_live_state(
 
 def test_refresh_all_comparisons_skips_unselected_duplicates_and_reports_failures(tmp_path):
     normal = _action("normal-action")
+    second_normal = _action("second-normal-action")
     duplicate = {
         **_action("duplicate-action"),
         "source_selection_required": True,
@@ -251,7 +252,7 @@ def test_refresh_all_comparisons_skips_unselected_duplicates_and_reports_failure
                 "court_slug": "example-court",
                 "court_id": "court-id",
                 "source_row_numbers": [2],
-                "actions": [normal],
+                "actions": [normal, second_normal],
             },
             {
                 "court_slug": "duplicate-court",
@@ -261,13 +262,14 @@ def test_refresh_all_comparisons_skips_unselected_duplicates_and_reports_failure
             },
         ],
     )
-    service = ApiExecutionService(
-        tmp_path / "out", AppConfig(), FakeFactApiClient(target=ApiResponse(204))
-    )
+    client = FakeFactApiClient(target=ApiResponse(204))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
 
     service.refresh_all_target_comparisons(run_id)
 
-    assert len(service.get_execution_review(run_id).comparisons) == 1
+    assert len(service.get_execution_review(run_id).comparisons) == 2
+    assert client.lookup_slugs == ["example-court"]
+    assert len(client.get_paths) == 2
 
     failing_root = tmp_path / "failing"
     failing_run = _archive(failing_root)

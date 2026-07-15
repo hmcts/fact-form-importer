@@ -694,7 +694,7 @@ def test_review_overview_and_api_change_routes_cover_value_source_and_target_gat
                         "model_result": {
                             "operation": "set",
                             "value": False,
-                            "confidence": "high",
+                            "confidence": "medium",
                             "needs_human_review": False,
                             "reason": "Safe test result",
                         },
@@ -748,7 +748,7 @@ def test_review_overview_and_api_change_routes_cover_value_source_and_target_gat
     assert approved_target.status_code == 302
     assert changes_page.status_code == 200
     assert b"This is not a 1-item approval queue" in changes_page.data
-    assert b"Run one read-only scan" in changes_page.data
+    assert b"New workbook runs fetch current FaCT sections automatically" in changes_page.data
     assert b"effective difference" in changes_page.data
     assert execution_client.writes == []
     assert client.get(

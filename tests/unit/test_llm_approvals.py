@@ -115,7 +115,7 @@ def test_field_policy_accepts_changed_high_confidence_sets_and_clears():
         }
     )
 
-    assert selected == {"exact", "changed", "format", "cleared", "blocked"}
+    assert selected == {"exact", "changed", "format", "cleared", "type", "blocked"}
 
 
 def test_field_policy_reconciliation_records_v2_provenance(tmp_path):

@@ -79,6 +79,13 @@ FaCT API-backed validation, issue/status calculation, API-aligned inspection
 JSON, endpoint action plan, NSU review workbook, and read-only approval user
 outputs.
 
+When the run uses live FaCT vocabularies, successful archive publication is
+followed by the required read-only live-section comparison scan. The API
+changes page therefore opens with current/submitted/effective results already
+prepared; reviewers approve only actual changes to populated sections. Its
+refresh control is a retry for interrupted scans or a deliberate recheck after
+live FaCT data changes. It never writes to FaCT.
+
 ```bash
 python3 -m fact_form_importer run --input "./input/microsoft-forms-export.xlsx" --output "./out" --verify-addresses
 ```

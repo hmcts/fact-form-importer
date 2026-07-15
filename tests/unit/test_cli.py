@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fact_form_importer.ingest.column_mapping import excel_column_index, load_column_mapping
+from fact_form_importer import cli
 from fact_form_importer.cli import main
 from fact_form_importer.llm.pipeline import LlmNormalisationResult, LlmUsageMetrics
 
@@ -61,6 +62,44 @@ def test_run_command_writes_processing_outputs(tmp_path, capsys, monkeypatch):
     assert summary["llm_requested"] is False
     assert summary["llm_calls"] == 0
     assert summary["address_verification_enabled"] is False
+
+
+def test_initial_fact_comparison_scan_reconciles_and_returns_live_counts(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    class FakeExecutionService:
+        def __init__(self, output_path):
+            calls.append(("init", output_path))
+
+        def reconcile_automatic_approvals(self, run_id):
+            calls.append(("approve", run_id))
+
+        def refresh_all_target_comparisons(self, run_id):
+            calls.append(("compare", run_id))
+
+        def get_execution_summary(self, run_id):
+            calls.append(("summary", run_id))
+            return {
+                "replacement_approval_counts": {
+                    "comparisons": 12,
+                    "not_checked": 0,
+                    "required": 3,
+                }
+            }
+
+    monkeypatch.setattr(cli, "ApiExecutionService", FakeExecutionService)
+
+    counts = cli._initial_fact_comparison_scan(tmp_path / "out", "run-1")
+
+    assert counts == {"checked": 12, "not_checked": 0, "approval_required": 3}
+    assert calls == [
+        ("init", tmp_path / "out"),
+        ("approve", "run-1"),
+        ("compare", "run-1"),
+        ("summary", "run-1"),
+    ]
 
 
 def test_run_command_requires_fact_api_configuration_for_address_verification(tmp_path, capsys, monkeypatch):

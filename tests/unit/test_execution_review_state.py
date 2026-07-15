@@ -150,3 +150,30 @@ def test_changed_live_snapshot_invalidates_previous_replacement_approval(tmp_pat
     store.save_comparison("run", changed)
 
     assert changed.change_id not in store.load("run").target_approvals
+
+
+def test_bulk_comparison_save_preserves_unchanged_approval_and_invalidates_changed_one(
+    tmp_path,
+):
+    store = ExecutionReviewStore(tmp_path)
+    first_action = {
+        "action_id": "court-first",
+        "resource": "building_facilities",
+        "method": "POST",
+        "path": "/courts/id/v1/building-facilities",
+        "body": {"parking": True},
+    }
+    second_action = {**first_action, "action_id": "court-second"}
+    first = build_target_comparison("court", first_action, {"parking": False})
+    second = build_target_comparison("court", second_action, {"parking": False})
+    store.save_comparisons("run", [first, second])
+    store.approve_target("run", first.change_id)
+    store.approve_target("run", second.change_id)
+
+    changed_second = build_target_comparison(
+        "court", second_action, {"parking": None}
+    )
+    ledger = store.save_comparisons("run", [first, changed_second])
+
+    assert first.change_id in ledger.target_approvals
+    assert changed_second.change_id not in ledger.target_approvals

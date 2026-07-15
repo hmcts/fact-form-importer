@@ -130,15 +130,23 @@ class ExecutionReviewStore:
     def save_comparison(
         self, run_id: str, comparison: TargetComparison
     ) -> ExecutionReviewLedger:
+        return self.save_comparisons(run_id, [comparison])
+
+    def save_comparisons(
+        self, run_id: str, comparisons: list[TargetComparison]
+    ) -> ExecutionReviewLedger:
+        """Atomically persist a comparison scan without rewriting per section."""
+
         with self._lock:
             ledger = self.load(run_id)
-            previous = ledger.comparisons.get(comparison.change_id)
-            ledger.comparisons[comparison.change_id] = comparison
-            if previous and (
-                previous.current_hash != comparison.current_hash
-                or previous.proposed_hash != comparison.proposed_hash
-            ):
-                ledger.target_approvals.pop(comparison.change_id, None)
+            for comparison in comparisons:
+                previous = ledger.comparisons.get(comparison.change_id)
+                ledger.comparisons[comparison.change_id] = comparison
+                if previous and (
+                    previous.current_hash != comparison.current_hash
+                    or previous.proposed_hash != comparison.proposed_hash
+                ):
+                    ledger.target_approvals.pop(comparison.change_id, None)
             return self.save(ledger)
 
     def approve_target(self, run_id: str, change_id: str) -> ExecutionReviewLedger:

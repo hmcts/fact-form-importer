@@ -159,29 +159,80 @@ class ApiExecutionService:
                 client.close()
 
     def refresh_all_target_comparisons(self, run_id: str) -> None:
+        """Fetch all live sections, batching court lookup and sidecar persistence."""
+
         report = self._readiness_report(run_id)
         failures: list[str] = []
-        for record in report.get("records", []):
-            court_slug = str(record.get("court_slug") or "")
-            try:
-                actions = self._active_actions(run_id, record)
-                if any(action.get("source_selection_required") for action in actions):
-                    selection = self.review_store.load(run_id).source_selections.get(court_slug)
-                    if selection is None:
-                        continue
-                for action in actions:
-                    self.refresh_target_comparison(
-                        run_id, court_slug, str(action.get("action_id") or "")
-                    )
-            except (ValueError, httpx.HTTPError) as exc:
-                if "Refresh FACT_DATA_API_BEARER_TOKEN" in str(exc):
-                    raise ValueError(str(exc)) from exc
-                failures.append(f"{court_slug}: {type(exc).__name__}")
+        comparisons: list[TargetComparison] = []
+        client, close = self._client_or_new()
+        review = self.review_store.load(run_id)
+        try:
+            for record in report.get("records", []):
+                court_slug = str(record.get("court_slug") or "")
+                try:
+                    actions = self._active_actions(run_id, record)
+                    if any(action.get("source_selection_required") for action in actions):
+                        if review.source_selections.get(court_slug) is None:
+                            continue
+                    court = client.lookup_court(court_slug)
+                    if court is None:
+                        raise ValueError("Court does not exist in FaCT")
+                    for action in actions:
+                        comparisons.append(
+                            self._target_comparison_with_client(
+                                run_id,
+                                court_slug,
+                                action,
+                                court.court_id,
+                                client,
+                            )
+                        )
+                except (ValueError, httpx.HTTPError) as exc:
+                    _, reason = _preflight_error_details("court lookup", exc)
+                    if "Refresh FACT_DATA_API_BEARER_TOKEN" in reason:
+                        raise ValueError(reason) from exc
+                    failures.append(f"{court_slug}: {type(exc).__name__}")
+        finally:
+            if close:
+                client.close()
+        if comparisons:
+            self.review_store.save_comparisons(run_id, comparisons)
         self._save_execution_summary(run_id)
         if failures:
             raise ValueError(
                 f"FaCT comparison scan completed with {len(failures)} court error(s)"
             )
+
+    def _target_comparison_with_client(
+        self,
+        run_id: str,
+        court_slug: str,
+        action: dict[str, Any],
+        court_id: str,
+        client: FactApiExecutionClient,
+    ) -> TargetComparison:
+        effective_action = dict(action)
+        effective_action["proposed_items"] = self._execution_items(
+            run_id, action, court_id
+        )
+        if action.get("resource") not in {
+            "address",
+            "contact_detail",
+            "court_opening_hours",
+        }:
+            effective_action["body"] = self._execution_body(run_id, action, court_id)
+        response = client.get(_preflight_path(str(action["path"])))
+        if response.status_code in {401, 403}:
+            raise ValueError(
+                f"FaCT API rejected the target section comparison "
+                f"(HTTP {response.status_code}). Refresh FACT_DATA_API_BEARER_TOKEN "
+                "and restart the importer UI."
+            )
+        if response.status_code not in {200, 204, 404}:
+            raise ValueError(
+                f"Target section comparison returned HTTP {response.status_code}"
+            )
+        return build_target_comparison(court_slug, effective_action, response.body)
 
     def approve_target_change(self, run_id: str, change_id: str) -> ExecutionReviewLedger:
         self._readiness_report(run_id)
@@ -195,6 +246,31 @@ class ApiExecutionService:
         execution = self.store.load(run_id)
         approval_ledger = self.approval_store.load(run_id)
         llm_report = self._llm_review_report(run_id)
+        obsolete_po_box_ids = {
+            str(item["review_id"])
+            for item in llm_report.get("items", [])
+            if item.get("address_mode") == "po_box" and item.get("review_id")
+        }
+        review_ids_by_action: dict[str, set[str]] = {
+            str(action.get("action_id") or ""): {
+                str(review_id)
+                for review_id in action.get("llm_review_ids", [])
+                if review_id and str(review_id) not in obsolete_po_box_ids
+            }
+            for record in report.get("records", [])
+            for action in record.get("actions", [])
+        }
+        for item in llm_report.get("items", []):
+            if (
+                not item.get("actionable")
+                or item.get("address_mode") == "po_box"
+                or not item.get("review_id")
+            ):
+                continue
+            for action_id in item.get("dependent_action_ids", []):
+                review_ids_by_action.setdefault(str(action_id), set()).add(
+                    str(item["review_id"])
+                )
         changes = []
         for record in report.get("records", []):
             court_slug = str(record.get("court_slug") or "")
@@ -214,7 +290,9 @@ class ApiExecutionService:
                     comparison_payload["differences"] = comparison_payload[
                         "effective_differences"
                     ]
-                review_ids = self._action_review_ids(action, llm_report)
+                review_ids = sorted(
+                    review_ids_by_action.get(str(action.get("action_id") or ""), set())
+                )
                 pending_value_holds = [
                     {
                         "review_id": review_id,
@@ -251,6 +329,8 @@ class ApiExecutionService:
                             execution,
                             approval_ledger,
                             llm_report,
+                            review_state=review,
+                            review_ids=review_ids,
                         ),
                     }
                 )
@@ -379,7 +459,7 @@ class ApiExecutionService:
         return {**report, "items": items, "approval_counts": _approval_counts(items)}
 
     def reconcile_automatic_approvals(self, run_id: str) -> LlmApprovalLedger:
-        """Apply the strict address policy without executing any FaCT action."""
+        """Apply versioned address and field policies without executing FaCT actions."""
 
         report = self._llm_review_report(run_id)
         approvals, added = self.approval_store.reconcile_policies(
@@ -1410,20 +1490,27 @@ class ApiExecutionService:
         ledger: ExecutionLedger,
         approvals: LlmApprovalLedger,
         review_report: dict[str, Any],
+        *,
+        review_state: ExecutionReviewLedger | None = None,
+        review_ids: list[str] | None = None,
     ) -> str:
         court = ledger.courts.get(court_slug)
         state = court.actions.get(str(action.get("action_id"))) if court else None
         status = state.status if state else "planned"
         if status in {"blocked", "failed", "unknown", "running", "succeeded"}:
             return status
-        review_state = self.review_store.load(run_id)
+        review_state = review_state or self.review_store.load(run_id)
         if action.get("source_selection_required"):
             selection = review_state.source_selections.get(court_slug)
             if selection is None:
                 return "awaiting_approval"
             if selection.source_row_number != action.get("source_row_number"):
                 return "not_selected"
-        review_ids = self._action_review_ids(action, review_report)
+        review_ids = (
+            review_ids
+            if review_ids is not None
+            else self._action_review_ids(action, review_report)
+        )
         if any(review_id not in approvals.approvals for review_id in review_ids):
             return "awaiting_approval"
         comparison = review_state.comparisons.get(

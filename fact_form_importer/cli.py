@@ -202,6 +202,13 @@ def run(
         return 1
 
     summary = result.output.summary
+    comparison_scan = None
+    comparison_scan_error = None
+    if summary.get("vocabulary_source") == "fact_data_api":
+        try:
+            comparison_scan = _initial_fact_comparison_scan(output_path, result.run_id)
+        except ValueError as exc:
+            comparison_scan_error = str(exc)
     print(f"Run ID: {result.run_id}")
     print(f"Source file: {input_path}")
     print(f"Workbook rows: {summary['row_count']}")
@@ -253,7 +260,33 @@ def run(
     print(f"Wrote address verification report: {result.address_verification_report_path}")
     print(f"Archived run: {result.archive.archive_path}")
     print(f"Wrote latest run outputs to: {output_path}")
+    if comparison_scan:
+        print(
+            "Initial FaCT comparison scan: "
+            f"{comparison_scan['checked']} checked, "
+            f"{comparison_scan['not_checked']} not checked, "
+            f"{comparison_scan['approval_required']} existing-data approvals required"
+        )
+    elif comparison_scan_error:
+        print(
+            f"Warning: Initial FaCT comparison scan needs retry: {comparison_scan_error}",
+            file=sys.stderr,
+        )
     return 0
+
+
+def _initial_fact_comparison_scan(output_path: Path, run_id: str) -> dict[str, int]:
+    """Populate the required read-only live comparison state for a new run."""
+
+    service = ApiExecutionService(output_path)
+    service.reconcile_automatic_approvals(run_id)
+    service.refresh_all_target_comparisons(run_id)
+    counts = service.get_execution_summary(run_id)["replacement_approval_counts"]
+    return {
+        "checked": int(counts.get("comparisons", 0)),
+        "not_checked": int(counts.get("not_checked", 0)),
+        "approval_required": int(counts.get("required", 0)),
+    }
 
 
 def llm_request_review(
