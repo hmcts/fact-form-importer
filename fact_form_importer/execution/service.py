@@ -26,10 +26,7 @@ from fact_form_importer.execution.models import (
     utc_now,
 )
 from fact_form_importer.execution.overlay import derive_latest_execution_overlay
-from fact_form_importer.execution.report import (
-    EXECUTION_SUMMARY_VERSION,
-    build_execution_summary,
-)
+from fact_form_importer.execution.report import build_execution_summary
 from fact_form_importer.execution.review_state import (
     ExecutionReviewLedger,
     ExecutionReviewStore,
@@ -602,14 +599,7 @@ class ApiExecutionService:
     def get_execution_summary(self, run_id: str) -> dict[str, Any]:
         report = self._llm_review_report(run_id)
         readiness = self._readiness_report(run_id)
-        approvals, added = self.approval_store.reconcile_policies(run_id, report, readiness)
-        existing = self.store.load_summary(run_id)
-        if (
-            not added
-            and existing is not None
-            and existing.get("summary_version") == EXECUTION_SUMMARY_VERSION
-        ):
-            return existing
+        approvals, _ = self.approval_store.reconcile_policies(run_id, report, readiness)
         summary = build_execution_summary(
             run_id,
             readiness,
@@ -617,6 +607,7 @@ class ApiExecutionService:
             review_report=report,
             approvals=approvals,
             execution_review=self.review_store.load(run_id),
+            submissions=self._review_summary_submissions(run_id),
         )
         return self.store.save_summary(run_id, summary)
 
@@ -743,8 +734,25 @@ class ApiExecutionService:
             review_report=review_report or self._llm_review_report(run_id),
             approvals=approvals or self.approval_store.load(run_id),
             execution_review=self.review_store.load(run_id),
+            submissions=self._review_summary_submissions(run_id),
         )
         return self.store.save_summary(run_id, summary)
+
+    def _review_summary_submissions(self, run_id: str) -> list[dict[str, Any]]:
+        submissions = self._submissions_by_row(run_id)
+        authoritative = self._authoritative_source_rows(run_id)
+        result = []
+        for row, submission in submissions.items():
+            if authoritative is not None and row not in authoritative:
+                continue
+            value = json.loads(json.dumps(submission))
+            value["issues"] = [
+                issue
+                for issue in value.get("issues", [])
+                if issue.get("code") != "DUPLICATE_COURT_SLUG"
+            ]
+            result.append(value)
+        return result
 
     @staticmethod
     def _batch_actions_to_attempt(
@@ -1510,11 +1518,17 @@ def _approval_counts(items: list[dict[str, Any]]) -> dict[str, int]:
         "auto_approved": sum(item.get("approval_method") == "policy" for item in approved),
         "auto_approved_total": len(policy_approved),
         "auto_approved_addresses": sum(
-            item.get("approval_policy_version") == "high-single-os-candidate-v1"
+            item.get("approval_policy_version")
+            in {"high-single-os-candidate-v1", "high-supplied-os-candidate-v2"}
             for item in policy_approved
         ),
         "auto_approved_unchanged_fields": sum(
             item.get("approval_policy_version") == "high-unchanged-field-v1"
+            for item in policy_approved
+        ),
+        "auto_approved_fields": sum(
+            item.get("approval_policy_version")
+            in {"high-unchanged-field-v1", "high-accepted-field-v2"}
             for item in policy_approved
         ),
         "pending": sum(item.get("approval_status") == "pending" for item in actionable),

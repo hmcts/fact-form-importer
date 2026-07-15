@@ -18,12 +18,13 @@
   <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Execution summary</a>
 </nav>
 <p><a class="button-link" href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}">Start or continue review</a></p>
+<h2>Form ingestion result</h2>
 <div class="summary">
-  {% for label, value in [('Form rows', summary.get('source_submission_count', summary.get('submission_count', status_total))),('Authoritative rows', summary.get('authoritative_submission_count', summary.get('submission_count', status_total))),('Superseded duplicate rows', summary.get('superseded_submission_count', 0)),('Unique court slugs', summary.get('unique_court_slug_count', factor_summary.unique_court_slug_count)),('Processed rows', summary.get('processed_count', 0)),('Warning rows', summary.get('processed_with_warnings_count', 0)),('Needs review rows', summary.get('needs_human_review_count', 0)),('Failed rows', summary.get('failed_count', 0)),('Addresses checked', summary.get('address_verification_count', 0)),('Address actions held', summary.get('address_verification_action_blocking_count', 0)),('Ready API actions', summary.get('api_manifest_ready_action_count', 0)),('Pending API actions', summary.get('api_manifest_pending_action_count', 0)),('Review-required defaults', summary.get('api_manifest_review_required_default_count', 0)),('LLM calls', summary.get('llm_calls', 0))] %}
+  {% for label, value in [('Form rows', summary.get('source_submission_count', summary.get('submission_count', status_total))),('Authoritative rows', summary.get('authoritative_submission_count', summary.get('submission_count', status_total))),('Superseded duplicate rows', summary.get('superseded_submission_count', 0)),('Unique court slugs', summary.get('unique_court_slug_count', factor_summary.unique_court_slug_count)),('Processed rows', summary.get('processed_count', 0)),('Warning rows', summary.get('processed_with_warnings_count', 0)),('Ingestion-review rows', summary.get('needs_human_review_count', 0)),('Failed rows', summary.get('failed_count', 0)),('Addresses checked', summary.get('address_verification_count', 0)),('LLM calls', summary.get('llm_calls', 0))] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
-<p class="muted">Operational status counts cover authoritative rows. Older duplicate submissions remain available in Records/Audit with a superseded label.</p>
+<p class="muted">These are immutable results from ingesting the workbook. Approving review decisions does not rewrite the archived ingestion status. Operational status counts cover authoritative rows; older duplicate submissions remain available in Records/Audit.</p>
 {% if factor_summary.llm_review_submission_count or factor_summary.os_action_blocking_submission_count %}
 <h2>Review Factors</h2>
 <div class="summary">
@@ -32,9 +33,32 @@
 </div>
 <p class="muted">LLM review rows have a model-specific issue that contributes to human review. OS-held addresses require a decision before that address action can be sent, but do not independently change the court row's import status.</p>
 {% endif %}
-<h2>API execution</h2>
+{% set review_progress = execution_summary.review_progress_counts %}
+<h2>Current review progress</h2>
+<p>These live figures update from the approval and comparison ledgers. Categories overlap; the unique court total counts each authoritative court once.</p>
 <div class="summary">
-  {% for label, value in [('Completed courts', execution_summary.court_status_counts.completed), ('Courts awaiting approval', execution_summary.court_status_counts.awaiting_approval), ('Courts needing attention', execution_summary.court_status_counts.attention_required), ('LLM approvals pending', execution_summary.llm_approval_counts.pending), ('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('Unchanged fields auto-approved', execution_summary.llm_approval_counts.auto_approved_unchanged_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Existing-data approvals pending', execution_summary.replacement_approval_counts.pending), ('Actions awaiting approval', execution_summary.action_status_counts.awaiting_approval), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  <div><strong>Unique courts needing review</strong><br><a href="{{ url_for('records', run_id=archive.manifest.run_id, work='outstanding') }}">{{ review_progress.unique_courts_outstanding }}</a></div>
+  <div><strong>Review decisions pending</strong><br>{{ review_progress.pending_value_decisions }}<br><span class="muted">across {{ review_progress.pending_value_decision_courts }} courts, including results without an API action</span></div>
+  <div><strong>Source corrections</strong><br>{{ review_progress.source_correction_items }}<br><span class="muted">across {{ review_progress.source_correction_courts }} courts</span></div>
+  <div><strong>Existing-data approvals pending</strong><br>{{ review_progress.existing_data_approvals_pending }}<br><span class="muted">across {{ review_progress.existing_data_approval_courts }} courts</span></div>
+  <div><strong>Ambiguous comparisons</strong><br>{{ review_progress.ambiguous_comparisons }}<br><span class="muted">across {{ review_progress.ambiguous_comparison_courts }} courts</span></div>
+  <div><strong>Invalid planned sections</strong><br>{{ review_progress.invalid_section_actions }}<br><span class="muted">across {{ review_progress.invalid_section_courts }} courts</span></div>
+  <div><strong>FaCT sections not yet compared</strong><br>{{ execution_summary.replacement_approval_counts.not_checked }}</div>
+</div>
+<p class="muted">Unchecked FaCT sections are not counted as human approvals: the read-only comparison scan must first determine whether live data would actually change.</p>
+
+<h2>Approval outcomes</h2>
+<div class="summary">
+  {% for label, value in [('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('High-confidence fields auto-approved', execution_summary.llm_approval_counts.auto_approved_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved)] %}
+  <div><strong>{{ label }}</strong><br>{{ value }}</div>
+  {% endfor %}
+</div>
+
+<h2>API execution</h2>
+<p>These figures cover the {{ execution_summary.selected_court_count }} courts that have planned API sections. They are separate from the immutable ingestion-review row count above.</p>
+<div class="summary">
+  <div><strong>Execution value dependencies pending</strong><br>{{ review_progress.pending_execution_value_dependencies }}<br><span class="muted">across {{ review_progress.pending_execution_value_dependency_courts }} planned courts</span></div>
+  {% for label, value in [('Planned courts', execution_summary.selected_court_count), ('Planned section actions', execution_summary.planned_action_count), ('Planned courts held by approvals', execution_summary.court_hold_counts.held_by_approvals), ('Section actions held by approvals', execution_summary.action_status_counts.awaiting_approval), ('Courts without a known approval hold', execution_summary.court_hold_counts.without_known_approval_hold), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts with blocked, failed or uncertain API outcomes', execution_summary.court_status_counts.attention_required), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>

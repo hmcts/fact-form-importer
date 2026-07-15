@@ -422,6 +422,7 @@ def test_llm_dependent_action_waits_for_every_approval_before_execution(tmp_path
         "auto_approved_total": 0,
         "auto_approved_addresses": 0,
         "auto_approved_unchanged_fields": 0,
+        "auto_approved_fields": 0,
         "pending": 0,
         "already_executed": 0,
         "not_actionable": 0,
@@ -1303,6 +1304,10 @@ def test_get_execution_summary_rebuilds_an_old_cached_report(tmp_path):
 
     assert summary["summary_version"] == EXECUTION_SUMMARY_VERSION
     assert summary["planned_action_count"] == 1
+    assert summary["replacement_approval_counts"]["not_checked"] == 1
+    assert summary["court_hold_counts"]["held_by_approvals"] == 0
+    assert summary["court_hold_counts"]["without_known_approval_hold"] == 1
+    assert "review_progress_counts" in summary
     assert service.store.load_summary(run_id) == summary
 
 

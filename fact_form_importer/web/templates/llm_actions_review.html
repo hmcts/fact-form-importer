@@ -33,7 +33,7 @@
 {% if approval_complete %}<p class="success" tabindex="-1" autofocus>All matching review decisions are complete.</p>{% endif %}
 {% if review.derived_from_legacy_archive %}<p class="muted">This page was reconstructed from a legacy archive. Some model confidence and reason details were not stored by that run.</p>{% endif %}
 <div class="summary">
-  {% for label, value in [('Reviewable results', review.approval_counts.reviewable_total), ('Review decisions pending', review.approval_counts.review_pending), ('Execution dependencies pending', review.approval_counts.pending), ('Automatically approved results', review.approval_counts.auto_approved_total), ('Automatically approved addresses', review.approval_counts.auto_approved_addresses), ('Automatically approved unchanged fields', review.approval_counts.auto_approved_unchanged_fields), ('Manually approved results', review.approval_counts.manual_approved), ('Already executed', review.approval_counts.already_executed)] %}
+  {% for label, value in [('Reviewable results', review.approval_counts.reviewable_total), ('Review decisions pending', review.approval_counts.review_pending), ('Execution dependencies pending', review.approval_counts.pending), ('Automatically approved results', review.approval_counts.auto_approved_total), ('Automatically approved addresses', review.approval_counts.auto_approved_addresses), ('Automatically approved high-confidence fields', review.approval_counts.auto_approved_fields), ('Manually approved results', review.approval_counts.manual_approved), ('Already executed', review.approval_counts.already_executed)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>

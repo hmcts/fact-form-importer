@@ -15,13 +15,16 @@ from fact_form_importer.output.archive import publish_run_archive, stage_path
 from fact_form_importer.validators.fact_api_courts import CourtReference
 from fact_form_importer.web.app import (
     LocalJobRunner,
+    _action_review_tasks_by_source_row,
     _action_evidence,
     _action_execution_status,
     _change_has_hold,
     _load_readiness_report,
     _operational_submissions,
+    _plain_record_action_reason,
     _raw_evidence_for_fields,
     _review_category,
+    _record_issue_guidance,
     _review_overview,
     _safe_job_error,
     _status_from_visible_issues,
@@ -167,6 +170,83 @@ def test_records_page_is_a_plain_language_todo_list_with_action_links(tmp_path):
     assert b"1 FaCT section action(s) are associated with this row" in detail.data
 
 
+def test_live_review_total_includes_processed_pending_value_and_refreshes_on_approval(
+    tmp_path,
+):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    submissions_path = archive_path / "submissions_cleaned.json"
+    submissions = json.loads(submissions_path.read_text())
+    submissions[0]["issues"] = [
+        {
+            "field": "facilities.accessible_toilet_description",
+            "code": "LLM_FIELD_NORMALISED",
+            "severity": "info",
+            "message": "LLM normalised a selected field",
+        }
+    ]
+    submissions_path.write_text(json.dumps([submissions[0]]))
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "processed-value",
+                        "kind": "field",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "facilities.accessible_toilet_description",
+                        "llm_input": {"cleaned_value": "Ground floor"},
+                        "model_result": {
+                            "operation": "set",
+                            "value": "Available on the ground floor.",
+                            "confidence": "medium",
+                            "needs_human_review": False,
+                            "reason": "Normalised wording",
+                        },
+                        "outcome": "accepted",
+                        "dependent_action_ids": ["example-court-1"],
+                        "actionable": True,
+                        "approvable": True,
+                    }
+                ],
+            }
+        )
+    )
+    client = create_app(output_root).test_client()
+
+    before = client.get(f"/runs/{run_id}/execution-summary.json").get_json()
+    landing = client.get("/")
+    outstanding = client.get(f"/runs/{run_id}/records?work=outstanding")
+    ingestion_review = client.get(
+        f"/runs/{run_id}/records?status=needs_human_review"
+    )
+
+    assert before["review_progress_counts"]["unique_courts_outstanding"] == 1
+    assert before["review_progress_counts"]["pending_value_decisions"] == 1
+    assert before["review_progress_counts"]["pending_value_decision_courts"] == 1
+    assert b"Unique courts needing review" in landing.data
+    assert b"work=outstanding" in landing.data
+    assert b"example-court" in outstanding.data
+    assert b"example-court" not in ingestion_review.data
+
+    approved = client.post(
+        f"/runs/{run_id}/llm-actions/processed-value/approve"
+    )
+    after = client.get(f"/runs/{run_id}/execution-summary.json").get_json()
+    run_page = client.get(f"/runs/{run_id}")
+    completed_queue = client.get(f"/runs/{run_id}/records?work=outstanding")
+
+    assert approved.status_code == 302
+    assert after["review_progress_counts"]["unique_courts_outstanding"] == 0
+    assert after["review_progress_counts"]["pending_value_decisions"] == 0
+    assert b"Form ingestion result" in run_page.data
+    assert b"Current review progress" in run_page.data
+    assert b"Ingestion-review rows" in run_page.data
+    assert b"example-court" not in completed_queue.data
+
+
 def test_review_queue_classification_and_hold_filters():
     assert _review_category("", "DUPLICATE_COURT_SLUG") == "court_identity_duplicates"
     assert _review_category("addresses[1].postcode") == "addresses"
@@ -209,6 +289,77 @@ def test_review_queue_classification_and_hold_filters():
     }
     assert _change_has_hold(replacement, "target_replacement")
     assert _change_has_hold(replacement, "unknown-filter")
+
+
+def test_record_action_tasks_and_issue_guidance_cover_each_human_remedy():
+    changes = [
+        {"source_row_number": None, "source_row_numbers": [2, 3]},
+        {
+            "source_row_number": 2,
+            "comparison": {"merge_conflicts": ["duplicate contact type"]},
+            "action": {"readiness": "ready"},
+        },
+        {
+            "source_row_number": 2,
+            "comparison": {"merge_conflicts": ["another conflict"]},
+            "action": {"readiness": "ready"},
+        },
+        {
+            "source_row_numbers": [3],
+            "comparison": {"has_existing_data": True, "is_no_change": False},
+            "target_approved": False,
+            "action": {"readiness": "ready"},
+        },
+        {
+            "source_row_number": 4,
+            "comparison": None,
+            "action": {
+                "readiness": "pending",
+                "reason": "courtId and addressLine1 are required",
+            },
+        },
+        {
+            "source_row_number": 5,
+            "comparison": {"has_existing_data": False, "is_no_change": True},
+            "action": {"readiness": "ready"},
+        },
+    ]
+
+    tasks = _action_review_tasks_by_source_row(changes)
+
+    assert tasks[2] == [
+        {
+            "state": "changes",
+            "label": "Resolve an ambiguous FaCT match in Step 2",
+            "remedy": "Review the live and proposed typed entries before this section can run.",
+        }
+    ]
+    assert tasks[3][0]["label"] == "Approve a live FaCT change in Step 2"
+    assert tasks[4][0]["state"] == "court"
+    assert "court identifier" in tasks[4][0]["remedy"]
+    assert "address line 1" in tasks[4][0]["remedy"]
+    assert 5 not in tasks
+    assert _plain_record_action_reason(None) is None
+
+    court = _record_issue_guidance(
+        {"code": "COURT_SLUG_NOT_FOUND", "field": "court_slug"}, []
+    )
+    address = _record_issue_guidance(
+        {"code": "ADDRESS_OS_REVIEW_REQUIRED", "field": "addresses[1]"}, []
+    )
+    pending = _record_issue_guidance(
+        {"code": "LLM_LOW_CONFIDENCE", "field": "contacts[1].explanation"},
+        [{"approval_status": "pending"}],
+    )
+    complete = _record_issue_guidance(
+        {"code": "LLM_FIELD_NORMALISED", "field": "contacts[1].explanation"},
+        [{"approval_status": "approved"}],
+    )
+
+    assert court["state"] == "source" and "cannot create or guess" in court["remedy"]
+    assert address["state"] == "source" and "No approvable address" in address["remedy"]
+    assert pending["state"] == "review"
+    assert complete["state"] == "complete"
 
 
 def test_llm_actions_page_displays_evidence_and_approves_without_executing(tmp_path):
@@ -505,7 +656,7 @@ def test_llm_actions_page_labels_strict_address_policy_approval(tmp_path):
 
     assert page.status_code == 200
     assert b"Automatically approved" in page.data
-    assert b"high-single-os-candidate-v1" in page.data
+    assert b"high-supplied-os-candidate-v2" in page.data
     assert b"Save address and continue" not in page.data
     assert b"Edit approved address" in page.data
     assert b"Save edited address" in page.data

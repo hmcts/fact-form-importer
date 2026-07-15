@@ -2,14 +2,16 @@ import json
 
 from fact_form_importer.execution.approvals import (
     ADDRESS_AUTO_APPROVAL_POLICY_VERSION,
+    ADDRESS_AUTO_APPROVAL_POLICY_VERSIONS,
     APPROVAL_LEDGER_VERSION,
+    FIELD_AUTO_APPROVAL_POLICY_VERSION,
     LlmApprovalStore,
     policy_eligible_address_review_ids,
-    policy_eligible_unchanged_field_review_ids,
+    policy_eligible_high_confidence_field_review_ids,
 )
 
 
-def test_strict_address_policy_rejects_ambiguous_and_non_actionable_results():
+def test_address_policy_accepts_supplied_multi_candidate_high_result_only():
     eligible = _item("eligible")
     multiple = _item("multiple", candidates=[{"uprn": "uprn-1"}, {"uprn": "uprn-2"}])
     medium = _item("medium", confidence="medium")
@@ -35,7 +37,7 @@ def test_strict_address_policy_rejects_ambiguous_and_non_actionable_results():
         _readiness(),
     )
 
-    assert selected == {"eligible"}
+    assert selected == {"eligible", "multiple"}
 
 
 def test_policy_reconciliation_is_atomic_idempotent_and_preserves_manual_approvals(tmp_path):
@@ -54,6 +56,10 @@ def test_policy_reconciliation_is_atomic_idempotent_and_preserves_manual_approva
     assert second.approvals["automatic"].approval_method == "policy"
     assert second.approvals["automatic"].policy_version == ADDRESS_AUTO_APPROVAL_POLICY_VERSION
     assert second.approvals["automatic"].approved_at == first_timestamp
+    assert ADDRESS_AUTO_APPROVAL_POLICY_VERSIONS == {
+        "high-single-os-candidate-v1",
+        "high-supplied-os-candidate-v2",
+    }
     assert not store.path_for("run-1").with_suffix(".json.tmp").exists()
 
 
@@ -82,7 +88,7 @@ def test_legacy_approval_ledger_defaults_existing_entries_to_manual(tmp_path):
     assert ledger.approvals["review-1"].approval_method == "manual"
 
 
-def test_unchanged_field_policy_requires_exact_high_confidence_safe_set():
+def test_field_policy_accepts_changed_high_confidence_sets_and_clears():
     exact = _field_item("exact")
     changed = _field_item("changed", value="Different")
     format_only = _field_item("format", cleaned="Ground floor", value="ground floor")
@@ -93,7 +99,7 @@ def test_unchanged_field_policy_requires_exact_high_confidence_safe_set():
     type_changed = _field_item("type", cleaned=True, value="True")
     blocked = _field_item("blocked", actionable=False)
 
-    selected = policy_eligible_unchanged_field_review_ids(
+    selected = policy_eligible_high_confidence_field_review_ids(
         {
             "items": [
                 exact,
@@ -109,7 +115,18 @@ def test_unchanged_field_policy_requires_exact_high_confidence_safe_set():
         }
     )
 
-    assert selected == {"exact", "blocked"}
+    assert selected == {"exact", "changed", "format", "cleared", "blocked"}
+
+
+def test_field_policy_reconciliation_records_v2_provenance(tmp_path):
+    store = LlmApprovalStore(tmp_path / "out")
+
+    ledger, added = store.reconcile_policies(
+        "run-1", {"items": [_field_item("changed", value="Different")]}, _readiness()
+    )
+
+    assert added == 1
+    assert ledger.approvals["changed"].policy_version == FIELD_AUTO_APPROVAL_POLICY_VERSION
 
 
 def test_address_override_records_hash_and_policy_decision_history(tmp_path):

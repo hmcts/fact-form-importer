@@ -115,6 +115,9 @@ def test_normalise_fields_with_llm_uses_structured_json_output(monkeypatch):
     assert "Available on the ground, first and third floors." in prompt
     assert "National Contact Centre for Civil and Family Court" in prompt
     assert "operation 'clear'" in prompt
+    assert "Exampleton Tribunal" in prompt
+    assert "test-uprn-offices" in prompt
+    assert '"postcode"' not in prompt
 
 
 def test_llm_response_schema_requires_every_object_property_for_azure():

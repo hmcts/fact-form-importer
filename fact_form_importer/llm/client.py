@@ -10,7 +10,13 @@ from pydantic import ValidationError
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.llm.prompts import SYSTEM_PROMPT, build_llm_input
-from fact_form_importer.llm.schemas import LlmField, LlmNormalisationRequest, LlmNormalisationResponse
+from fact_form_importer.llm.schemas import (
+    LlmAddressCandidate,
+    LlmAddressCandidateRequest,
+    LlmField,
+    LlmNormalisationRequest,
+    LlmNormalisationResponse,
+)
 
 
 class LlmResponseParseError(ValueError):
@@ -241,4 +247,31 @@ def build_llm_test_request() -> LlmNormalisationRequest:
                 "Do not invent a new type.",
             ],
         },
+        address_candidates=[
+            LlmAddressCandidateRequest(
+                address_index=1,
+                submitted_address={
+                    "line_1": None,
+                    "line_2": "1 Justice Way",
+                    "town_or_city": "Exampleton",
+                    "county": None,
+                },
+                candidates=[
+                    LlmAddressCandidate(
+                        uprn="test-uprn-tribunal",
+                        organisation_name="Exampleton Tribunal",
+                        building_number="1",
+                        thoroughfare_name="Justice Way",
+                        post_town="Exampleton",
+                    ),
+                    LlmAddressCandidate(
+                        uprn="test-uprn-offices",
+                        organisation_name="Exampleton Offices",
+                        building_number="1",
+                        thoroughfare_name="Justice Way",
+                        post_town="Exampleton",
+                    ),
+                ],
+            )
+        ],
     )

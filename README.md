@@ -621,13 +621,14 @@ not erase prior execution evidence.
 Runs that use the LLM also archive `llm_actions_review.json`. It records each
 field result and unresolved-address comparison, including the exact safe LLM
 input, OS candidates, selected UPRN, proposed address mapping, and dependent API
-actions. Normalised fields and non-policy address selections must be approved
-individually in the local review UI. A strict versioned policy automatically
-approves an address only when the model selected the sole supplied OS candidate
-with high confidence, did not request review, and the result has an actionable
-address dependency. The prompt treats a plausible first-line discrepancy as a
-weaker signal, but still rejects conflicting town/street/building evidence,
-multiple plausible candidates, and matches requiring invented information.
+actions. Medium/low-confidence, unresolved, or review-flagged model results
+must be approved individually in the local review UI. A strict versioned policy
+automatically approves an address when the model selected any supplied OS
+candidate with high confidence, did not request review, and the result has an
+actionable address dependency. The prompt treats a plausible first-line
+discrepancy as a weaker signal, but still rejects conflicting
+town/street/building evidence, competing plausible institutional candidates,
+and matches requiring invented information.
 Approvals are idempotent, do not execute an API request, and are stored outside
 the immutable archive in `out/llm-approval-state/<run-id>.json`, with manual or
 policy provenance. An action with one or more unapproved LLM dependencies
@@ -635,10 +636,12 @@ remains `awaiting_approval`. Approved OS mappings are applied only to the
 eventual request body, and execution confirms that the selected UPRN is still
 returned before writing.
 
-Policy `high-unchanged-field-v1` also approves accepted `set` results when the
-typed proposed value exactly equals the cleaned submitted value, confidence is
-high, and the model did not request review. Format-only changes, clears,
-unresolved results, and medium/low confidence remain reviewable. Reviewers may
+Policy `high-accepted-field-v2` approves every accepted high-confidence field
+`set` or allowlisted `clear` result when the model did not request human review,
+including changed wording and format-only changes. Earlier
+`high-unchanged-field-v1` decisions remain valid and distinguishable in the
+ledger. Unresolved, review-flagged, and medium/low-confidence results remain
+reviewable. Reviewers may
 edit the five address text components shown on the LLM actions page before
 execution. The ledger stores the canonical approved patch and its hash while
 the archived OS/LLM evidence remains unchanged. Editing an automatic approval
@@ -749,12 +752,20 @@ ready/pending action counts, and the count of visible request-only migration
 defaults. It also records how many API actions and LLM results initially await
 field-level approval; the mutable execution summary reports the current pending
 and approved counts. High-confidence address selections are automatically
-approved only when the model selected the sole supplied OS candidate, did not
-request review, and the result has an actionable address API dependency. The
+approved when the model selected a supplied OS candidate with high confidence,
+did not request review, and the result has an actionable address API dependency.
+The selected UPRN must be present in the exact candidate list; this applies to
+single- and multi-candidate lookups. The
 versioned approval ledger records these as policy approvals; multi-candidate,
-medium/low-confidence and changed results remain manual or read-only. Exact
+medium/low-confidence, null and conflicting results remain manual or read-only. Exact
 unchanged high-confidence fields use a separate policy, including when another
 blocker means no API action currently depends on the result.
+For sparse submitted addresses, the prompt tells the model that every candidate
+already came from the submitted postcode lookup. Consistent line 2 and town
+evidence may be combined with a uniquely plausible OS organisation/building
+name identifying a court or tribunal. The generic institutional word alone is
+never sufficient, and multiple plausible or conflicting candidates remain for
+review. The postcode and court slug stay outside the model request.
 Automatic approval never executes a FaCT request, and address execution still
 performs the fresh-UPRN, target-section and snapshot-bound effective-change preflights. In a
 normal run, `vocabulary_source` should be
@@ -798,7 +809,12 @@ python3 -m fact_form_importer serve --output "./out"
 ```
 
 The landing page lists every valid `out/final/<run_id>/run_manifest.json` from
-newest to oldest. Each run has a primary `/workflow` page with three guided,
+newest to oldest. Its live `Unique courts needing review` column deduplicates
+outstanding value decisions, source corrections, confirmed existing-data
+approvals, ambiguous comparisons and invalid planned sections by authoritative
+court. It links to `/records?work=outstanding`, which can include processed rows
+with a pending model-derived value; `status=needs_human_review` remains the
+immutable ingestion-result filter. Each run has a primary `/workflow` page with three guided,
 non-locking steps: review LLM/address values, refresh and approve FaCT changes,
 then review and execute courts. `/courts` lists one authoritative row per court
 and links to `/courts/<court_slug>`, the canonical per-court comparison and
@@ -835,6 +851,12 @@ to category queues. LLM rows show highlighted submitted-versus-proposed text;
 addresses mark line one as a weaker matching signal; API changes show current
 live data, the submitted proposal, the effective merged result, preserved
 values, component differences and resulting POST/PUT operations.
+The run page separates immutable form-ingestion results from live review
+progress and API execution. Review-decision counts include approvable results
+without an API action, while execution-dependency counts include only results
+holding planned sections. Current-state summaries are regenerated from the
+mutable approval, comparison and execution ledgers when viewed; approving a
+result never rewrites archived ingestion counts.
 The FaCT-change page labels the full action count as planned sections awaiting
 one read-only scan, not as an approval count. Its summary distinguishes
 unchecked, unchanged, empty-target, approval-required, approved and ambiguous

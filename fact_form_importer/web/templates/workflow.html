@@ -11,7 +11,7 @@
 
 <section class="workflow-step" id="step-1">
   <h2>1. Review LLM and address results</h2>
-  <p><strong>{{ workflow.llm_pending }}</strong> approvals pending from {{ workflow.llm_total }} review results.</p>
+  <p><strong>{{ workflow.llm_pending }}</strong> review decisions pending from {{ workflow.llm_total }} results. <span class="muted">{{ workflow.llm_execution_pending }} currently hold planned API sections; the remainder are still reviewable evidence on blocker-affected rows.</span></p>
   <a class="button-link" href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending') if workflow.llm_pending else url_for('llm_actions_review', run_id=archive.manifest.run_id) }}">{% if workflow.llm_pending %}Continue LLM review{% else %}View completed LLM review{% endif %}</a>
 </section>
 

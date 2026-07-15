@@ -215,8 +215,15 @@ def create_app(
     @app.get("/")
     def index():
         archives = list_run_archives(output_root)
+        service = app.config["EXECUTION_SERVICE"]
         for archive in archives:
             archive["factor_summary"] = _run_factor_summary(archive)
+            try:
+                archive["execution_summary"] = service.get_execution_summary(
+                    str(archive["manifest"]["run_id"])
+                )
+            except ValueError:
+                archive["execution_summary"] = {"review_progress_counts": {}}
         return render_template(
             "index.html",
             archives=archives,
@@ -367,20 +374,16 @@ def create_app(
         service = app.config["EXECUTION_SERVICE"]
         readiness = service.get_readiness_report(run_id)
         llm_review = service.get_llm_actions_review(run_id)
+        changes = service.get_api_changes_review(run_id).get("changes", [])
         records_by_row = _manifest_records_by_source_row(readiness)
         review_items_by_row = _llm_review_items_by_source_row(llm_review)
+        action_tasks_by_row = _action_review_tasks_by_source_row(changes)
         status = request.args.get("status")
+        work = request.args.get("work")
         category = request.args.get("category")
         query = (request.args.get("q") or "").strip().casefold()
-        filtered = [
-            submission
-            for submission in submissions
-            if (not status or submission.get("status") == status)
-            and (not category or _submission_has_review_category(submission, category))
-            and _matches_record_query(submission, query)
-        ]
         ledger = service.get_ledger(run_id)
-        for submission in filtered:
+        for submission in submissions:
             court = ledger.courts.get(submission.get("court_slug"))
             submission["execution_status"] = court.status if court else "not_started"
             row = submission.get("source", {}).get("source_row_number")
@@ -388,7 +391,16 @@ def create_app(
                 submission,
                 review_items_by_row.get(row, []),
                 records_by_row.get(row),
+                action_tasks_by_row.get(row, []),
             )
+        filtered = [
+            submission
+            for submission in submissions
+            if (not status or submission.get("status") == status)
+            and (work != "outstanding" or submission.get("outstanding_work"))
+            and (not category or _submission_has_review_category(submission, category))
+            and _matches_record_query(submission, query)
+        ]
         queue_summary = _record_queue_summary(filtered)
         page, pages, records_page = _paginate(filtered, request.args.get("page"))
         return render_template(
@@ -396,6 +408,7 @@ def create_app(
             archive=archive,
             records=records_page,
             status=status,
+            work=work,
             category=category,
             query=query,
             page=page,
@@ -447,6 +460,11 @@ def create_app(
             submission,
             _llm_review_items_by_source_row(llm_review).get(source_row_number, []),
             _manifest_records_by_source_row(manifest).get(source_row_number),
+            _action_review_tasks_by_source_row(
+                app.config["EXECUTION_SERVICE"].get_api_changes_review(run_id).get(
+                    "changes", []
+                )
+            ).get(source_row_number, []),
         )
         return render_template(
             "record_detail.html",
@@ -1128,7 +1146,11 @@ def _workflow_payload(run_id: str, service: ApiExecutionService) -> dict[str, An
     llm = service.get_llm_actions_review(run_id)
     changes = service.get_api_changes_review(run_id).get("changes", [])
     execution = service.get_execution_summary(run_id)
-    llm_pending = int(llm.get("approval_counts", {}).get("pending", 0))
+    approval_counts = llm.get("approval_counts", {})
+    llm_pending = int(
+        approval_counts.get("review_pending", approval_counts.get("pending", 0))
+    )
+    llm_execution_pending = int(approval_counts.get("pending", 0))
     comparisons = _comparison_summary(changes)
     comparison_pending = comparisons["not_checked"]
     change_approval_pending = comparisons["approval_required"]
@@ -1140,6 +1162,7 @@ def _workflow_payload(run_id: str, service: ApiExecutionService) -> dict[str, An
     return {
         "first_incomplete": first_incomplete,
         "llm_pending": llm_pending,
+        "llm_execution_pending": llm_execution_pending,
         "llm_total": llm.get("item_count", 0),
         "comparison_pending": comparison_pending,
         "change_approval_pending": change_approval_pending,
@@ -1298,6 +1321,7 @@ def _add_record_review_guidance(
     submission: dict[str, Any],
     review_items: list[dict[str, Any]],
     manifest_record: dict[str, Any] | None,
+    action_review_tasks: list[dict[str, str]] | None = None,
 ) -> None:
     """Describe whether each archived issue needs a decision, source fix, or no action."""
 
@@ -1321,6 +1345,77 @@ def _add_record_review_guidance(
         issue.get("review_guidance", {}).get("state") == "source"
         for issue in submission.get("issues", [])
     )
+    submission["action_review_tasks"] = action_review_tasks or []
+    submission["outstanding_work"] = bool(
+        submission["pending_value_review_count"]
+        or submission["source_task_count"]
+        or submission["action_review_tasks"]
+    )
+
+
+def _action_review_tasks_by_source_row(
+    changes: list[dict[str, Any]],
+) -> dict[int, list[dict[str, str]]]:
+    result: dict[int, list[dict[str, str]]] = {}
+    seen: set[tuple[int, str, str]] = set()
+    for change in changes:
+        row = change.get("source_row_number")
+        if not isinstance(row, int):
+            rows = change.get("source_row_numbers", [])
+            row = rows[0] if len(rows) == 1 and isinstance(rows[0], int) else None
+        if not isinstance(row, int):
+            continue
+        comparison = change.get("comparison")
+        task: dict[str, str] | None = None
+        if isinstance(comparison, dict) and comparison.get("merge_conflicts"):
+            task = {
+                "state": "changes",
+                "label": "Resolve an ambiguous FaCT match in Step 2",
+                "remedy": "Review the live and proposed typed entries before this section can run.",
+            }
+        elif (
+            isinstance(comparison, dict)
+            and comparison.get("has_existing_data")
+            and not comparison.get("is_no_change")
+            and not change.get("target_approved")
+        ):
+            task = {
+                "state": "changes",
+                "label": "Approve a live FaCT change in Step 2",
+                "remedy": "Review and approve the exact current-versus-merged section difference.",
+            }
+        elif change.get("action", {}).get("readiness") == "pending":
+            task = {
+                "state": "court",
+                "label": "The proposed API section needs attention",
+                "remedy": _plain_record_action_reason(
+                    change.get("action", {}).get("reason")
+                )
+                or "Review the proposed section and its validation reason.",
+            }
+        if task is None:
+            continue
+        key = (row, task["state"], task["label"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.setdefault(row, []).append(task)
+    return result
+
+
+def _plain_record_action_reason(value: Any) -> str | None:
+    if not value:
+        return None
+    text = str(value).strip().rstrip(".")
+    replacements = {
+        "courtId": "court identifier",
+        "addressLine1": "address line 1",
+        "townCity": "town or city",
+        "courtContactDescriptionId": "contact description",
+    }
+    for internal, friendly in replacements.items():
+        text = text.replace(internal, friendly)
+    return text + "."
 
 
 def _matching_llm_review_items(

@@ -21,6 +21,10 @@ def test_prompt_treats_line_one_as_weaker_without_allowing_conflicting_matches()
     assert "line_1 as a weaker matching signal" in SYSTEM_PROMPT
     assert "non-line_1 details conflict" in SYSTEM_PROMPT
     assert "candidate remains plausible" in SYSTEM_PROMPT
+    assert "already came from the submitted postcode lookup" in SYSTEM_PROMPT
+    assert "organisation_name or building_name" in SYSTEM_PROMPT
+    assert 'generic word "court" or "tribunal" is never sufficient' in SYSTEM_PROMPT
+    assert "multiple institutional candidates remain plausible" in SYSTEM_PROMPT
 
 
 def test_review_report_records_field_and_barnet_style_address_evidence(tmp_path):

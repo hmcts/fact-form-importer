@@ -14,13 +14,23 @@ from fact_form_importer.execution.models import utc_now
 
 
 APPROVAL_LEDGER_VERSION = "1.2"
-ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-single-os-candidate-v1"
+LEGACY_ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-single-os-candidate-v1"
+ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-supplied-os-candidate-v2"
+ADDRESS_AUTO_APPROVAL_POLICY_VERSIONS = {
+    LEGACY_ADDRESS_AUTO_APPROVAL_POLICY_VERSION,
+    ADDRESS_AUTO_APPROVAL_POLICY_VERSION,
+}
 ADDRESS_AUTO_APPROVAL_RATIONALE = (
-    "High-confidence address selected the sole supplied OS candidate without requesting review"
+    "High-confidence address selected a supplied OS candidate without requesting review"
 )
-UNCHANGED_FIELD_AUTO_APPROVAL_POLICY_VERSION = "high-unchanged-field-v1"
-UNCHANGED_FIELD_AUTO_APPROVAL_RATIONALE = (
-    "High-confidence field result exactly matches the cleaned submitted value"
+LEGACY_UNCHANGED_FIELD_AUTO_APPROVAL_POLICY_VERSION = "high-unchanged-field-v1"
+FIELD_AUTO_APPROVAL_POLICY_VERSION = "high-accepted-field-v2"
+FIELD_AUTO_APPROVAL_POLICY_VERSIONS = {
+    LEGACY_UNCHANGED_FIELD_AUTO_APPROVAL_POLICY_VERSION,
+    FIELD_AUTO_APPROVAL_POLICY_VERSION,
+}
+FIELD_AUTO_APPROVAL_RATIONALE = (
+    "High-confidence accepted field result did not request human review"
 )
 
 
@@ -134,10 +144,12 @@ class LlmApprovalStore:
         eligible.update(
             {
                 review_id: (
-                    UNCHANGED_FIELD_AUTO_APPROVAL_POLICY_VERSION,
-                    UNCHANGED_FIELD_AUTO_APPROVAL_RATIONALE,
+                    FIELD_AUTO_APPROVAL_POLICY_VERSION,
+                    FIELD_AUTO_APPROVAL_RATIONALE,
                 )
-                for review_id in policy_eligible_unchanged_field_review_ids(review_report)
+                for review_id in policy_eligible_high_confidence_field_review_ids(
+                    review_report
+                )
             }
         )
         with self._lock:
@@ -184,7 +196,7 @@ class LlmApprovalStore:
 def policy_eligible_address_review_ids(
     review_report: dict[str, Any], readiness_report: dict[str, Any]
 ) -> set[str]:
-    """Return actionable address review IDs that satisfy the strict automatic policy."""
+    """Return actionable high-confidence selections of supplied OS candidates."""
 
     address_action_ids = {
         str(action["action_id"])
@@ -199,32 +211,34 @@ def policy_eligible_address_review_ids(
     }
 
 
-def policy_eligible_unchanged_field_review_ids(
+def policy_eligible_high_confidence_field_review_ids(
     review_report: dict[str, Any],
 ) -> set[str]:
-    """Return exact, high-confidence field results which introduce no change."""
+    """Return accepted high-confidence field results safe for policy approval."""
 
     eligible: set[str] = set()
     for item in review_report.get("items", []):
         result = item.get("model_result")
-        llm_input = item.get("llm_input")
         if (
             item.get("kind") != "field"
             or item.get("outcome") != "accepted"
             or not item.get("review_id")
             or not isinstance(result, dict)
-            or not isinstance(llm_input, dict)
-            or result.get("operation") != "set"
+            or result.get("operation") not in {"set", "clear"}
             or result.get("confidence") != "high"
             or result.get("needs_human_review") is not False
         ):
             continue
-        before = llm_input.get("cleaned_value")
-        if before is None:
-            before = llm_input.get("raw_value")
-        if type(before) is type(result.get("value")) and before == result.get("value"):
-            eligible.add(str(item["review_id"]))
+        eligible.add(str(item["review_id"]))
     return eligible
+
+
+def policy_eligible_unchanged_field_review_ids(
+    review_report: dict[str, Any],
+) -> set[str]:
+    """Compatibility alias for callers using the former policy helper name."""
+
+    return policy_eligible_high_confidence_field_review_ids(review_report)
 
 
 def _is_policy_eligible_address_item(item: dict[str, Any], address_action_ids: set[str]) -> bool:
@@ -250,11 +264,13 @@ def _is_policy_eligible_address_item(item: dict[str, Any], address_action_ids: s
         or result.get("needs_human_review") is not False
         or not selected_uprn
         or not isinstance(candidates, list)
-        or len(candidates) != 1
-        or not isinstance(candidates[0], dict)
     ):
         return False
-    return str(candidates[0].get("uprn") or "") == selected_uprn
+    return any(
+        isinstance(candidate, dict)
+        and str(candidate.get("uprn") or "") == selected_uprn
+        for candidate in candidates
+    )
 
 
 def _canonical_hash(value: Any) -> str:
