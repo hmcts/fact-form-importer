@@ -15,6 +15,7 @@
       <p class="muted">The original submitted slug remains unchanged in the archive. All provisional actions for this row use the validated target above.</p>
       <details><summary>Change validated target</summary><form method="post" action="{{ url_for('select_court_target', run_id=archive.manifest.run_id, source_row_number=submission.source.source_row_number) }}"><label for="target-slug">Different existing FaCT court slug</label><input id="target-slug" name="target_slug" required><button type="submit" class="secondary">Validate and change court</button></form></details>
     {% else %}
+      {% if court_disposition %}<p class="success"><strong>Closed as unactionable.</strong> {{ court_disposition.rationale }}</p>{% else %}
       <p>The submitted slug <code>{{ court_target_resolution.submitted_slug }}</code> was not found in FaCT. Enter a different slug only when you have identified the same court in FaCT.</p>
       {% if court_target_resolution.suggestion %}<p class="muted">Earlier automated suggestion (not selected): {{ court_target_resolution.suggestion.suggested_court_name }} · <code>{{ court_target_resolution.suggestion.suggested_slug }}</code></p>{% endif %}
       {% if court_target_error %}<p class="error">{{ court_target_error }}</p>{% endif %}
@@ -24,6 +25,8 @@
         <button type="submit" class="secondary">Validate and use this court</button>
       </form>
       <p class="muted">This is a read-only FaCT lookup. A target already used by another source row is rejected to prevent two distinct forms being silently combined.</p>
+      <details><summary>No defensible FaCT match exists</summary><form method="post" action="{{ url_for('close_unactionable_court', run_id=archive.manifest.run_id, source_row_number=submission.source.source_row_number) }}"><label for="unactionable-reason">Reason for closing as unactionable</label><textarea id="unactionable-reason" name="rationale" rows="3" required></textarea><button type="submit" class="secondary">Close as unactionable</button></form><p class="muted">This suppresses unsucceeded actions and removes the court from outstanding work. It does not change archived evidence or write to FaCT.</p></details>
+      {% endif %}
     {% endif %}
   </div>
   {% endif %}

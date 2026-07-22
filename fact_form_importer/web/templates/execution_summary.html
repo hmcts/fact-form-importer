@@ -6,6 +6,7 @@
   <a href="{{ url_for('courts', run_id=archive.manifest.run_id) }}">Courts and actions</a>
   <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
   <a href="{{ url_for('execution_summary_json', run_id=archive.manifest.run_id) }}">Download JSON</a>
+  <a href="{{ url_for('business_report', run_id=archive.manifest.run_id) }}">Business outcome report</a>
   <a href="#request-types">By request type</a>
   <a href="#attention-actions">Per-court attention list</a>
 </nav>
@@ -14,6 +15,8 @@
   <h2>Execution job</h2>
   <p><strong>{{ execution_job.scope | capitalize }}</strong> job · <strong>{{ execution_job.state }}</strong>{% if execution_job.court_slug %} · {{ execution_job.court_slug }}{% endif %}{% if execution_job.action_id %} · <code>{{ execution_job.action_id }}</code>{% endif %}</p>
   <p class="muted">Queued {{ execution_job.created_at }}{% if execution_job.started_at %} · Started {{ execution_job.started_at }}{% endif %}{% if execution_job.completed_at %} · Finished {{ execution_job.completed_at }}{% endif %}</p>
+  {% if execution_job.progress.total_courts %}<p><strong>{{ execution_job.progress.completed_courts }} of {{ execution_job.progress.total_courts }} courts processed.</strong></p>{% endif %}
+  {% if execution_job.timing.wall_seconds %}<p class="muted">Elapsed job time: {{ execution_job.timing.wall_seconds }} seconds.</p>{% endif %}
   {% if execution_job.error %}<p class="error">{{ execution_job.error }}</p>{% endif %}
 </section>
 {% endif %}

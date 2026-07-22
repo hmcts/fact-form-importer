@@ -10,10 +10,11 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from fact_form_importer.execution.atomic_state import atomic_write_json, file_lock
 from fact_form_importer.execution.models import utc_now
 
 
-APPROVAL_LEDGER_VERSION = "1.3"
+APPROVAL_LEDGER_VERSION = "1.5"
 LEGACY_ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-single-os-candidate-v1"
 ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-supplied-os-candidate-v2"
 ADDRESS_AUTO_APPROVAL_POLICY_VERSIONS = {
@@ -50,6 +51,9 @@ class LlmApproval(BaseModel):
     rationale: Optional[str] = None
     approved_address_patch: Optional[dict[str, Optional[str]]] = None
     approved_value_hash: Optional[str] = None
+    approved_field_value: Optional[str] = None
+    field_value_overridden: bool = False
+    omitted: bool = False
     decision_history: list[ApprovalDecision] = Field(default_factory=list)
 
 
@@ -76,14 +80,18 @@ class LlmApprovalStore:
         return self.directory / f"{run_id}.json"
 
     def load(self, run_id: str) -> LlmApprovalLedger:
+        with file_lock(self.path_for(run_id)):
+            return self._load_unlocked(run_id)
+
+    def _load_unlocked(self, run_id: str) -> LlmApprovalLedger:
         path = self.path_for(run_id)
         if not path.exists():
             return LlmApprovalLedger(run_id=run_id)
         return LlmApprovalLedger.model_validate_json(path.read_text(encoding="utf-8"))
 
     def approve(self, run_id: str, review_id: str) -> LlmApprovalLedger:
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             changed = ledger.denials.pop(review_id, None) is not None
             if review_id not in ledger.approvals:
                 ledger.approvals[review_id] = LlmApproval(review_id=review_id)
@@ -98,8 +106,8 @@ class LlmApprovalStore:
     ) -> tuple[LlmApprovalLedger, int]:
         """Atomically approve pending IDs while preserving explicit denials."""
 
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             added = 0
             for review_id in sorted(review_ids):
                 if review_id in ledger.approvals or review_id in ledger.denials:
@@ -111,22 +119,75 @@ class LlmApprovalStore:
                 self._save(ledger)
             return ledger, added
 
-    def deny(self, run_id: str, review_id: str) -> LlmApprovalLedger:
+    def deny(self, run_id: str, review_id: str, rationale: str) -> LlmApprovalLedger:
         """Record a final human decision not to use a pending LLM result."""
 
-        with self._lock:
-            ledger = self.load(run_id)
-            if review_id not in ledger.denials:
-                ledger.denials[review_id] = LlmDenial(review_id=review_id)
+        rationale = rationale.strip()
+        if not rationale:
+            raise ValueError("Enter a reason for denying this result")
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
+            existing = ledger.denials.get(review_id)
+            if existing is None or existing.rationale != rationale:
+                ledger.denials[review_id] = LlmDenial(
+                    review_id=review_id, rationale=rationale
+                )
                 ledger.ledger_version = APPROVAL_LEDGER_VERSION
                 self._save(ledger)
+            return ledger
+
+    def approve_field(
+        self,
+        run_id: str,
+        review_id: str,
+        value: str | None,
+        *,
+        omitted: bool = False,
+        rationale: str | None = None,
+    ) -> LlmApprovalLedger:
+        """Approve the exact text (or omission) used for an optional reviewed field."""
+
+        if omitted:
+            value = None
+            rationale = (rationale or "").strip()
+            if not rationale:
+                raise ValueError("Enter a reason for omitting this optional value")
+        else:
+            value = (value or "").strip()
+            if not value:
+                raise ValueError("Enter the field value to approve")
+            if len(value) > 250:
+                raise ValueError("Contact explanations must be 250 characters or fewer")
+            rationale = "Reviewer approved the displayed field text"
+        value_hash = _canonical_hash({"value": value, "omitted": omitted})
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
+            existing = ledger.approvals.get(review_id)
+            if (
+                existing
+                and existing.approved_value_hash == value_hash
+                and existing.rationale == rationale
+            ):
+                return ledger
+            ledger.approvals[review_id] = LlmApproval(
+                review_id=review_id,
+                approval_method="manual",
+                rationale=rationale,
+                approved_value_hash=value_hash,
+                approved_field_value=value,
+                field_value_overridden=True,
+                omitted=omitted,
+            )
+            ledger.denials.pop(review_id, None)
+            ledger.ledger_version = APPROVAL_LEDGER_VERSION
+            self._save(ledger)
             return ledger
 
     def reconsider(self, run_id: str, review_id: str) -> tuple[LlmApprovalLedger, bool]:
         """Return a denied result to the pending queue."""
 
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             removed = ledger.denials.pop(review_id, None) is not None
             if removed:
                 ledger.ledger_version = APPROVAL_LEDGER_VERSION
@@ -142,8 +203,8 @@ class LlmApprovalStore:
         """Record the exact reviewer-approved address while retaining decision history."""
 
         value_hash = _canonical_hash(address_patch)
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             existing = ledger.approvals.get(review_id)
             if (
                 existing
@@ -203,8 +264,8 @@ class LlmApprovalStore:
                 )
             }
         )
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             added = 0
             for review_id in sorted(eligible):
                 if review_id in ledger.approvals or review_id in ledger.denials:
@@ -236,12 +297,7 @@ class LlmApprovalStore:
         ledger.updated_at = utc_now()
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.path_for(ledger.run_id)
-        temp_path = path.with_suffix(path.suffix + ".tmp")
-        temp_path.write_text(
-            json.dumps(ledger.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        temp_path.replace(path)
+        atomic_write_json(path, ledger.model_dump(mode="json"))
 
 
 def policy_eligible_address_review_ids(
@@ -278,10 +334,21 @@ def policy_eligible_high_confidence_field_review_ids(
             or result.get("operation") not in {"set", "clear"}
             or result.get("confidence") != "high"
             or result.get("needs_human_review") is not False
+            or _requires_manual_overlength_review(item)
         ):
             continue
         eligible.add(str(item["review_id"]))
     return eligible
+
+
+def _requires_manual_overlength_review(item: dict[str, Any]) -> bool:
+    if not str(item.get("field") or "").endswith(".explanation"):
+        return False
+    llm_input = item.get("llm_input")
+    if not isinstance(llm_input, dict):
+        return False
+    submitted = llm_input.get("cleaned_value")
+    return isinstance(submitted, str) and len(submitted) > 250
 
 
 def policy_eligible_unchanged_field_review_ids(

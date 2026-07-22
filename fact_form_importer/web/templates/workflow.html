@@ -18,7 +18,7 @@
 <section class="workflow-step" id="step-2">
   <h2>2. Review changes to live FaCT data</h2>
   {% if workflow.comparison_pending %}
-  <p><strong>{{ workflow.comparison_total }}</strong> planned court sections are awaiting one read-only FaCT comparison scan. This is not an approval queue: the number of genuine existing-data approvals is unknown until the scan finishes.</p>
+  <p><strong>{{ workflow.comparison_pending }}</strong> of {{ workflow.comparison_total }} planned court sections still need the read-only FaCT comparison scan. This is not an approval queue: a section becomes a human decision only when the scan finds a non-empty live value that would change.</p>
   <p class="muted">{{ workflow.comparison_checked }} checked so far · {{ workflow.comparison_pending }} not checked.</p>
   {% else %}
   <p>All {{ workflow.comparison_total }} planned sections have been checked: <strong>{{ workflow.change_approval_pending }}</strong> existing-data changes need approval, {{ workflow.comparison_approved }} are approved and {{ workflow.comparison_no_approval }} need no existing-data approval. <strong>{{ workflow.merge_conflicts }}</strong> of the checked sections contain ambiguous submitted entries that remain blocked.</p>

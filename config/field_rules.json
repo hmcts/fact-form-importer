@@ -314,6 +314,8 @@
       "rules": [
         "Make the text suitable for public display.",
         "Preserve the meaning of the contact explanation.",
+        "The result must be no more than 250 characters, including punctuation.",
+        "If the submitted explanation is longer than 250 characters, shorten it factually and set needs_human_review to true so a reviewer can approve or edit it.",
         "Remove days, opening times and closing times because those belong in the structured opening-hours fields.",
         "If removing the schedule leaves only a generic contact-centre label or no useful public explanation, use operation 'clear' with value null.",
         "For example, 'National Contact Centre for Civil and Family Court, Monday to Thursday 9am to 5pm, Friday 9am to 4:30pm' must be cleared because no useful explanation remains.",

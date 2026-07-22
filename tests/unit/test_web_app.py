@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlparse
 from zipfile import ZIP_STORED, ZipFile
 
 import httpx
+from werkzeug.datastructures import FileStorage
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.fact_api import ApiResponse
@@ -511,14 +512,19 @@ def test_llm_deny_then_bulk_approve_excludes_denied_and_never_writes(tmp_path):
     pending = client.get(f"/runs/{run_id}/llm-actions?status=pending")
     denied = client.post(
         f"/runs/{run_id}/llm-actions/deny-me/deny",
-        data={"review_status": "pending", "field_page": "1", "address_page": "1"},
+        data={
+            "review_status": "pending",
+            "field_page": "1",
+            "address_page": "1",
+            "rationale": "This does not match the submitted evidence",
+        },
     )
     denied_page = client.get(f"/runs/{run_id}/llm-actions?status=denied")
     bulk = client.post(f"/runs/{run_id}/llm-actions/approve-all")
     bulk_page = client.get(bulk.headers["Location"])
 
     assert b"Deny and continue" in pending.data
-    assert b"Approve all 3 remaining results" in pending.data
+    assert b"Approve all eligible remaining results" in pending.data
     assert denied.headers["Location"].endswith("#review-approve-one")
     assert b"Reconsider" in denied_page.data
     assert "bulk_approved=2" in bulk.headers["Location"]
@@ -654,6 +660,146 @@ def test_missing_court_target_can_be_validated_without_writing_and_collision_is_
     assert b"Resolved with a validated FaCT court target" in resolved_record_page.data
     assert b"validated-court" in resolved_record_page.data
     assert execution_client.writes == []
+
+
+def test_duplicate_item_resolution_unactionable_closure_and_business_downloads(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    readiness_path = archive_path / "api_readiness_report.json"
+    readiness = json.loads(readiness_path.read_text())
+    readiness["manifest_version"] = "2.0"
+    action = readiness["records"][0]["actions"][0]
+    action.update(
+        {
+            "resource": "contact_detail",
+            "proposed_items": [
+                {
+                    "courtContactDescriptionId": "old-type",
+                    "phoneNumber": "020 1111 1111",
+                }
+            ],
+            "proposed_item_ids": ["source-item-1"],
+            "proposed_item_source_fields": [["contacts[1]"]],
+        }
+    )
+    readiness_path.write_text(json.dumps(readiness))
+    (archive_path / "fact_vocabularies.json").write_text(
+        json.dumps(
+            {
+                "vocabularies": {
+                    "contact_description_types": [
+                        {"name": "Enquiries", "code": "ENQUIRIES", "api_id": "new-type"}
+                    ]
+                }
+            }
+        )
+    )
+    submissions_path = archive_path / "submissions_cleaned.json"
+    submissions = json.loads(submissions_path.read_text())
+    submissions[1]["issues"] = [
+        {
+            "field": "court_slug",
+            "code": "COURT_SLUG_NOT_FOUND",
+            "message": "Court was not found",
+        }
+    ]
+    submissions_path.write_text(json.dumps(submissions))
+    service = ApiExecutionService(output_root, AppConfig(), _FakeExecutionClient())
+    client = create_app(output_root, execution_service=service).test_client()
+
+    remapped = client.post(
+        f"/runs/{run_id}/api-changes/example-court-1/items/source-item-1/resolve",
+        data={
+            "decision": "remap",
+            "replacement_type_id": "new-type",
+            "rationale": "The reviewer confirmed the enquiries type",
+            "change_id": "change",
+        },
+    )
+    closed = client.post(
+        f"/runs/{run_id}/records/3/close-unactionable",
+        data={"rationale": "No defensible FaCT court match exists"},
+    )
+
+    assert remapped.status_code == 302
+    resolution = service.get_execution_review(run_id).collection_item_resolutions[
+        "source-item-1"
+    ]
+    assert resolution.replacement_type_id == "new-type"
+    assert closed.status_code == 302
+    assert service.get_execution_review(run_id).court_dispositions["3"].rationale == (
+        "No defensible FaCT court match exists"
+    )
+    assert client.get(f"/runs/{run_id}/business-report").status_code == 200
+    assert client.get(f"/runs/{run_id}/business-report.md").status_code == 200
+    assert client.get(f"/runs/{run_id}/business-report.csv").status_code == 200
+    assert client.get(f"/runs/{run_id}/business-report.json").status_code == 200
+
+
+def test_review_mutation_routes_return_plain_400_errors_and_record_redirects(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+    client = create_app(output_root).test_client()
+
+    assert client.post(
+        f"/runs/{run_id}/records/3/close-unactionable", data={"rationale": ""}
+    ).status_code == 400
+    assert client.post(
+        f"/runs/{run_id}/api-changes/missing/items/missing/resolve",
+        data={"decision": "invalid", "rationale": "Test"},
+    ).status_code == 400
+    assert client.post(
+        f"/runs/{run_id}/api-changes/missing/refresh",
+        data={"court_slug": "missing"},
+    ).status_code == 400
+    assert client.post(
+        f"/runs/{run_id}/api-changes/missing/approve"
+    ).status_code == 400
+    invalid_target = client.post(
+        f"/runs/{run_id}/records/3/court-target", data={"target_slug": "INVALID SLUG"}
+    )
+    assert invalid_target.status_code == 302
+    assert "/records/3?" in invalid_target.headers["Location"]
+
+
+def test_bulk_change_approval_surfaces_validation_error(tmp_path, monkeypatch):
+    output_root, run_id = _archive(tmp_path)
+    service = ApiExecutionService(output_root, AppConfig(), _FakeExecutionClient())
+
+    def fail(_run_id):
+        raise ValueError("comparison changed")
+
+    monkeypatch.setattr(service, "approve_all_target_changes", fail)
+    client = create_app(output_root, execution_service=service).test_client()
+
+    response = client.post(f"/runs/{run_id}/api-changes/approve-all")
+
+    assert response.status_code == 400
+    assert b"comparison changed" in response.data
+
+
+def test_ui_import_starts_retryable_comparison_and_keeps_archive_on_scan_failure(tmp_path):
+    started = []
+
+    def processor(**kwargs):
+        return SimpleNamespace(
+            run_id="new-run",
+            output=SimpleNamespace(summary={"vocabulary_source": "fact_data_api"}),
+        )
+
+    def comparison_starter(run_id):
+        started.append(run_id)
+        raise ValueError("temporary comparison failure")
+
+    runner = LocalJobRunner(tmp_path, processor, comparison_starter)
+    job = runner.start(
+        FileStorage(stream=io.BytesIO(b"a,b\n"), filename="forms.csv"),
+        use_llm=False,
+        llm_enabled=False,
+    )
+    runner.executor.shutdown(wait=True)
+
+    assert runner.get(job.job_id).state == "completed"
+    assert started == ["new-run"]
 
 
 def test_llm_review_explains_missing_court_in_plain_english(tmp_path):

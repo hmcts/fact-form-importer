@@ -2,6 +2,9 @@ import pytest
 
 from fact_form_importer.execution.review_state import (
     CourtTargetOverride,
+    CollectionItemResolution,
+    CourtDisposition,
+    ExecutionReviewLedger,
     ExecutionReviewStore,
     build_target_comparison,
 )
@@ -150,8 +153,8 @@ def test_merge_adds_required_zero_phone_only_when_live_and_submitted_values_are_
         },
     )
 
-    assert missing.proposed["accessibleEntrancePhoneNumber"] == "00000000000"
-    assert missing.proposed["liftSupportPhoneNumber"] == "00000000000"
+    assert missing.proposed["accessibleEntrancePhoneNumber"] == "+44 0000000000"
+    assert missing.proposed["liftSupportPhoneNumber"] == "+44 0000000000"
     assert preserved.proposed["accessibleEntrancePhoneNumber"] == "020 7000 0001"
     assert preserved.proposed["liftSupportPhoneNumber"] == "020 7000 0002"
 
@@ -316,3 +319,112 @@ def test_bulk_target_approval_is_atomic_validated_and_idempotent(tmp_path):
     assert approved.target_approvals[valid.change_id].approved_at == repeated.target_approvals[
         valid.change_id
     ].approved_at
+
+
+def test_collection_merge_collapses_exact_and_complementary_contacts():
+    action = {
+        "action_id": "court-contacts",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/id/v1/contact-details",
+        "proposed_items": [
+            {"courtContactDescriptionId": "type-1", "phoneNumber": "020 1234 5678"},
+            {"courtContactDescriptionId": "type-1", "email": "court@example.test"},
+            {"courtContactDescriptionId": "type-2", "phoneNumber": "0300 123 4567"},
+            {"courtContactDescriptionId": "type-2", "phoneNumber": "0300 123 4567"},
+        ],
+    }
+
+    comparison = build_target_comparison("court", action, [])
+
+    assert comparison.merge_conflicts == []
+    assert len(comparison.proposed) == 2
+    assert comparison.proposed[0]["phoneNumber"] == "020 1234 5678"
+    assert comparison.proposed[0]["email"] == "court@example.test"
+
+
+def test_collection_merge_keeps_conflicting_duplicate_contacts_blocked():
+    action = {
+        "action_id": "court-contacts",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/id/v1/contact-details",
+        "proposed_items": [
+            {"courtContactDescriptionId": "type-1", "phoneNumber": "020 1111 1111"},
+            {"courtContactDescriptionId": "type-1", "phoneNumber": "020 2222 2222"},
+        ],
+    }
+
+    comparison = build_target_comparison("court", action, [])
+
+    assert comparison.operations == []
+    assert comparison.merge_conflicts == [
+        "Multiple contact detail entries use business type 'type-1'"
+    ]
+
+
+def test_review_store_recovers_valid_json_prefix_and_keeps_corrupt_original(tmp_path):
+    store = ExecutionReviewStore(tmp_path)
+    path = store.path_for("run")
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        ExecutionReviewLedger(run_id="run").model_dump_json() + " trailing corruption",
+        encoding="utf-8",
+    )
+
+    recovered = store.load("run")
+
+    assert recovered.run_id == "run"
+    assert ExecutionReviewLedger.model_validate_json(path.read_text()).run_id == "run"
+    assert list(path.parent.glob("run.json.corrupt-*"))
+
+
+def test_item_resolution_and_court_disposition_invalidate_only_affected_comparisons(tmp_path):
+    store = ExecutionReviewStore(tmp_path)
+    first = build_target_comparison(
+        "first",
+        {
+            "action_id": "first-action",
+            "resource": "building_facilities",
+            "source_row_number": 2,
+            "body": {"parking": True},
+        },
+        {"parking": False},
+    )
+    second = build_target_comparison(
+        "second",
+        {
+            "action_id": "second-action",
+            "resource": "building_facilities",
+            "source_row_number": 3,
+            "body": {"parking": True},
+        },
+        {"parking": False},
+    )
+    store.save_comparisons("run", [first, second])
+    store.approve_targets("run", {first.change_id, second.change_id})
+
+    resolved = store.resolve_collection_item(
+        "run",
+        CollectionItemResolution(
+            item_id="item-1",
+            action_id="first-action",
+            resource="contact_detail",
+            decision="omit",
+            rationale="Duplicate entry",
+        ),
+    )
+    closed = store.close_court(
+        "run",
+        CourtDisposition(
+            source_row_number=3,
+            court_slug="second",
+            rationale="No defensible court target",
+        ),
+    )
+
+    assert first.change_id not in resolved.comparisons
+    assert second.change_id in resolved.comparisons
+    assert closed.comparisons == {}
+    assert closed.collection_item_resolutions["item-1"].rationale == "Duplicate entry"
+    assert closed.court_dispositions["3"].status == "unactionable"

@@ -5,16 +5,23 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
 from threading import RLock
 from typing import Any, Optional
+import uuid
 
 from pydantic import BaseModel, Field
 
 from fact_form_importer.execution.models import utc_now
+from fact_form_importer.execution.atomic_state import (
+    atomic_write_json,
+    decode_first_json_object,
+    file_lock,
+)
 from fact_form_importer.output.fact_api_manifest import MISSING_SUPPORT_PHONE_PLACEHOLDER
 
 
-EXECUTION_REVIEW_LEDGER_VERSION = "1.2"
+EXECUTION_REVIEW_LEDGER_VERSION = "1.3"
 _REQUEST_FIELDS_BY_RESOURCE = {
     "building_facilities": {
         "courtId", "parking", "freeWaterDispensers", "snackVendingMachines",
@@ -95,6 +102,24 @@ class TargetApproval(BaseModel):
     approved_at: str = Field(default_factory=utc_now)
 
 
+class CollectionItemResolution(BaseModel):
+    item_id: str
+    action_id: str
+    resource: str
+    decision: str
+    rationale: str
+    replacement_type_id: Optional[str] = None
+    decided_at: str = Field(default_factory=utc_now)
+
+
+class CourtDisposition(BaseModel):
+    source_row_number: int
+    court_slug: Optional[str] = None
+    status: str = "unactionable"
+    rationale: str
+    decided_at: str = Field(default_factory=utc_now)
+
+
 class ExecutionReviewLedger(BaseModel):
     ledger_version: str = EXECUTION_REVIEW_LEDGER_VERSION
     run_id: str
@@ -103,6 +128,10 @@ class ExecutionReviewLedger(BaseModel):
     court_target_overrides: dict[str, CourtTargetOverride] = Field(default_factory=dict)
     comparisons: dict[str, TargetComparison] = Field(default_factory=dict)
     target_approvals: dict[str, TargetApproval] = Field(default_factory=dict)
+    collection_item_resolutions: dict[str, CollectionItemResolution] = Field(
+        default_factory=dict
+    )
+    court_dispositions: dict[str, CourtDisposition] = Field(default_factory=dict)
     plan_manifest_version: Optional[str] = None
 
 
@@ -116,15 +145,44 @@ class ExecutionReviewStore:
 
     def load(self, run_id: str) -> ExecutionReviewLedger:
         path = self.path_for(run_id)
+        with self._lock, file_lock(path):
+            return self._load_unlocked(run_id)
+
+    def _load_unlocked(self, run_id: str) -> ExecutionReviewLedger:
+        path = self.path_for(run_id)
         if not path.exists():
             return ExecutionReviewLedger(run_id=run_id)
-        return ExecutionReviewLedger.model_validate_json(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        try:
+            return ExecutionReviewLedger.model_validate_json(text)
+        except ValueError as original_error:
+            backup = path.with_suffix(path.suffix + ".bak")
+            if backup.exists():
+                try:
+                    return ExecutionReviewLedger.model_validate_json(
+                        backup.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    pass
+            try:
+                prefix, suffix = decode_first_json_object(text)
+                if not suffix:
+                    raise original_error
+                recovered = ExecutionReviewLedger.model_validate(prefix)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise original_error
+            diagnostic = path.with_suffix(
+                path.suffix + f".corrupt-{uuid.uuid4().hex[:12]}"
+            )
+            shutil.copyfile(path, diagnostic)
+            atomic_write_json(path, recovered.model_dump(mode="json"), backup=False)
+            return recovered
 
     def select_source(
         self, run_id: str, court_slug: str, source_row_number: int
     ) -> ExecutionReviewLedger:
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             existing = ledger.source_selections.get(court_slug)
             if existing and existing.source_row_number == source_row_number:
                 return ledger
@@ -135,7 +193,7 @@ class ExecutionReviewStore:
                 if comparison.court_slug == court_slug:
                     ledger.comparisons.pop(change_id, None)
                     ledger.target_approvals.pop(change_id, None)
-            return self.save(ledger)
+            return self._save_unlocked(ledger)
 
     def set_court_target_override(
         self,
@@ -144,8 +202,8 @@ class ExecutionReviewStore:
     ) -> ExecutionReviewLedger:
         """Persist a validated target court and invalidate row-bound comparisons."""
 
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             key = str(override.source_row_number)
             existing = ledger.court_target_overrides.get(key)
             if existing and (
@@ -161,7 +219,7 @@ class ExecutionReviewStore:
                     continue
                 ledger.comparisons.pop(change_id, None)
                 ledger.target_approvals.pop(change_id, None)
-            return self.save(ledger)
+            return self._save_unlocked(ledger)
 
     def save_comparison(
         self, run_id: str, comparison: TargetComparison
@@ -173,17 +231,23 @@ class ExecutionReviewStore:
     ) -> ExecutionReviewLedger:
         """Atomically persist a comparison scan without rewriting per section."""
 
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
+            changed = False
             for comparison in comparisons:
                 previous = ledger.comparisons.get(comparison.change_id)
+                if previous and _comparison_content(previous) == _comparison_content(
+                    comparison
+                ):
+                    continue
                 ledger.comparisons[comparison.change_id] = comparison
+                changed = True
                 if previous and (
                     previous.current_hash != comparison.current_hash
                     or previous.proposed_hash != comparison.proposed_hash
                 ):
                     ledger.target_approvals.pop(comparison.change_id, None)
-            return self.save(ledger)
+            return self._save_unlocked(ledger) if changed else ledger
 
     def approve_target(self, run_id: str, change_id: str) -> ExecutionReviewLedger:
         ledger, _ = self.approve_targets(run_id, {change_id})
@@ -194,8 +258,8 @@ class ExecutionReviewStore:
     ) -> tuple[ExecutionReviewLedger, int]:
         """Atomically approve a validated set of existing-data comparisons."""
 
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             comparisons: list[TargetComparison] = []
             for change_id in sorted(change_ids):
                 comparison = ledger.comparisons.get(change_id)
@@ -226,15 +290,15 @@ class ExecutionReviewStore:
                     proposed_hash=comparison.proposed_hash,
                 )
                 added += 1
-            return (self.save(ledger) if added else ledger), added
+            return (self._save_unlocked(ledger) if added else ledger), added
 
     def invalidate_actions(
         self, run_id: str, action_ids: set[str]
     ) -> ExecutionReviewLedger:
         """Discard comparisons and approvals whose proposal has been edited."""
 
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             changed = False
             for change_id, comparison in list(ledger.comparisons.items()):
                 if comparison.action_id not in action_ids:
@@ -242,35 +306,63 @@ class ExecutionReviewStore:
                 ledger.comparisons.pop(change_id, None)
                 ledger.target_approvals.pop(change_id, None)
                 changed = True
-            return self.save(ledger) if changed else ledger
+            return self._save_unlocked(ledger) if changed else ledger
+
+    def resolve_collection_item(
+        self, run_id: str, resolution: CollectionItemResolution
+    ) -> ExecutionReviewLedger:
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
+            ledger.collection_item_resolutions[resolution.item_id] = resolution
+            for change_id, comparison in list(ledger.comparisons.items()):
+                if comparison.action_id != resolution.action_id:
+                    continue
+                ledger.comparisons.pop(change_id, None)
+                ledger.target_approvals.pop(change_id, None)
+            return self._save_unlocked(ledger)
+
+    def close_court(
+        self, run_id: str, disposition: CourtDisposition
+    ) -> ExecutionReviewLedger:
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
+            ledger.court_dispositions[str(disposition.source_row_number)] = disposition
+            for change_id, comparison in list(ledger.comparisons.items()):
+                if comparison.source_row_number != disposition.source_row_number:
+                    continue
+                ledger.comparisons.pop(change_id, None)
+                ledger.target_approvals.pop(change_id, None)
+            return self._save_unlocked(ledger)
 
     def reconcile_plan_version(
         self, run_id: str, manifest_version: str
     ) -> ExecutionReviewLedger:
-        """Discard mutable comparisons when a derived operational plan changes."""
+        """Record the plan version; action-specific edits perform invalidation."""
 
-        with self._lock:
-            ledger = self.load(run_id)
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
             if ledger.plan_manifest_version == manifest_version:
                 return ledger
-            ledger.comparisons.clear()
-            ledger.target_approvals.clear()
-            ledger.source_selections.clear()
             ledger.plan_manifest_version = manifest_version
-            return self.save(ledger)
+            return self._save_unlocked(ledger)
 
     def save(self, ledger: ExecutionReviewLedger) -> ExecutionReviewLedger:
+        with self._lock, file_lock(self.path_for(ledger.run_id)):
+            return self._save_unlocked(ledger)
+
+    def _save_unlocked(self, ledger: ExecutionReviewLedger) -> ExecutionReviewLedger:
         ledger.updated_at = utc_now()
         ledger.ledger_version = EXECUTION_REVIEW_LEDGER_VERSION
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.path_for(ledger.run_id)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(ledger.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+        atomic_write_json(path, ledger.model_dump(mode="json"))
         return ledger
+
+
+def _comparison_content(comparison: TargetComparison) -> dict[str, Any]:
+    payload = comparison.model_dump(mode="json")
+    payload.pop("captured_at", None)
+    return payload
 
 
 def build_target_comparison(
@@ -337,6 +429,10 @@ def merged_target_state(
 
     current_items = list(current) if isinstance(current, list) else []
     proposed_items = list(submitted) if isinstance(submitted, list) else []
+    source_clear_fields = action.get("proposed_item_clear_fields") or []
+    proposed_items, clear_fields = _coalesce_proposed_items(
+        resource, proposed_items, source_clear_fields
+    )
     current_groups = _group_by_business_key(resource, current_items)
     proposed_groups = _group_by_business_key(resource, proposed_items)
     operations: list[dict[str, Any]] = []
@@ -344,7 +440,6 @@ def merged_target_state(
     effective = [dict(item) for item in current_items]
     current_indexes = _group_indexes_by_business_key(resource, current_items)
     proposed_indexes = _group_indexes_by_business_key(resource, proposed_items)
-    clear_fields = action.get("proposed_item_clear_fields") or []
     for key in sorted(proposed_groups):
         existing = current_groups.get(key, [])
         wanted = proposed_groups[key]
@@ -387,6 +482,71 @@ def merged_target_state(
                 }
             )
     return effective, operations, conflicts
+
+
+def _coalesce_proposed_items(
+    resource: str,
+    items: list[dict[str, Any]],
+    clear_fields: list[list[str]],
+) -> tuple[list[dict[str, Any]], list[list[str]]]:
+    """Collapse exact duplicates and non-conflicting complementary contacts."""
+
+    groups = _group_indexes_by_business_key(resource, items)
+    coalesced: list[dict[str, Any]] = []
+    coalesced_clears: list[list[str]] = []
+    for indexes in groups.values():
+        candidates = [dict(items[index]) for index in indexes]
+        combined_clears = sorted(
+            {
+                str(field)
+                for index in indexes
+                for field in (clear_fields[index] if index < len(clear_fields) else [])
+            }
+        )
+        canonical = {
+            canonical_hash(_comparable_collection_item(candidate))
+            for candidate in candidates
+        }
+        if len(canonical) == 1:
+            coalesced.append(candidates[0])
+            coalesced_clears.append(combined_clears)
+            continue
+        if resource == "contact_detail":
+            merged = _merge_complementary_contacts(candidates)
+            if merged is not None:
+                coalesced.append(merged)
+                coalesced_clears.append(combined_clears)
+                continue
+        coalesced.extend(candidates)
+        for index in indexes:
+            coalesced_clears.append(
+                list(clear_fields[index]) if index < len(clear_fields) else []
+            )
+    return coalesced, coalesced_clears
+
+
+def _comparable_collection_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in item.items()
+        if key not in {"id", "court", "courtId", "createdAt", "updatedAt"}
+    }
+
+
+def _merge_complementary_contacts(
+    contacts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    merged: dict[str, Any] = {}
+    for contact in contacts:
+        for field, value in contact.items():
+            if value is None or value == "":
+                continue
+            if field not in merged or merged[field] is None or merged[field] == "":
+                merged[field] = value
+                continue
+            if merged[field] != value:
+                return None
+    return merged
 
 
 def _deep_merge(current: dict[str, Any], submitted: dict[str, Any]) -> dict[str, Any]:

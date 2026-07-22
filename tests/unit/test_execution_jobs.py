@@ -20,8 +20,10 @@ class _HoldingService:
     def execute_safe_court_actions(self, run_id, court_slug):
         self.calls.append(("court", run_id, court_slug))
 
-    def execute_all_safe_actions(self, run_id):
+    def execute_all_safe_actions(self, run_id, progress_callback=None):
         self.calls.append(("run", run_id))
+        if progress_callback:
+            progress_callback(1, 1)
 
     def refresh_all_target_comparisons(self, run_id):
         self.calls.append(("comparison", run_id))
@@ -45,6 +47,21 @@ def test_execution_jobs_are_globally_exclusive_and_persist_terminal_state(tmp_pa
     assert completed.started_at is not None
     assert completed.completed_at is not None
     assert service.calls == [("action", "run-1", "court", "action-1")]
+
+
+def test_separate_runner_instances_share_the_global_job_lock(tmp_path):
+    first_service = _HoldingService()
+    first = ExecutionJobRunner(tmp_path, first_service)
+    second = ExecutionJobRunner(tmp_path, _HoldingService())
+
+    first.start("run-1", "action", court_slug="court", action_id="action-1")
+    assert first_service.started.wait(timeout=1)
+    with pytest.raises(ValueError, match="already running"):
+        second.start("run-2", "run")
+
+    first_service.release.set()
+    first.executor.shutdown(wait=True)
+    second.executor.shutdown(wait=True)
 
 
 def test_runner_marks_unknown_inflight_jobs_interrupted_after_restart(tmp_path):

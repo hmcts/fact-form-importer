@@ -57,6 +57,17 @@ class AppConfig:
         return _env_bool("FACT_DATA_API_WRITES_ENABLED", default=False)
 
     @property
+    def fact_data_api_execution_concurrency(self) -> int:
+        """Maximum courts executed concurrently; actions within a court stay sequential."""
+
+        raw = os.getenv("FACT_API_EXECUTION_CONCURRENCY", "4")
+        try:
+            value = int(raw)
+        except ValueError:
+            return 4
+        return min(max(value, 1), 8)
+
+    @property
     def os_address_min_interval_seconds(self) -> float:
         """Minimum gap between uncached FaCT/OS postcode lookups.
 

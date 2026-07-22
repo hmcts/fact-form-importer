@@ -117,6 +117,11 @@ def process_workbook(
             json.dumps(submission_selection, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+        (staging / "fact_vocabularies.json").write_text(
+            json.dumps(vocabularies.model_dump(mode="json"), indent=2, ensure_ascii=False)
+            + "\n",
+            encoding="utf-8",
+        )
         submissions = validate_all_submissions(
             authoritative_submissions,
             vocabularies,

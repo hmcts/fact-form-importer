@@ -1134,3 +1134,68 @@ fact_form_importer/
 config/
 tests/
 ```
+
+## Reliability and full-run workflow (2026-07-22)
+
+The current end-to-end workbook is `input/input-csv-4.xlsx` (472 submissions,
+plus its header). This work is importer-only: it does not require or authorise
+changes to `fact-data-api`.
+
+- Scottish postcodes, including `AB`, `EH` and `G`, pass both importer manifest
+  validation and the FaCT/OS lookup path. `BT`, `IM`, `JE` and `GY` remain
+  unsupported.
+- Invalid optional phone values remain in audit evidence as warnings but are
+  omitted from API bodies. When FaCT conditionally requires a support phone for
+  a false lift or accessible-entrance answer, only the outgoing request uses
+  `+44 0000000000`; a valid submitted phone is always preserved.
+- Counter-service `appointmentContact` is an email-only FaCT field despite its
+  generic name. A supplied phone or malformed email remains in audit evidence
+  with a warning, but the request omits it and sets `appointmentNeeded=false`
+  rather than sending a body the API will reject.
+- Lift dimensions accept metric, imperial and embedded values, choose the
+  smallest reported measurement, and use the API minimum `1` only when the form
+  confirms a lift but contains no usable measurement. Interview-room counts are
+  read from digits, number words and explicit groups, with `1` used only when
+  rooms are confirmed and no count can be recovered.
+- `00:00–00:00` means closed and is omitted. No opening hours are invented when
+  all periods are closed or unusable.
+- Contact explanations are constrained to FaCT's 250-character/character-set
+  contract. Repairs from an overlength source always require manual review.
+  Reviewers can edit the exact outgoing text or omit the optional value; every
+  denial or omission requires and records a reviewer-entered reason.
+- Each proposed collection entry has a stable source-item ID and every API-backed
+  run archives `fact_vocabularies.json`. Exact duplicate items collapse
+  automatically. Complementary contact entries merge only when their populated
+  fields do not conflict. Conflicts remain in Step 2, where each entry can be
+  retained, remapped to an archived type, or omitted with a reason.
+- An unmatched authoritative court can be closed as unactionable with a reason.
+  This removes it from live outstanding-work totals and suppresses unsucceeded
+  actions without changing the immutable run archive.
+
+Mutable execution state uses run-scoped advisory file locks, unique
+same-directory temporary files, atomic replacement and last-known-good backups.
+The execution-review loader can recover a schema-valid leading JSON object from
+a file with trailing corruption and keeps the original as `.corrupt-*` evidence.
+Execution and comparison jobs share one cross-process global lock with owner,
+heartbeat, progress and timing state, so two UI processes cannot run competing
+jobs.
+
+Per-write court checkpoints are stored as small atomic files under
+`execution-state/<run-id>.courts/`. Reads overlay those newer shards on the
+legacy/consolidated ledger, and a later consolidated save supersedes older
+shards. This retains immediate durability without serialising four workers on a
+full multi-thousand-action JSON rewrite for every request.
+
+`FACT_API_EXECUTION_CONCURRENCY` controls court-level write concurrency (default
+`4`, range `1`–`8`). Actions for the same court remain sequential, fresh court,
+section and UPRN checks still run immediately before writes, and unknown writes
+are never retried automatically. Action state is saved immediately before and
+after writes; summaries are checkpointed rather than rebuilt after every court.
+
+API-backed CLI runs automatically prepare the read-only FaCT comparisons after
+archive publication. UI imports start the same retryable comparison job in the
+background. The results page links to `/runs/<run-id>/business-report`, with
+downloadable Markdown, CSV and JSON versions. These reports separate terminal
+action success from acceptance among requests actually sent, distinguish API
+latency from importer persistence time, group common themes, include reviewer
+rationale and recommended decisions, and exclude raw values/request bodies.

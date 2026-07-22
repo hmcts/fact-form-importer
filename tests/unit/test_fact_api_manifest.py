@@ -128,6 +128,74 @@ def test_manifest_builds_ready_actions_with_preflight_and_source_evidence():
     assert manifest.summary["api_manifest_pending_action_count"] == 0
 
 
+def test_manifest_omits_non_email_counter_appointment_contact():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="processed_with_warnings",
+        counter_service={
+            "assists_with": ["Forms"],
+            "appointment_contact": "020 7946 0000",
+            "same_monday_to_friday": True,
+            "monday_to_friday": OpeningTime(
+                open="09:00", close="17:00", status="valid_time"
+            ),
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+    action = next(
+        action
+        for action in manifest.records[0].actions
+        if action.resource == "counter_service_opening_hours"
+    )
+
+    assert action.body["appointmentNeeded"] is False
+    assert "appointmentContact" not in action.body
+
+    legacy_body = normalise_fact_api_action_body(
+        "counter_service_opening_hours",
+        {
+            "courtId": "court-id",
+            "counterService": True,
+            "assistWithForms": True,
+            "assistWithDocuments": False,
+            "assistWithSupport": False,
+            "appointmentNeeded": True,
+            "appointmentContact": "020 7946 0000",
+            "openingTimesDetails": [
+                {
+                    "dayOfWeek": "EVERYDAY",
+                    "openingTime": "09:00",
+                    "closingTime": "17:00",
+                }
+            ],
+        },
+    )
+    assert legacy_body["appointmentNeeded"] is False
+    assert "appointmentContact" not in legacy_body
+
+    required_reason = validate_fact_api_action_body(
+        "counter_service_opening_hours",
+        {
+            **legacy_body,
+            "appointmentNeeded": True,
+        },
+    )
+    invalid_reason = validate_fact_api_action_body(
+        "counter_service_opening_hours",
+        {
+            **legacy_body,
+            "appointmentNeeded": True,
+            "appointmentContact": "020 7946 0000",
+        },
+    )
+    assert "appointmentContact is required" in required_reason
+    assert "appointmentContact does not match" in invalid_reason
+
+
 def test_manifest_marks_invalid_api_text_pending_and_resolves_court_uuid_at_execution():
     submission = CourtSubmission(
         source=SourceMetadata(source_row_number=2),
@@ -445,7 +513,7 @@ def test_manifest_records_missing_support_phone_request_defaults_without_mutatin
     assert "accessibleEntrancePhoneNumber" not in action.body
     assert "liftSupportPhoneNumber" not in action.body
     assert len(action.migration_assumptions) == 2
-    assert all("00000000000" in assumption for assumption in action.migration_assumptions)
+    assert all("+44 0000000000" in assumption for assumption in action.migration_assumptions)
 
 
 def test_manifest_uses_review_visible_defaults_for_blank_lift_measurements():
@@ -476,9 +544,11 @@ def test_manifest_uses_review_visible_defaults_for_blank_lift_measurements():
     assert action.body["liftDoorLimit"] == 1
     assert action.migration_assumptions == [
         "Review-required migration default: lift is marked available but the source has no "
-        "door width, so this FaCT request uses 1 cm. It does not amend the source or cleaned data.",
+        "usable door width, so this FaCT request uses 1 cm. It does not amend the source or "
+        "cleaned data.",
         "Review-required migration default: lift is marked available but the source has no "
-        "weight limit, so this FaCT request uses 1 kg. It does not amend the source or cleaned data.",
+        "usable weight limit, so this FaCT request uses 1 kg. It does not amend the source or "
+        "cleaned data.",
     ]
     assert manifest.summary["api_manifest_review_required_default_count"] == 2
     assert manifest.summary["api_manifest_review_required_default_action_count"] == 1
@@ -581,7 +651,7 @@ def test_manifest_accepts_native_numeric_lift_measurements():
     assert action.body["liftDoorLimit"] == 650
 
 
-def test_manifest_does_not_default_explicitly_invalid_or_missing_lift_answers():
+def test_manifest_defaults_unusable_lift_measurements_but_not_a_missing_controller():
     explicit_invalid = CourtSubmission(
         source=SourceMetadata(source_row_number=8),
         court_slug="invalid-lift-court",
@@ -625,15 +695,41 @@ def test_manifest_does_not_default_explicitly_invalid_or_missing_lift_answers():
         if action.resource == "accessibility_options"
     )
 
-    assert invalid_action.readiness == "pending"
-    assert invalid_action.body.get("liftDoorWidth") is None
-    assert invalid_action.body.get("liftDoorLimit") is None
-    assert invalid_action.migration_assumptions == []
-    assert "liftDoorWidth" in invalid_action.reason
-    assert "liftDoorLimit" in invalid_action.reason
+    assert invalid_action.readiness == "ready"
+    assert invalid_action.body["liftDoorWidth"] == 1
+    assert invalid_action.body["liftDoorLimit"] == 1
+    assert len(invalid_action.migration_assumptions) == 2
     assert missing_action.readiness == "pending"
     assert "lift" not in missing_action.body
     assert "lift is required" in missing_action.reason
+
+
+def test_manifest_converts_imperial_and_uses_the_smallest_reported_lift_value():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=10),
+        court_slug="multiple-lifts-court",
+        status="processed",
+        facilities={
+            "accessible_parking": False,
+            "accessible_entrance": True,
+            "hearing_enhancement_equipment": "Hearing loop systems are available at this court.",
+            "lift_available": True,
+            "lift_door_width": "External lift 31 inches; internal lift 3 feet",
+            "lift_weight_limit": "External 630kg; internal 400kg",
+            "quiet_room_available": False,
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+    action = next(
+        item for item in manifest.records[0].actions if item.resource == "accessibility_options"
+    )
+
+    assert action.body["liftDoorWidth"] == 78
+    assert action.body["liftDoorLimit"] == 400
+    assert action.migration_assumptions == []
 
 
 def test_manifest_uses_review_visible_interview_room_count_defaults():
@@ -686,6 +782,99 @@ def test_manifest_uses_review_visible_interview_room_count_defaults():
     assert manifest.summary["api_manifest_review_required_default_action_count"] == 2
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("five", 5),
+        ("27 rooms - 1st floor, 2nd floor", 27),
+        ("Eight interview rooms on the first floor. Two interview rooms downstairs.", 10),
+        ("located on 1st, 2nd and 3rd floors", 1),
+    ],
+)
+def test_manifest_parses_descriptive_interview_room_counts(value, expected):
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=13),
+        court_slug="descriptive-rooms-court",
+        status="processed",
+        interview_rooms={"has_interview_rooms": True, "room_count": value},
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+    action = next(
+        item
+        for item in manifest.records[0].actions
+        if item.resource == "professional_information"
+    )
+
+    assert action.body["professionalInformation"]["interviewRoomCount"] == expected
+
+
+def test_manifest_omits_invalid_optional_phones_without_losing_source_evidence():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=14),
+        court_slug="optional-phone-court",
+        status="processed_with_warnings",
+        facilities={
+            "accessible_parking": True,
+            "accessible_parking_phone": "ask reception",
+            "accessible_entrance": True,
+            "accessible_entrance_support_phone": "main door",
+            "hearing_enhancement_equipment": "Hearing loop systems are available at this court.",
+            "lift_available": False,
+            "quiet_room_available": False,
+        },
+        interview_rooms={
+            "has_interview_rooms": True,
+            "room_count": "2",
+            "booking_phone": "cannot be booked",
+        },
+        contacts=[ContactDetail(index=1, description="Enquiries", phone="not a phone")],
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+    actions = {item.resource: item for item in manifest.records[0].actions}
+
+    assert "accessibleParkingPhoneNumber" not in actions["accessibility_options"].body
+    assert "accessibleEntrancePhoneNumber" not in actions["accessibility_options"].body
+    assert (
+        "interviewPhoneNumber"
+        not in actions["professional_information"].body["professionalInformation"]
+    )
+    assert "phoneNumber" not in actions["contact_detail"].body
+
+
+def test_manifest_omits_closed_zero_length_opening_periods():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=15),
+        court_slug="closed-days-court",
+        status="processed",
+        opening_hours=[
+            OpeningHoursSet(
+                index=1,
+                type="Court open",
+                same_monday_to_friday=False,
+                monday=OpeningTime(open="00:00", close="00:00", status="valid_time"),
+                tuesday=OpeningTime(open="09:00", close="17:00", status="valid_time"),
+            )
+        ],
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+    action = next(
+        item for item in manifest.records[0].actions if item.resource == "court_opening_hours"
+    )
+
+    assert action.body["openingTimesDetails"] == [
+        {"dayOfWeek": "TUESDAY", "openingTime": "09:00", "closingTime": "17:00"}
+    ]
+
+
 def test_manifest_normalises_conventional_address_notation_for_fact_api():
     submission = CourtSubmission(
         source=SourceMetadata(source_row_number=7),
@@ -733,14 +922,34 @@ def test_fact_api_contract_validation_blocks_known_unrepresentable_values():
     assert "email" in contact_reason
 
 
-def test_fact_api_contract_validation_allows_scottish_postcodes():
+@pytest.mark.parametrize("postcode", ["BT1 1AA", "IM1 1AA", "JE1 1AA", "GY1 1AA"])
+def test_fact_api_contract_rejects_only_unsupported_crown_dependency_regions(postcode):
+    reason = validate_fact_api_action_body(
+        "address",
+        {
+            "courtId": "court-id",
+            "addressLine1": "1 Main Street",
+            "townCity": "Town",
+            "postcode": postcode,
+            "addressType": "VISIT_US",
+        },
+    )
+
+    assert reason is not None
+
+
+@pytest.mark.parametrize(
+    ("postcode", "town"),
+    [("AB10 1SH", "Aberdeen"), ("EH1 1YZ", "Edinburgh"), ("G2 1AA", "Glasgow")],
+)
+def test_fact_api_contract_validation_allows_scottish_postcodes(postcode, town):
     address_reason = validate_fact_api_action_body(
         "address",
         {
             "courtId": "court-id",
             "addressLine1": "1 Main Street",
-            "townCity": "Aberdeen",
-            "postcode": "AB10 1SH",
+            "townCity": town,
+            "postcode": postcode,
             "addressType": "VISIT_US",
         },
     )

@@ -32,6 +32,12 @@ class ActionAttempt(BaseModel):
     outcome: ActionExecutionStatus
     http_status: Optional[int] = None
     message: Optional[str] = None
+    request_duration_ms: Optional[float] = None
+    persistence_duration_ms: Optional[float] = None
+    write_request_count: Optional[int] = None
+    accepted_write_count: Optional[int] = None
+    rejected_write_count: Optional[int] = None
+    unknown_write_count: Optional[int] = None
 
 
 class ActionExecutionState(BaseModel):

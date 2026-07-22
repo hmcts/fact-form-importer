@@ -11,6 +11,7 @@ from fact_form_importer.execution.report import (
     _error_theme,
     _group_attention_by_request_type,
 )
+from fact_form_importer.execution.review_state import CollectionItemResolution
 from fact_form_importer.execution.service import ApiExecutionService
 from fact_form_importer.output.archive import publish_run_archive, stage_path
 from fact_form_importer.output.fact_api_manifest import API_MANIFEST_VERSION
@@ -747,7 +748,7 @@ def test_denied_llm_result_is_excluded_from_bulk_approval_and_keeps_action_held(
     client = FakeFactApiClient(target=ApiResponse(204), write=ApiResponse(201))
     service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
 
-    service.deny_llm_review(run_id, "deny-me")
+    service.deny_llm_review(run_id, "deny-me", "Conflicts with the submitted evidence")
     _, approved = service.approve_all_pending_llm_reviews(run_id)
     review = service.get_llm_actions_review(run_id)
     status_by_id = {
@@ -1070,7 +1071,7 @@ def test_execution_applies_blank_lift_minimums_to_a_legacy_action(tmp_path, monk
     assert client.writes[0][2]["liftDoorLimit"] == 1
 
 
-def test_execution_does_not_default_explicitly_invalid_legacy_lift_values(
+def test_execution_defaults_unusable_legacy_lift_values(
     tmp_path, monkeypatch
 ):
     action = {
@@ -1117,9 +1118,124 @@ def test_execution_does_not_default_explicitly_invalid_legacy_lift_values(
     )
 
     state = ledger.courts["example-court"].actions["example-court-1"]
-    assert state.status == "blocked"
-    assert "liftDoorWidth" in state.reason
-    assert client.writes == []
+    assert state.status == "succeeded"
+    assert client.writes[0][2]["liftDoorWidth"] == 1
+
+
+def test_reviewed_contact_explanation_and_collection_omission_overlay_execution_items(
+    tmp_path,
+):
+    action = {
+        "action_id": "example-court-1",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/court-id/v1/contact-details",
+        "readiness": "ready",
+        "source_row_number": 2,
+        "llm_review_ids": ["explanation-review"],
+        "proposed_items": [
+            {
+                "courtContactDescriptionId": "type-1",
+                "explanation": "Original long explanation",
+                "phoneNumber": "020 1111 1111",
+            }
+        ],
+        "proposed_item_ids": ["source-item-1"],
+        "proposed_item_source_fields": [["contacts[1]"]],
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    review_path = tmp_path / "out" / "final" / run_id / "llm_actions_review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "explanation-review",
+                        "kind": "field",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "contacts[1].explanation",
+                        "outcome": "accepted",
+                        "approvable": True,
+                        "actionable": True,
+                        "dependent_action_ids": ["example-court-1"],
+                        "llm_input": {"cleaned_value": "x" * 251},
+                        "model_result": {
+                            "operation": "set",
+                            "value": "Short factual explanation",
+                            "confidence": "high",
+                            "needs_human_review": False,
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+
+    service.approve_llm_review(
+        run_id, "explanation-review", field_value="Reviewer-approved explanation"
+    )
+    edited = service._execution_items(run_id, action, "court-id")
+    service.approve_llm_review(
+        run_id,
+        "explanation-review",
+        omit_field=True,
+        omission_rationale="The optional explanation duplicates the contact type",
+    )
+    omitted_value = service._execution_items(run_id, action, "court-id")
+    service.review_store.resolve_collection_item(
+        run_id,
+        CollectionItemResolution(
+            item_id="source-item-1",
+            action_id="example-court-1",
+            resource="contact_detail",
+            decision="omit",
+            rationale="Duplicate channel is not required",
+        ),
+    )
+    omitted_item = service._execution_items(run_id, action, "court-id")
+
+    assert edited[0]["explanation"] == "Reviewer-approved explanation"
+    assert "explanation" not in omitted_value[0]
+    assert omitted_item == []
+
+
+def test_duplicate_resolution_and_unactionable_validation_errors_are_explicit(tmp_path):
+    action = {
+        **_action("example-court-1"),
+        "proposed_item_ids": ["source-item-1"],
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    archive = tmp_path / "out" / "final" / run_id
+    (archive / "submissions_cleaned.json").write_text(
+        json.dumps(
+            [
+                {
+                    "source": {"source_row_number": 2},
+                    "court_slug": "example-court",
+                    "issues": [],
+                }
+            ]
+        )
+    )
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+
+    with pytest.raises(ValueError, match="retain, remap or omit"):
+        service.resolve_collection_item(run_id, "example-court-1", "source-item-1", "bad", "Reason")
+    with pytest.raises(ValueError, match="reason"):
+        service.resolve_collection_item(run_id, "example-court-1", "source-item-1", "omit", "")
+    with pytest.raises(ValueError, match="does not exist"):
+        service.resolve_collection_item(run_id, "missing", "missing", "omit", "Reason")
+    with pytest.raises(ValueError, match="Only collection"):
+        service.resolve_collection_item(
+            run_id, "example-court-1", "source-item-1", "retain", "Reason"
+        )
+    with pytest.raises(ValueError, match="source row"):
+        service.close_unactionable_court(run_id, 99, "No court")
+    with pytest.raises(ValueError, match="without a defensible"):
+        service.close_unactionable_court(run_id, 2, "No court")
 
 
 def test_preflight_blocks_invalid_accessibility_phone_before_api_write(tmp_path, monkeypatch):
@@ -1343,6 +1459,7 @@ def test_execute_all_safe_actions_runs_in_slug_order_continues_after_failure_and
 
     service.execute_all_safe_actions(run_id)
     assert len(client.writes) == 2
+    assert client.lookup_slugs == ["alpha-court", "bravo-court"]
 
 
 def test_execute_all_safe_actions_marks_unexpected_court_error_and_continues(tmp_path, monkeypatch):

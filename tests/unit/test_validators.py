@@ -227,12 +227,13 @@ def test_validate_submission_marks_bad_time_format_for_review():
     assert _has_issue(validated, INVALID_TIME)
 
 
-def test_validate_submission_accepts_counter_appointment_contact_as_email_or_phone():
+def test_validate_submission_requires_counter_appointment_contact_to_be_email():
     phone_submission = _submission(counter_service={"appointment_contact": "020 7946 0000"})
     email_submission = _submission(counter_service={"appointment_contact": "court@example.com"})
     invalid_submission = _submission(counter_service={"appointment_contact": "front desk"})
 
-    assert validate_submission(phone_submission).status == "processed"
+    assert validate_submission(phone_submission).status == "processed_with_warnings"
+    assert _has_issue(validate_submission(phone_submission), INVALID_EMAIL)
     assert validate_submission(email_submission).status == "processed"
 
     validated_invalid = validate_submission(invalid_submission)
@@ -288,7 +289,7 @@ def test_validate_submission_passes_with_valid_values_and_vocabularies():
         counter_service={
             "specific_courts": ["County Court"],
             "assists_with": ["Forms"],
-            "appointment_contact": "020 7946 0000",
+            "appointment_contact": "appointments@example.com",
         },
         contacts=[ContactDetail(index=1, description="Enquiries", email="court@example.com")],
         opening_hours=[

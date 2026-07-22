@@ -36,7 +36,7 @@ _COURT_STATUSES = (
     "completed",
 )
 _ATTENTION_ACTION_STATUSES = {"blocked", "failed", "unknown"}
-EXECUTION_SUMMARY_VERSION = "2.0"
+EXECUTION_SUMMARY_VERSION = "2.1"
 _SOURCE_CORRECTION_CODES = {
     "COURT_SLUG_NOT_FOUND",
     "COURT_SLUG_SUGGESTED",
@@ -99,7 +99,11 @@ def build_execution_summary(
     review_ledger = execution_review or ExecutionReviewLedger(run_id=run_id)
 
     records = sorted(
-        readiness_report.get("records", []),
+        [
+            record
+            for record in readiness_report.get("records", [])
+            if not _record_is_disposed(record, review_ledger, ledger)
+        ],
         key=lambda record: str(record.get("court_slug") or ""),
     )
     for record in records:
@@ -255,6 +259,11 @@ def _review_progress_counts(
 
     approved_ids = set(approvals.approvals)
     denied_ids = set(approvals.denials)
+    disposed_rows = {
+        int(row)
+        for row in execution_review.court_dispositions
+        if str(row).isdigit()
+    }
     rows = {
         submission.get("source", {}).get("source_row_number"): submission
         for submission in submissions
@@ -276,6 +285,8 @@ def _review_progress_counts(
         if not review_id or not item.get("approvable", item.get("actionable")):
             continue
         row = item.get("source_row_number")
+        if row in disposed_rows:
+            continue
         if isinstance(row, int):
             review_items_by_row[row].append(item)
         if review_id in approved_ids:
@@ -295,6 +306,8 @@ def _review_progress_counts(
     source_correction_items = 0
     for submission in submissions:
         row = submission.get("source", {}).get("source_row_number")
+        if row in disposed_rows:
+            continue
         row_items = review_items_by_row.get(row, []) if isinstance(row, int) else []
         for issue in submission.get("issues", []):
             if (
@@ -331,6 +344,8 @@ def _review_progress_counts(
     invalid_section_courts: set[str] = set()
     invalid_section_items = 0
     for record in readiness_report.get("records", []):
+        if any(row in disposed_rows for row in record.get("source_row_numbers", [])):
+            continue
         court_slug = str(record.get("court_slug") or "")
         for action in record.get("actions", []):
             if action.get("readiness") != "pending":
@@ -371,6 +386,20 @@ def _review_progress_counts(
         "invalid_section_actions": invalid_section_items,
         "invalid_section_courts": len(invalid_section_courts),
     }
+
+
+def _record_is_disposed(
+    record: dict[str, Any],
+    review: ExecutionReviewLedger,
+    ledger: ExecutionLedger,
+) -> bool:
+    rows = record.get("source_row_numbers", [])
+    if not rows or not all(str(row) in review.court_dispositions for row in rows):
+        return False
+    state = ledger.courts.get(str(record.get("court_slug") or ""))
+    return not state or not any(
+        action.status == "succeeded" for action in state.actions.values()
+    )
 
 
 def _submission_court_key(submission: dict[str, Any]) -> str:

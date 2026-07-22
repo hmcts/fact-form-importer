@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from fact_form_importer.execution.approvals import (
     ADDRESS_AUTO_APPROVAL_POLICY_VERSION,
     ADDRESS_AUTO_APPROVAL_POLICY_VERSIONS,
@@ -155,7 +157,7 @@ def test_address_override_records_hash_and_policy_decision_history(tmp_path):
 
 def test_denial_survives_policy_and_bulk_approval_until_reconsidered(tmp_path):
     store = LlmApprovalStore(tmp_path / "out")
-    store.deny("run-1", "denied")
+    store.deny("run-1", "denied", "The result conflicts with the submitted evidence")
 
     policy, policy_added = store.reconcile_policies(
         "run-1",
@@ -178,6 +180,54 @@ def test_denial_survives_policy_and_bulk_approval_until_reconsidered(tmp_path):
     assert final_added == 1
     assert set(final.approvals) == {"automatic", "manual", "denied"}
     assert final.ledger_version == APPROVAL_LEDGER_VERSION
+
+
+def test_field_approval_supports_exact_text_or_audited_omission(tmp_path):
+    store = LlmApprovalStore(tmp_path / "out")
+
+    edited = store.approve_field("run-1", "explanation", "Short factual text")
+    omitted = store.approve_field(
+        "run-1",
+        "explanation",
+        None,
+        omitted=True,
+        rationale="This generic label adds no useful public information",
+    )
+
+    assert edited.approvals["explanation"].approved_field_value == "Short factual text"
+    assert edited.approvals["explanation"].field_value_overridden is True
+    assert omitted.approvals["explanation"].omitted is True
+    assert omitted.approvals["explanation"].rationale == (
+        "This generic label adds no useful public information"
+    )
+    assert (
+        store.approve_field(
+            "run-1",
+            "explanation",
+            None,
+            omitted=True,
+            rationale="This generic label adds no useful public information",
+        ).approvals["explanation"].approved_value_hash
+        == omitted.approvals["explanation"].approved_value_hash
+    )
+
+
+def test_denial_requires_a_reason_and_edited_explanation_respects_api_limit(tmp_path):
+    store = LlmApprovalStore(tmp_path / "out")
+
+    with pytest.raises(ValueError, match="reason"):
+        store.deny("run-1", "review", "  ")
+    with pytest.raises(ValueError, match="reason"):
+        store.approve_field("run-1", "review", None, omitted=True)
+    with pytest.raises(ValueError, match="250"):
+        store.approve_field("run-1", "review", "x" * 251)
+
+
+def test_overlength_source_explanation_is_not_policy_approved():
+    item = _field_item("long", cleaned="x" * 251, value="Shortened text")
+    item["field"] = "contacts[1].explanation"
+
+    assert policy_eligible_high_confidence_field_review_ids({"items": [item]}) == set()
 
 
 def _item(

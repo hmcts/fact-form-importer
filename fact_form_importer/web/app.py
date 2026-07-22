@@ -30,6 +30,10 @@ from werkzeug.utils import secure_filename
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.service import ApiExecutionService
 from fact_form_importer.execution.jobs import ExecutionJobRunner
+from fact_form_importer.execution.business_report import (
+    business_report_csv,
+    business_report_markdown,
+)
 from fact_form_importer.ingest.column_mapping import load_column_mapping
 from fact_form_importer.models.court_submission import CourtSubmission
 from fact_form_importer.output.archive import load_run_archive, list_run_archives
@@ -79,9 +83,15 @@ Processor = Callable[..., ProcessingResult]
 class LocalJobRunner:
     """One local import job at a time, with safe persisted status only."""
 
-    def __init__(self, output_root: Path, processor: Processor) -> None:
+    def __init__(
+        self,
+        output_root: Path,
+        processor: Processor,
+        comparison_starter: Callable[[str], Any] | None = None,
+    ) -> None:
         self.output_root = output_root
         self.processor = processor
+        self.comparison_starter = comparison_starter
         self.jobs_path = output_root / ".jobs"
         self.uploads_path = output_root / ".uploads"
         self.jobs_path.mkdir(parents=True, exist_ok=True)
@@ -154,6 +164,18 @@ class LocalJobRunner:
                     run_id=result.run_id,
                 )
             )
+            if (
+                self.comparison_starter
+                and getattr(getattr(result, "output", None), "summary", {}).get(
+                    "vocabulary_source"
+                )
+                == "fact_data_api"
+            ):
+                try:
+                    self.comparison_starter(result.run_id)
+                except ValueError:
+                    # The immutable run is valid; comparison remains safely retryable.
+                    pass
         except Exception as exc:
             self._write_job(
                 JobState(
@@ -210,7 +232,13 @@ def create_app(
     app.config["EXECUTION_JOB_RUNNER"] = ExecutionJobRunner(
         output_root, app.config["EXECUTION_SERVICE"]
     )
-    app.config["JOB_RUNNER"] = LocalJobRunner(output_root, processor)
+    app.config["JOB_RUNNER"] = LocalJobRunner(
+        output_root,
+        processor,
+        comparison_starter=lambda run_id: app.config[
+            "EXECUTION_JOB_RUNNER"
+        ].start(run_id, "comparison"),
+    )
 
     @app.get("/")
     def index():
@@ -383,7 +411,9 @@ def create_app(
         category = request.args.get("category")
         query = (request.args.get("q") or "").strip().casefold()
         ledger = service.get_ledger(run_id)
-        target_overrides = service.get_execution_review(run_id).court_target_overrides
+        review_state = service.get_execution_review(run_id)
+        target_overrides = review_state.court_target_overrides
+        court_dispositions = review_state.court_dispositions
         for submission in submissions:
             row = submission.get("source", {}).get("source_row_number")
             target_override = target_overrides.get(str(row))
@@ -401,6 +431,7 @@ def create_app(
                 records_by_row.get(row),
                 action_tasks_by_row.get(row, []),
                 target_override=target_override,
+                court_disposition=court_dispositions.get(str(row)),
             )
         filtered = [
             submission
@@ -445,6 +476,9 @@ def create_app(
         court_target_resolution = service.get_court_target_resolution(
             run_id, source_row_number
         )
+        court_disposition = service.get_execution_review(run_id).court_dispositions.get(
+            str(source_row_number)
+        )
         operational_court_slug = (
             court_target_resolution.get("override", {}).get("target_slug")
             if court_target_resolution and court_target_resolution.get("override")
@@ -488,6 +522,7 @@ def create_app(
                 if court_target_resolution
                 else None
             ),
+            court_disposition=court_disposition,
         )
         return render_template(
             "record_detail.html",
@@ -496,6 +531,7 @@ def create_app(
             actions=actions,
             court_execution=court_execution,
             court_target_resolution=court_target_resolution,
+            court_disposition=court_disposition,
             operational_court_slug=operational_court_slug,
             court_target_error=request.args.get("court_target_error"),
             court_target_saved=request.args.get("court_target_saved"),
@@ -551,6 +587,17 @@ def create_app(
                 court_target_review_id=review_id,
             )
         )
+
+    @app.post("/runs/<run_id>/records/<int:source_row_number>/close-unactionable")
+    def close_unactionable_court(run_id: str, source_row_number: int):
+        _archive_or_404(output_root, run_id)
+        try:
+            app.config["EXECUTION_SERVICE"].close_unactionable_court(
+                run_id, source_row_number, request.form.get("rationale") or ""
+            )
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(url_for("records", run_id=run_id, work="outstanding"))
 
     @app.get("/runs/<run_id>/issues")
     def issues(run_id: str):
@@ -632,6 +679,16 @@ def create_app(
                 }
                 & {"running", "succeeded", "unknown"}
             )
+            if item.get("field_editable"):
+                item["field_editable"] = bool(
+                    not active_job
+                    and item.get("approval_status") in {"pending", "approved"}
+                    and not {
+                        action.get("status")
+                        for action in item.get("dependent_actions", [])
+                    }
+                    & {"running", "succeeded", "unknown"}
+                )
         field_items = [item for item in items if item.get("kind") == "field"]
         address_items = [item for item in items if item.get("kind") == "address"]
         field_page, field_pages, field_page_items = _paginate(
@@ -666,6 +723,8 @@ def create_app(
     def approve_llm_action(run_id: str, review_id: str):
         _archive_or_404(output_root, run_id)
         address_patch = None
+        field_value = request.form.get("field_value")
+        omit_field = request.form.get("omit_field") == "1"
         if "addressLine1" in request.form:
             address_patch = {
                 field: request.form.get(field)
@@ -682,6 +741,9 @@ def create_app(
                 run_id,
                 review_id,
                 address_patch=address_patch,
+                field_value=field_value,
+                omit_field=omit_field,
+                omission_rationale=request.form.get("omission_rationale"),
                 execution_job_active=bool(
                     app.config["EXECUTION_JOB_RUNNER"].active()
                 ),
@@ -698,7 +760,9 @@ def create_app(
     def deny_llm_action(run_id: str, review_id: str):
         _archive_or_404(output_root, run_id)
         try:
-            app.config["EXECUTION_SERVICE"].deny_llm_review(run_id, review_id)
+            app.config["EXECUTION_SERVICE"].deny_llm_review(
+                run_id, review_id, request.form.get("rationale") or ""
+            )
         except ValueError as exc:
             abort(400, str(exc))
         return redirect(
@@ -824,6 +888,30 @@ def create_app(
             )
         )
 
+    @app.post("/runs/<run_id>/api-changes/<action_id>/items/<item_id>/resolve")
+    def resolve_collection_item(run_id: str, action_id: str, item_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            app.config["EXECUTION_SERVICE"].resolve_collection_item(
+                run_id,
+                action_id,
+                item_id,
+                request.form.get("decision") or "",
+                request.form.get("rationale") or "",
+                replacement_type_id=request.form.get("replacement_type_id"),
+            )
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(
+            url_for(
+                "api_changes_review",
+                run_id=run_id,
+                view=request.form.get("view") or "pending",
+                page=request.form.get("page") or 1,
+                _anchor=f"change-{request.form.get('change_id') or ''}",
+            )
+        )
+
     @app.post("/runs/<run_id>/api-changes/approve-all")
     def approve_all_api_changes(run_id: str):
         _archive_or_404(output_root, run_id)
@@ -935,6 +1023,44 @@ def create_app(
             headers={
                 "Content-Disposition": (f'attachment; filename="{run_id}-execution-summary.json"')
             },
+        )
+
+    @app.get("/runs/<run_id>/business-report")
+    def business_report(run_id: str):
+        archive = _archive_or_404(output_root, run_id)
+        payload = app.config["EXECUTION_SERVICE"].get_business_report(run_id)
+        return render_template(
+            "business_report.html", archive=archive, report=payload
+        )
+
+    @app.get("/runs/<run_id>/business-report.md")
+    def business_report_markdown_download(run_id: str):
+        _archive_or_404(output_root, run_id)
+        payload = app.config["EXECUTION_SERVICE"].get_business_report(run_id)
+        return Response(
+            business_report_markdown(payload),
+            mimetype="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="{run_id}-business-report.md"'},
+        )
+
+    @app.get("/runs/<run_id>/business-report.csv")
+    def business_report_csv_download(run_id: str):
+        _archive_or_404(output_root, run_id)
+        payload = app.config["EXECUTION_SERVICE"].get_business_report(run_id)
+        return Response(
+            business_report_csv(payload),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{run_id}-business-report.csv"'},
+        )
+
+    @app.get("/runs/<run_id>/business-report.json")
+    def business_report_json_download(run_id: str):
+        _archive_or_404(output_root, run_id)
+        payload = app.config["EXECUTION_SERVICE"].get_business_report(run_id)
+        return Response(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{run_id}-business-report.json"'},
         )
 
     @app.post("/runs/<run_id>/courts/<court_slug>/api-check")
@@ -1588,6 +1714,7 @@ def _add_record_review_guidance(
     action_review_tasks: list[dict[str, str]] | None = None,
     *,
     target_override: Any = None,
+    court_disposition: Any = None,
 ) -> None:
     """Describe whether each archived issue needs a decision, source fix, or no action."""
 
@@ -1608,6 +1735,16 @@ def _add_record_review_guidance(
                 ),
                 "remedy": "No workbook rerun is required for this run.",
             }
+        if court_disposition and issue.get("code") in {
+            "COURT_SLUG_NOT_FOUND",
+            "COURT_SLUG_SUGGESTED",
+        }:
+            issue["review_guidance"] = {
+                "state": "complete",
+                "label": "Closed as unactionable",
+                "explanation": court_disposition.rationale,
+                "remedy": "No further importer action is required for this submission.",
+            }
 
     action_count = 0
     if manifest_record:
@@ -1625,6 +1762,10 @@ def _add_record_review_guidance(
         for issue in submission.get("issues", [])
     )
     submission["action_review_tasks"] = action_review_tasks or []
+    if court_disposition:
+        submission["pending_value_review_count"] = 0
+        submission["source_task_count"] = 0
+        submission["action_review_tasks"] = []
     submission["outstanding_work"] = bool(
         submission["pending_value_review_count"]
         or submission["source_task_count"]

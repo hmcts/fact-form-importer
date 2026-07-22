@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import json
 from pathlib import Path
 import re
+from threading import Lock
+import time
 from typing import Any, Literal
 from urllib.parse import quote
 from uuid import UUID
@@ -16,6 +19,7 @@ import httpx
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.approvals import LlmApprovalLedger, LlmApprovalStore
+from fact_form_importer.execution.business_report import build_business_report
 from fact_form_importer.execution.fact_api import ApiResponse, FactApiExecutionClient
 from fact_form_importer.execution.ledger import ExecutionLedgerStore
 from fact_form_importer.execution.models import (
@@ -31,11 +35,14 @@ from fact_form_importer.execution.report import (
     build_execution_summary,
 )
 from fact_form_importer.execution.review_state import (
+    CollectionItemResolution,
+    CourtDisposition,
     CourtTargetOverride,
     ExecutionReviewLedger,
     ExecutionReviewStore,
     TargetComparison,
     build_target_comparison,
+    merged_target_state,
     target_change_id,
 )
 from fact_form_importer.llm.review import (
@@ -90,6 +97,7 @@ class ApiExecutionService:
             _unconfigured_postcode_lookup,
             min_interval_seconds=self.config.os_address_min_interval_seconds,
         )
+        self._postcode_lock = Lock()
 
     def get_ledger(self, run_id: str) -> ExecutionLedger:
         return self.store.load(run_id)
@@ -376,6 +384,86 @@ class ApiExecutionService:
             self._save_execution_summary(run_id)
         return ledger, added
 
+    def resolve_collection_item(
+        self,
+        run_id: str,
+        action_id: str,
+        item_id: str,
+        decision: str,
+        rationale: str,
+        *,
+        replacement_type_id: str | None = None,
+    ) -> ExecutionReviewLedger:
+        """Record an audited retain, remap or omission decision without writing."""
+
+        decision = decision.strip().lower()
+        rationale = rationale.strip()
+        if decision not in {"retain", "remap", "omit"}:
+            raise ValueError("Choose retain, remap or omit")
+        if not rationale:
+            raise ValueError("Enter a reason for this duplicate-type decision")
+        action = next(
+            (
+                action
+                for record in self._readiness_report(run_id).get("records", [])
+                for action in record.get("actions", [])
+                if action.get("action_id") == action_id
+            ),
+            None,
+        )
+        if action is None or item_id not in (action.get("proposed_item_ids") or []):
+            raise ValueError("That proposed collection item does not exist in this run")
+        resource = str(action.get("resource") or "")
+        if resource not in {"address", "contact_detail", "court_opening_hours"}:
+            raise ValueError("Only collection items can use duplicate-type resolution")
+        if decision == "remap":
+            replacement_type_id = (replacement_type_id or "").strip()
+            if not self._archived_type_exists(run_id, resource, replacement_type_id):
+                raise ValueError("Choose a type from the vocabulary archived for this run")
+        else:
+            replacement_type_id = None
+        ledger = self.review_store.resolve_collection_item(
+            run_id,
+            CollectionItemResolution(
+                item_id=item_id,
+                action_id=action_id,
+                resource=resource,
+                decision=decision,
+                rationale=rationale,
+                replacement_type_id=replacement_type_id,
+            ),
+        )
+        self._reset_dependent_actions(run_id, {action_id})
+        self._save_execution_summary(run_id)
+        return ledger
+
+    def close_unactionable_court(
+        self, run_id: str, source_row_number: int, rationale: str
+    ) -> ExecutionReviewLedger:
+        """Close an unmatched authoritative submission with an auditable reason."""
+
+        rationale = rationale.strip()
+        if not rationale:
+            raise ValueError("Enter a reason for closing this court as unactionable")
+        submission = self._submissions_by_row(run_id).get(source_row_number)
+        if submission is None:
+            raise ValueError("That source row does not exist in this run")
+        if not any(
+            issue.get("code") in {"COURT_SLUG_NOT_FOUND", "COURT_SLUG_SUGGESTED"}
+            for issue in submission.get("issues", [])
+        ):
+            raise ValueError("Only a court without a defensible FaCT target can be closed")
+        ledger = self.review_store.close_court(
+            run_id,
+            CourtDisposition(
+                source_row_number=source_row_number,
+                court_slug=submission.get("court_slug"),
+                rationale=rationale,
+            ),
+        )
+        self._save_execution_summary(run_id)
+        return ledger
+
     def get_api_changes_review(self, run_id: str) -> dict[str, Any]:
         report = self._readiness_report(run_id)
         review = self.review_store.load(run_id)
@@ -442,6 +530,26 @@ class ApiExecutionService:
                     for review_id in review_ids
                     if review_id not in approval_ledger.approvals
                 ]
+                item_ids = action.get("proposed_item_ids") or []
+                proposed_items = action.get("proposed_items") or []
+                collection_items = [
+                    {
+                        "item_id": str(item_id),
+                        "value": proposed_items[index]
+                        if index < len(proposed_items)
+                        else None,
+                        "resolution": (
+                            resolution.model_dump(mode="json")
+                            if (
+                                resolution := review.collection_item_resolutions.get(
+                                    str(item_id)
+                                )
+                            )
+                            else None
+                        ),
+                    }
+                    for index, item_id in enumerate(item_ids)
+                ]
                 changes.append(
                     {
                         "change_id": change_id,
@@ -463,6 +571,10 @@ class ApiExecutionService:
                             and approval.proposed_hash == comparison.proposed_hash
                         ),
                         "pending_value_holds": pending_value_holds,
+                        "collection_items": collection_items,
+                        "type_options": self._archived_type_options(
+                            run_id, str(action.get("resource") or "")
+                        ),
                         "execution_status": self._effective_action_status(
                             run_id,
                             court_slug,
@@ -541,6 +653,13 @@ class ApiExecutionService:
             item["approval_method"] = approval.approval_method if approval else None
             item["approval_policy_version"] = approval.policy_version if approval else None
             item["approval_rationale"] = approval.rationale if approval else None
+            item["approved_field_value"] = (
+                approval.approved_field_value if approval else None
+            )
+            item["field_value_overridden"] = bool(
+                approval and approval.field_value_overridden
+            )
+            item["omitted"] = bool(approval and approval.omitted)
             item["approved_address_patch"] = (
                 approval.approved_address_patch if approval else None
             )
@@ -564,6 +683,15 @@ class ApiExecutionService:
                     }
                 )
                 item["proposed_address"] = proposed
+            item["requires_manual_text_review"] = _requires_manual_text_review(item)
+            item["field_editable"] = bool(
+                _is_optional_explanation_review(item)
+                and item.get("approval_status") not in {"already_executed"}
+            )
+            if approval and approval.field_value_overridden:
+                item["approved_display_value"] = (
+                    None if approval.omitted else approval.approved_field_value
+                )
             linked_values = {
                 str(action_id): linked
                 for action_id in item.get("dependent_action_ids", [])
@@ -640,6 +768,14 @@ class ApiExecutionService:
                 if item.get("approvable", item.get("actionable"))
                 else "not_actionable"
             )
+            disposition = execution_review.court_dispositions.get(
+                str(item.get("source_row_number") or "")
+            )
+            if disposition and item["approval_status"] != "already_executed":
+                item["approval_status"] = "not_actionable"
+                item["approvable"] = False
+                item["actionable"] = False
+                item["court_disposition"] = disposition.model_dump(mode="json")
             item["comparison_summary"] = _llm_item_comparison(item)
             items.append(item)
         return {**report, "items": items, "approval_counts": _approval_counts(items)}
@@ -661,6 +797,9 @@ class ApiExecutionService:
         review_id: str,
         *,
         address_patch: dict[str, str | None] | None = None,
+        field_value: str | None = None,
+        omit_field: bool = False,
+        omission_rationale: str | None = None,
         execution_job_active: bool = False,
     ) -> LlmApprovalLedger:
         report = self._llm_review_report(run_id)
@@ -718,12 +857,43 @@ class ApiExecutionService:
                 self._reset_dependent_actions(run_id, action_ids)
         elif address_patch is not None:
             raise ValueError("Address override fields are valid only for address reviews")
+        elif current_item.get("field_editable"):
+            if execution_job_active:
+                raise ValueError(
+                    "Wait for the active execution job to finish before editing this value"
+                )
+            prohibited = {
+                action.get("status")
+                for action in current_item.get("dependent_actions", [])
+            } & {"running", "succeeded", "unknown"}
+            if prohibited:
+                raise ValueError(
+                    "This value cannot be edited after execution starts, succeeds, or becomes uncertain"
+                )
+            ledger = self.approval_store.approve_field(
+                run_id,
+                review_id,
+                field_value,
+                omitted=omit_field,
+                rationale=omission_rationale,
+            )
+            action_ids = {
+                str(action_id)
+                for action_id in current_item.get("dependent_action_ids", [])
+                if action_id
+            }
+            self.review_store.invalidate_actions(run_id, action_ids)
+            self._reset_dependent_actions(run_id, action_ids)
+        elif field_value is not None or omit_field:
+            raise ValueError("Editable field values are valid only for supported text reviews")
         else:
             ledger = self.approval_store.approve(run_id, review_id)
         self._save_execution_summary(run_id, approvals=ledger, review_report=report)
         return ledger
 
-    def deny_llm_review(self, run_id: str, review_id: str) -> LlmApprovalLedger:
+    def deny_llm_review(
+        self, run_id: str, review_id: str, rationale: str
+    ) -> LlmApprovalLedger:
         """Deny one pending usable result without executing a FaCT action."""
 
         report = self.get_llm_actions_review(run_id)
@@ -739,7 +909,7 @@ class ApiExecutionService:
             raise ValueError(f"LLM review item '{review_id}' does not exist in run '{run_id}'")
         if current_item.get("approval_status") != "pending":
             raise ValueError("Only a pending LLM result can be denied")
-        ledger = self.approval_store.deny(run_id, review_id)
+        ledger = self.approval_store.deny(run_id, review_id, rationale)
         self._save_execution_summary(
             run_id,
             approvals=ledger,
@@ -780,7 +950,9 @@ class ApiExecutionService:
         review_ids = {
             str(item["review_id"])
             for item in report.get("items", [])
-            if item.get("review_id") and item.get("approval_status") == "pending"
+            if item.get("review_id")
+            and item.get("approval_status") == "pending"
+            and not item.get("requires_manual_text_review")
         }
         ledger, added = self.approval_store.approve_many(run_id, review_ids)
         if added:
@@ -894,48 +1066,94 @@ class ApiExecutionService:
                 client.close()
         return self._save_with_summary(run_id, ledger)
 
-    def execute_all_safe_actions(self, run_id: str) -> ExecutionLedger:
-        """Execute every unattempted, preflight-safe court action sequentially.
-
-        This is intentionally a single-threaded operation. It shares the
-        postcode cache/rate limiter, preserves progress after each court, and
-        never automatically retries terminal action states from an earlier
-        execution attempt.
-        """
+    def execute_all_safe_actions(
+        self,
+        run_id: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> ExecutionLedger:
+        """Execute up to four courts concurrently, preserving court action order."""
 
         self._require_writes_enabled()
         report = self._readiness_report(run_id)
         records = sorted(
             report.get("records", []), key=lambda record: str(record.get("court_slug") or "")
         )
+        current = self.store.load(run_id)
+        records = [
+            record
+            for record in records
+            if self._batch_actions_to_attempt(
+                current,
+                {
+                    **record,
+                    "actions": self._active_actions(run_id, record),
+                },
+            )
+        ]
+        workers = (
+            1
+            if self._client is not None
+            else self.config.fact_data_api_execution_concurrency
+        )
+        last_summary = time.monotonic()
+        completed = 0
+        if progress_callback:
+            progress_callback(0, len(records))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="fact-court"
+        ) as executor:
+            futures = {
+                executor.submit(self._execute_record_for_run, run_id, record): record
+                for record in records
+            }
+            for future in as_completed(futures):
+                future.result()
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, len(records))
+                now = time.monotonic()
+                if completed % 10 == 0 or now - last_summary >= 10:
+                    self._save_execution_summary(run_id, report=report)
+                    last_summary = now
         ledger = self.store.load(run_id)
+        return self._save_with_summary(run_id, ledger, report)
+
+    def _execute_record_for_run(
+        self, run_id: str, record: dict[str, Any]
+    ) -> None:
+        """Execute one court in isolation and merge only that court into state."""
+
+        court_slug = str(record.get("court_slug") or "")
+        current = self.store.load(run_id)
+        ledger = ExecutionLedger(run_id=run_id)
+        if court_slug in current.courts:
+            ledger.courts[court_slug] = current.courts[court_slug].model_copy(deep=True)
+        court = self._court_state(ledger, court_slug, record.get("court_id"))
+        active_actions = self._active_actions(run_id, record)
+        actions = self._batch_actions_to_attempt(
+            ledger, {**record, "actions": active_actions}
+        )
+        if not actions:
+            self._update_court_status(court, record.get("actions", []))
+            self.store.save_court(run_id, court)
+            return
         client, close = self._client_or_new()
         try:
-            for record in records:
-                court_slug = str(record.get("court_slug") or "")
-                court = self._court_state(ledger, court_slug, record.get("court_id"))
-                active_actions = self._active_actions(run_id, record)
-                actions = self._batch_actions_to_attempt(
-                    ledger, {**record, "actions": active_actions}
-                )
-                if not actions:
-                    self._update_court_status(court, record.get("actions", []))
-                    self._save_with_summary(run_id, ledger, report)
-                    continue
-                try:
-                    for action in actions:
-                        # Re-read and hash-check immediately before each write.
-                        self._preflight_actions(run_id, ledger, record, [action], client)
-                        state = self._action_state(ledger, court_slug, str(action["action_id"]))
-                        if state.status == "ready":
-                            self._write_action(run_id, ledger, record, action, client)
-                except Exception as exc:  # retain progress and continue with later courts
-                    self._record_unexpected_court_error(ledger, record, actions, exc)
-                self._save_with_summary(run_id, ledger, report)
+            try:
+                for action in actions:
+                    self._preflight_actions(run_id, ledger, record, [action], client)
+                    self.store.save_court(run_id, court)
+                    state = self._action_state(
+                        ledger, court_slug, str(action["action_id"])
+                    )
+                    if state.status == "ready":
+                        self._write_action(run_id, ledger, record, action, client)
+            except Exception as exc:
+                self._record_unexpected_court_error(ledger, record, actions, exc)
         finally:
+            self.store.save_court(run_id, court)
             if close:
                 client.close()
-        return self._save_with_summary(run_id, ledger, report)
 
     def get_execution_summary(self, run_id: str) -> dict[str, Any]:
         report = self._llm_review_report(run_id)
@@ -959,6 +1177,15 @@ class ApiExecutionService:
         if summary and summary.get("summary_version") == EXECUTION_SUMMARY_VERSION:
             return summary
         return self.get_execution_summary(run_id)
+
+    def get_business_report(self, run_id: str) -> dict[str, Any]:
+        self._readiness_report(run_id)
+        return build_business_report(
+            run_id,
+            self.store.load(run_id),
+            self.review_store.load(run_id),
+            self.approval_store.load(run_id),
+        )
 
     def _record(self, run_id: str, court_slug: str) -> dict[str, Any]:
         report = self._readiness_report(run_id)
@@ -1176,9 +1403,6 @@ class ApiExecutionService:
     ) -> None:
         actions = list(actions)
         court_slug = str(record["court_slug"])
-        self._postcode_lookup.set_lookup(
-            lambda postcode: client.get(f"/search/address/v1/postcode/{quote(postcode, safe='')}")
-        )
         try:
             court = client.lookup_court(court_slug)
         except (httpx.HTTPError, ValueError) as exc:
@@ -1265,17 +1489,6 @@ class ApiExecutionService:
             legacy_reason_is_resolved = bool(
                 approved_address and _legacy_address_reason_is_only_blocker(action)
             ) or _legacy_lift_reason_is_only_blocker(action, request_defaults)
-            if action.get("readiness") != "ready" and not legacy_reason_is_resolved:
-                self._set_action(
-                    ledger,
-                    court_slug,
-                    action,
-                    "blocked",
-                    "preflight",
-                    None,
-                    str(action.get("reason") or "Action body is not ready for FaCT"),
-                )
-                continue
             collection = action.get("resource") in {
                 "address",
                 "contact_detail",
@@ -1293,6 +1506,26 @@ class ApiExecutionService:
                     )
                 ]
             )
+            duplicate_reason_is_resolved = bool(
+                collection
+                and _reason_contains_only_duplicate_type_conflicts(
+                    str(action.get("reason") or "")
+                )
+                and not merged_target_state(action, [], bodies)[2]
+            )
+            if action.get("readiness") != "ready" and not (
+                legacy_reason_is_resolved or duplicate_reason_is_resolved
+            ):
+                self._set_action(
+                    ledger,
+                    court_slug,
+                    action,
+                    "blocked",
+                    "preflight",
+                    None,
+                    str(action.get("reason") or "Action body is not ready for FaCT"),
+                )
+                continue
             if not bodies:
                 self._set_action(
                     ledger,
@@ -1312,12 +1545,18 @@ class ApiExecutionService:
                 address_action = action
                 if index < len(verifications) and isinstance(verifications[index], dict):
                     address_action = {**action, "address_verification": verifications[index]}
-                address_result = _address_os_preflight_result(
-                    address_action,
-                    body,
-                    self._postcode_lookup.get,
-                    approved_address=approved_addresses[index],
-                )
+                with self._postcode_lock:
+                    self._postcode_lookup.set_lookup(
+                        lambda postcode: client.get(
+                            f"/search/address/v1/postcode/{quote(postcode, safe='')}"
+                        )
+                    )
+                    address_result = _address_os_preflight_result(
+                        address_action,
+                        body,
+                        self._postcode_lookup.get,
+                        approved_address=approved_addresses[index],
+                    )
                 if address_result.status != "ready":
                     self._set_action(
                         ledger,
@@ -1432,6 +1671,15 @@ class ApiExecutionService:
         court_slug = str(record["court_slug"])
         state = self._action_state(ledger, court_slug, action["action_id"])
         state.status = "running"
+        persistence_seconds = 0.0
+        request_seconds = 0.0
+        write_request_count = 0
+        accepted_write_count = 0
+        rejected_write_count = 0
+        unknown_write_count = 0
+        persist_started = time.monotonic()
+        self.store.save_court(run_id, self._court_state(ledger, court_slug))
+        persistence_seconds += time.monotonic() - persist_started
         court_id = self._court_state(ledger, court_slug).court_id
         if not court_id:
             self._set_action(
@@ -1482,8 +1730,13 @@ class ApiExecutionService:
                             )
                             break
                     try:
+                        request_started = time.monotonic()
+                        write_request_count += 1
                         response = client.write(method, str(operation.get("path") or ""), body)
+                        request_seconds += time.monotonic() - request_started
                     except httpx.TimeoutException:
+                        request_seconds += time.monotonic() - request_started
+                        unknown_write_count += 1
                         self._set_action(
                             ledger,
                             court_slug,
@@ -1495,14 +1748,20 @@ class ApiExecutionService:
                         )
                         break
                     except httpx.HTTPError as exc:
+                        request_seconds += time.monotonic() - request_started
                         http_status, reason = _preflight_error_details(
                             "merged section request", exc
                         )
+                        if http_status is None:
+                            unknown_write_count += 1
+                        else:
+                            rejected_write_count += 1
                         self._set_action(
                             ledger, court_slug, action, "failed", "execute", http_status, reason
                         )
                         break
                     if not 200 <= response.status_code < 300:
+                        rejected_write_count += 1
                         self._set_action(
                             ledger,
                             court_slug,
@@ -1513,8 +1772,13 @@ class ApiExecutionService:
                             _write_rejection_reason(response.status_code, response.body),
                         )
                         break
+                    accepted_write_count += 1
                     completed_operations += 1
-                    self._save_with_summary(run_id, ledger)
+                    persist_started = time.monotonic()
+                    self.store.save_court(
+                        run_id, self._court_state(ledger, court_slug)
+                    )
+                    persistence_seconds += time.monotonic() - persist_started
                 else:
                     self._set_action(
                         ledger,
@@ -1537,6 +1801,21 @@ class ApiExecutionService:
                         completed_operations,
                         client,
                     )
+        execute_attempt = next(
+            (attempt for attempt in reversed(state.attempts) if attempt.operation == "execute"),
+            None,
+        )
+        if execute_attempt:
+            execute_attempt.request_duration_ms = round(
+                request_seconds * 1000, 3
+            )
+            execute_attempt.persistence_duration_ms = round(
+                persistence_seconds * 1000, 3
+            )
+            execute_attempt.write_request_count = write_request_count
+            execute_attempt.accepted_write_count = accepted_write_count
+            execute_attempt.rejected_write_count = rejected_write_count
+            execute_attempt.unknown_write_count = unknown_write_count
         self._update_court_status(
             self._court_state(ledger, court_slug), self._active_actions(run_id, record)
         )
@@ -1648,6 +1927,9 @@ class ApiExecutionService:
                         items[index].pop(field, None)
                     else:
                         items[index][field] = value
+        if action.get("resource") == "contact_detail":
+            self._apply_approved_contact_explanations(run_id, action, items)
+        items = self._apply_collection_item_resolutions(run_id, action, items)
         request_defaults = self._request_only_defaults(run_id, action)
         for item in items:
             item.update(request_defaults)
@@ -1657,6 +1939,116 @@ class ApiExecutionService:
             normalise_fact_api_action_body(str(action.get("resource") or ""), item)
             for item in items
         ]
+
+    def _apply_collection_item_resolutions(
+        self,
+        run_id: str,
+        action: dict[str, Any],
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        item_ids = action.get("proposed_item_ids") or []
+        if not isinstance(item_ids, list):
+            return items
+        resolutions = self.review_store.load(run_id).collection_item_resolutions
+        result: list[dict[str, Any]] = []
+        type_field = {
+            "address": "addressType",
+            "contact_detail": "courtContactDescriptionId",
+            "court_opening_hours": "openingHourTypeId",
+        }.get(str(action.get("resource") or ""))
+        for index, item in enumerate(items):
+            item_id = str(item_ids[index]) if index < len(item_ids) else ""
+            resolution = resolutions.get(item_id)
+            if resolution and resolution.decision == "omit":
+                continue
+            resolved = dict(item)
+            if (
+                resolution
+                and resolution.decision == "remap"
+                and resolution.replacement_type_id
+                and type_field
+            ):
+                resolved[type_field] = resolution.replacement_type_id
+            result.append(resolved)
+        return result
+
+    def _archived_type_exists(
+        self, run_id: str, resource: str, type_id: str
+    ) -> bool:
+        return any(
+            option["api_id"] == type_id
+            for option in self._archived_type_options(run_id, resource)
+        )
+
+    def _archived_type_options(
+        self, run_id: str, resource: str
+    ) -> list[dict[str, str]]:
+        vocabulary_name = {
+            "address": "address_types",
+            "contact_detail": "contact_description_types",
+            "court_opening_hours": "opening_hour_types",
+        }.get(resource)
+        archive = load_run_archive(self.output_root, run_id)
+        if archive is None or vocabulary_name is None:
+            return []
+        path = archive["path"] / "fact_vocabularies.json"
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        entries = payload.get("vocabularies", {}).get(vocabulary_name, [])
+        return [
+            {"api_id": str(entry["api_id"]), "name": str(entry.get("name") or "")}
+            for entry in entries
+            if entry.get("api_id")
+        ]
+
+    def _apply_approved_contact_explanations(
+        self,
+        run_id: str,
+        action: dict[str, Any],
+        items: list[dict[str, Any]],
+    ) -> None:
+        """Overlay reviewed explanation edits without changing archived evidence."""
+
+        source_fields = action.get("proposed_item_source_fields") or []
+        if not isinstance(source_fields, list):
+            return
+        approvals = self.approval_store.load(run_id)
+        report = self._llm_review_report(run_id)
+        review_by_field = {
+            str(item.get("field")): str(item.get("review_id"))
+            for item in report.get("items", [])
+            if item.get("kind") == "field"
+            and str(item.get("field") or "").endswith(".explanation")
+            and item.get("review_id")
+        }
+        for index, item_fields in enumerate(source_fields[: len(items)]):
+            if not isinstance(item_fields, list):
+                continue
+            review_id = next(
+                (
+                    review_id
+                    for review_field, review_id in review_by_field.items()
+                    if any(
+                        review_field == str(source_field)
+                        or review_field.startswith(f"{source_field}.")
+                        for source_field in item_fields
+                    )
+                ),
+                None,
+            )
+            if review_id is None:
+                continue
+            approval = approvals.approvals.get(review_id)
+            if not approval or not approval.field_value_overridden:
+                continue
+            if approval.omitted:
+                items[index].pop("explanation", None)
+            else:
+                items[index]["explanation"] = approval.approved_field_value
 
     def _request_only_defaults(
         self, run_id: str, action: dict[str, Any]
@@ -1671,6 +2063,12 @@ class ApiExecutionService:
         self, run_id: str, record: dict[str, Any]
     ) -> list[dict[str, Any]]:
         actions = list(record.get("actions", []))
+        dispositions = self.review_store.load(run_id).court_dispositions
+        if any(
+            str(row) in dispositions
+            for row in record.get("source_row_numbers", [])
+        ):
+            return []
         if not any(action.get("source_selection_required") for action in actions):
             return actions
         selected = self.review_store.load(run_id).source_selections.get(
@@ -2418,6 +2816,24 @@ def _response_contains_uprn(body: Any, uprn: str) -> bool:
     return False
 
 
+def _requires_manual_text_review(item: dict[str, Any]) -> bool:
+    """Keep overlength-source explanation repairs out of automatic/bulk approval."""
+
+    if item.get("kind") != "field" or not str(item.get("field") or "").endswith(
+        ".explanation"
+    ):
+        return False
+    llm_input = item.get("llm_input")
+    source = llm_input.get("cleaned_value") if isinstance(llm_input, dict) else None
+    return isinstance(source, str) and len(source) > 250
+
+
+def _is_optional_explanation_review(item: dict[str, Any]) -> bool:
+    return item.get("kind") == "field" and str(item.get("field") or "").endswith(
+        ".explanation"
+    )
+
+
 def _legacy_address_reason_is_only_blocker(action: dict[str, Any]) -> bool:
     evidence = action.get("address_verification")
     if not isinstance(evidence, dict) or evidence.get("status") != "review_required":
@@ -2472,6 +2888,14 @@ def _legacy_lift_reason_is_only_blocker(
     }
     return bool(reasons) and all(
         required_field_by_reason.get(reason) in request_defaults for reason in reasons
+    )
+
+
+def _reason_contains_only_duplicate_type_conflicts(reason: str) -> bool:
+    reasons = [item.strip() for item in reason.split(";") if item.strip()]
+    return bool(reasons) and all(
+        item.startswith("Multiple ") and " entries use business type " in item
+        for item in reasons
     )
 
 

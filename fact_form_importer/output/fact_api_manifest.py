@@ -26,11 +26,11 @@ from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "1.9"
+API_MANIFEST_VERSION = "2.0"
 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
-MISSING_SUPPORT_PHONE_PLACEHOLDER = "00000000000"
+MISSING_SUPPORT_PHONE_PLACEHOLDER = "+44 0000000000"
 _REVIEW_REQUIRED_MIGRATION_DEFAULT_PREFIX = "Review-required migration default:"
 _UNAVAILABLE_LIFT_MEASUREMENT_MARKERS = {
     "na",
@@ -84,6 +84,8 @@ class FactApiAction(BaseModel):
     source_selection_required: bool = False
     section_id: Optional[str] = None
     proposed_items: list[dict[str, Any]] = Field(default_factory=list)
+    proposed_item_ids: list[str] = Field(default_factory=list)
+    proposed_item_source_fields: list[list[str]] = Field(default_factory=list)
     proposed_item_clear_fields: list[list[str]] = Field(default_factory=list)
     address_verifications: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -260,6 +262,14 @@ def _build_record(
                     f"{submission.court_slug}:{resource}:{submission.source.source_row_number}"
                 ),
                 proposed_items=[body],
+                proposed_item_ids=[
+                    _proposed_item_id(
+                        submission.source.source_row_number,
+                        resource,
+                        source_fields or [],
+                    )
+                ],
+                proposed_item_source_fields=[source_fields or []],
                 proposed_item_clear_fields=[
                     _explicit_clear_fields(resource, llm_review_items, source_fields or [])
                 ],
@@ -410,6 +420,8 @@ def _group_collection_actions(actions: list[FactApiAction]) -> list[FactApiActio
             grouped.append(action)
             continue
         existing.proposed_items.extend(action.proposed_items or [action.body])
+        existing.proposed_item_ids.extend(action.proposed_item_ids)
+        existing.proposed_item_source_fields.extend(action.proposed_item_source_fields)
         existing.proposed_item_clear_fields.extend(
             action.proposed_item_clear_fields or [[]]
         )
@@ -507,10 +519,14 @@ def _accessibility_options_body(facilities: dict[str, Any]) -> dict[str, Any]:
     return _without_none(
         {
             "accessibleParking": facilities.get("accessible_parking"),
-            "accessibleParkingPhoneNumber": facilities.get("accessible_parking_phone"),
+            "accessibleParkingPhoneNumber": _valid_phone_or_none(
+                facilities.get("accessible_parking_phone")
+            ),
             "accessibleToiletDescription": facilities.get("accessible_toilet_description"),
             "accessibleEntrance": facilities.get("accessible_entrance"),
-            "accessibleEntrancePhoneNumber": facilities.get("accessible_entrance_support_phone"),
+            "accessibleEntrancePhoneNumber": _valid_phone_or_none(
+                facilities.get("accessible_entrance_support_phone")
+            ),
             "hearingEnhancementEquipment": hearing_equipment.get(
                 facilities.get("hearing_enhancement_equipment")
             ),
@@ -551,19 +567,21 @@ def _accessibility_options_assumptions(facilities: dict[str, Any]) -> list[str]:
             "field. If live FaCT has no number to preserve, the effective request uses "
             f"{MISSING_SUPPORT_PHONE_PLACEHOLDER}. It does not amend the source or cleaned data."
         )
-    if facilities.get("lift_available") is True and is_unavailable_lift_measurement(
-        facilities.get("lift_door_width")
-    ):
+    if facilities.get("lift_available") is True and _parse_lift_measurement(
+        facilities.get("lift_door_width"), "width"
+    ) is None:
         assumptions.append(
             "Review-required migration default: lift is marked available but the source has no "
-            "door width, so this FaCT request uses 1 cm. It does not amend the source or cleaned data."
+            "usable door width, so this FaCT request uses 1 cm. It does not amend the source or "
+            "cleaned data."
         )
-    if facilities.get("lift_available") is True and is_unavailable_lift_measurement(
-        facilities.get("lift_weight_limit")
-    ):
+    if facilities.get("lift_available") is True and _parse_lift_measurement(
+        facilities.get("lift_weight_limit"), "weight"
+    ) is None:
         assumptions.append(
             "Review-required migration default: lift is marked available but the source has no "
-            "weight limit, so this FaCT request uses 1 kg. It does not amend the source or cleaned data."
+            "usable weight limit, so this FaCT request uses 1 kg. It does not amend the source or "
+            "cleaned data."
         )
     return assumptions
 
@@ -571,7 +589,7 @@ def _accessibility_options_assumptions(facilities: dict[str, Any]) -> list[str]:
 def _translation_body(submission: CourtSubmission) -> dict[str, Any]:
     return _without_none(
         {
-            "phoneNumber": submission.translation_phone,
+            "phoneNumber": _valid_phone_or_none(submission.translation_phone),
             "email": submission.translation_email,
         }
     )
@@ -588,7 +606,7 @@ def _professional_information_body(submission: CourtSubmission) -> dict[str, Any
         {
             "interviewRooms": interview_rooms,
             "interviewRoomCount": _interview_room_count_for_request(rooms),
-            "interviewPhoneNumber": rooms.get("booking_phone"),
+            "interviewPhoneNumber": _valid_phone_or_none(rooms.get("booking_phone")),
             # The Microsoft Forms export does not collect these three fields.
             # Product approved false as the migration default; this applies only
             # to the FaCT request body and never changes the source submission.
@@ -608,10 +626,12 @@ def _professional_information_assumptions(submission: CourtSubmission) -> list[s
         "Migration policy: the form does not collect videoHearings, commonPlatform, "
         "or accessScheme, so this request defaults each field to false."
     ]
-    if rooms.get("has_interview_rooms") is True and _is_missing_form_value(rooms.get("room_count")):
+    if rooms.get("has_interview_rooms") is True and _parse_interview_room_count(
+        rooms.get("room_count")
+    ) is None:
         assumptions.append(
             "Review-required migration default: interview rooms are marked available but the source has no "
-            "room count, so this FaCT request uses 1. It does not amend the source or cleaned data."
+            "usable room count, so this FaCT request uses 1. It does not amend the source or cleaned data."
         )
     elif rooms.get("has_interview_rooms") is False and _positive_int(
         rooms.get("room_count")
@@ -638,7 +658,13 @@ def _counter_service_body(
 ) -> tuple[dict[str, Any], str | None]:
     counter = submission.counter_service
     assists_with = set(counter.get("assists_with") or [])
-    appointment_contact = counter.get("appointment_contact")
+    raw_appointment_contact = counter.get("appointment_contact")
+    appointment_contact = (
+        raw_appointment_contact
+        if isinstance(raw_appointment_contact, str)
+        and _FACT_API_EMAIL_PATTERN.fullmatch(raw_appointment_contact)
+        else None
+    )
     times = _counter_opening_times(counter)
     evidence = bool(assists_with or appointment_contact or times)
     if not evidence:
@@ -699,7 +725,7 @@ def _contact_body(contact, vocabularies: Vocabularies | None) -> tuple[dict[str,
             {
                 "courtContactDescriptionId": description_id,
                 "explanation": contact.explanation,
-                "phoneNumber": contact.phone,
+                "phoneNumber": _valid_phone_or_none(contact.phone),
                 "email": contact.email,
             }
         ),
@@ -762,6 +788,8 @@ def _time_detail(day: str, value: Any) -> list[dict[str, str]]:
     else:
         return []
     if status != "valid_time" or not opening_time or not closing_time:
+        return []
+    if opening_time == "00:00" and closing_time == "00:00":
         return []
     return [{"dayOfWeek": day, "openingTime": opening_time, "closingTime": closing_time}]
 
@@ -868,6 +896,15 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
         errors.extend(_contact_validation_errors(body))
     if resource in {"counter_service_opening_hours", "court_opening_hours"}:
         errors.extend(_opening_times_validation_errors(body))
+    if resource == "counter_service_opening_hours":
+        appointment_contact = body.get("appointmentContact")
+        if body.get("appointmentNeeded") is True and appointment_contact is None:
+            errors.append("appointmentContact is required by the FaCT API when appointmentNeeded is true")
+        elif appointment_contact is not None and (
+            not isinstance(appointment_contact, str)
+            or not _FACT_API_EMAIL_PATTERN.fullmatch(appointment_contact)
+        ):
+            errors.append("appointmentContact does not match the FaCT API email format")
 
     for field, value in body.items():
         if isinstance(value, str) and len(value) > 255:
@@ -931,6 +968,14 @@ def normalise_fact_api_action_body(resource: str, body: dict[str, Any]) -> dict[
         value = cleaned.get("explanation")
         if isinstance(value, str):
             cleaned["explanation"] = _normalise_fact_api_explanation(value)
+    elif resource == "counter_service_opening_hours":
+        appointment_contact = cleaned.get("appointmentContact")
+        if appointment_contact is not None and (
+            not isinstance(appointment_contact, str)
+            or not _FACT_API_EMAIL_PATTERN.fullmatch(appointment_contact)
+        ):
+            cleaned.pop("appointmentContact", None)
+            cleaned["appointmentNeeded"] = False
     return cleaned
 
 
@@ -1115,14 +1160,11 @@ def _is_missing_form_value(value: Any) -> bool:
 
 
 def is_unavailable_lift_measurement(value: Any) -> bool:
-    """Recognise a blank or explicit not-known answer, without accepting arbitrary prose."""
+    """Return whether a submitted lift measurement needs the approved minimum."""
 
-    if _is_missing_form_value(value):
-        return True
-    if not isinstance(value, str):
-        return False
-    marker = re.sub(r"[^a-z0-9]+", "", value.casefold())
-    return marker in _UNAVAILABLE_LIFT_MEASUREMENT_MARKERS
+    return _parse_lift_measurement(value, "width") is None and _parse_lift_measurement(
+        value, "weight"
+    ) is None
 
 
 def _lift_measurement_for_request(
@@ -1145,7 +1187,7 @@ def _lift_measurement_for_request(
     parsed = _parse_lift_measurement(value, measurement)
     if parsed is not None:
         return parsed
-    if lift_available is True and is_unavailable_lift_measurement(value):
+    if lift_available is True:
         return migration_default
     return None
 
@@ -1184,9 +1226,16 @@ def _parse_lift_measurement(
             "metres": Decimal("100"),
             "meter": Decimal("100"),
             "meters": Decimal("100"),
+            "in": Decimal("2.54"),
+            "inch": Decimal("2.54"),
+            "inches": Decimal("2.54"),
+            "ft": Decimal("30.48"),
+            "foot": Decimal("30.48"),
+            "feet": Decimal("30.48"),
         }
         unit_pattern = (
-            r"millimetres?|millimeters?|centimetres?|centimeters?|cms?|mm|metres?|meters?|m"
+            r"millimetres?|millimeters?|centimetres?|centimeters?|cms?|mm|"
+            r"metres?|meters?|inches?|in|feet|foot|ft|m"
         )
     else:
         units = {
@@ -1194,8 +1243,12 @@ def _parse_lift_measurement(
             "kgs": Decimal("1"),
             "kilogram": Decimal("1"),
             "kilograms": Decimal("1"),
+            "lb": Decimal("0.45359237"),
+            "lbs": Decimal("0.45359237"),
+            "pound": Decimal("0.45359237"),
+            "pounds": Decimal("0.45359237"),
         }
-        unit_pattern = r"kilograms?|kgs?"
+        unit_pattern = r"kilograms?|kgs?|pounds?|lbs?"
 
     converted = []
     for match in re.finditer(rf"(?<![\d.])(\d+(?:\.\d+)?)\s*({unit_pattern})\b", text):
@@ -1204,11 +1257,8 @@ def _parse_lift_measurement(
             converted.append(number * units[match.group(2)])
     if not converted:
         return None
-    parsed_values = [_positive_integral_decimal(item) for item in converted]
-    if any(item is None for item in parsed_values):
-        return None
-    values = set(parsed_values)
-    return next(iter(values)) if len(values) == 1 else None
+    parsed_values = [int(item) for item in converted if item >= 1]
+    return min(parsed_values) if parsed_values else None
 
 
 def _positive_integral_decimal(value: Any) -> int | None:
@@ -1238,12 +1288,80 @@ def _interview_room_count_for_request(rooms: dict[str, Any]) -> int | None:
     if has_interview_rooms is False:
         return 0
 
-    parsed = _positive_int(value)
+    parsed = _parse_interview_room_count(value)
     if parsed is not None:
         return parsed
-    if has_interview_rooms is True and _is_missing_form_value(value):
+    if has_interview_rooms is True:
         return _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT
     return None
+
+
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+}
+_COUNT_TOKEN = r"(?:\d+|" + "|".join(_NUMBER_WORDS) + r")"
+
+
+def _parse_interview_room_count(value: Any) -> int | None:
+    direct = _positive_int(value)
+    if direct is not None:
+        return direct if direct <= 150 else None
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFKC", value).strip().casefold()
+    if not text:
+        return None
+
+    def number(token: str) -> int:
+        return int(token) if token.isdigit() else _NUMBER_WORDS[token]
+
+    room_matches = re.findall(
+        rf"\b({_COUNT_TOKEN})\b(?=[^.;]{{0,30}}\b(?:interview|consultation|small)?\s*rooms?\b)",
+        text,
+    )
+    if room_matches:
+        total = sum(number(token) for token in room_matches)
+        return total if 1 <= total <= 150 else None
+    whole_word = _NUMBER_WORDS.get(text)
+    if whole_word is not None:
+        return whole_word
+    leading = re.match(rf"^(?:at\s+least\s+)?({_COUNT_TOKEN})\b", text)
+    if leading:
+        parsed = number(leading.group(1))
+        return parsed if parsed <= 150 else None
+    return None
+
+
+def _valid_phone_or_none(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    phone = re.sub(r"\s+", " ", value).strip()
+    return phone if _FACT_API_PHONE_PATTERN.fullmatch(phone) else None
+
+
+def _proposed_item_id(source_row: int, resource: str, source_fields: list[str]) -> str:
+    source = ",".join(sorted(source_fields)) or resource
+    safe_source = re.sub(r"[^a-z0-9]+", "-", source.casefold()).strip("-")
+    return f"row-{source_row}-{resource}-{safe_source}"
 
 
 def _combine_reasons(*reasons: str | None) -> str | None:

@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from fact_form_importer.execution.atomic_state import atomic_write_json, file_lock
 from fact_form_importer.llm.review import address_verification_batch_from_dict
 from fact_form_importer.models.court_submission import CourtSubmission
 from fact_form_importer.output.fact_api_manifest import (
@@ -38,8 +39,11 @@ def derive_latest_execution_overlay(
         }
         for row, reference in sorted(overrides.items())
     }
+    existing_derived: dict[str, Any] | None = None
     if path.exists():
-        derived = json.loads(path.read_text(encoding="utf-8"))
+        with file_lock(path):
+            derived = json.loads(path.read_text(encoding="utf-8"))
+        existing_derived = derived
         if (
             derived.get("manifest_version") == API_MANIFEST_VERSION
             and derived.get("court_target_overrides", {}) == override_evidence
@@ -58,7 +62,9 @@ def derive_latest_execution_overlay(
         # They remain usable through their original manifest.
         return original
     if not submissions:
-        return original
+        return _preserve_succeeded_sections(
+            existing_derived or original, original, succeeded_action_ids or set()
+        )
     submissions, submission_selection = select_authoritative_submissions(submissions)
     overridden_submissions = []
     for submission in submissions:
@@ -112,6 +118,22 @@ def derive_latest_execution_overlay(
         address_verifications=address_verification_batch_from_dict(address_report),
         llm_review_items=llm_items,
     ).manifest.model_dump(mode="json")
+    # Early/test archives can contain schema-valid but deliberately abbreviated
+    # submissions alongside a usable legacy action plan. Preserve any legacy
+    # record whose source row could not be reconstructed from that evidence.
+    derived_rows = {
+        row
+        for record in result.get("records", [])
+        for row in record.get("source_row_numbers", [])
+        if isinstance(row, int)
+    }
+    retained_legacy = [
+        record
+        for record in original.get("records", [])
+        if not derived_rows.intersection(record.get("source_row_numbers", []))
+    ]
+    if retained_legacy:
+        result["records"] = retained_legacy + result.get("records", [])
     if overrides:
         override_rows = set(overrides)
         retained_records = [
@@ -130,9 +152,8 @@ def derive_latest_execution_overlay(
     result["submission_selection"] = submission_selection
     result["court_target_overrides"] = override_evidence
     directory.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    with file_lock(path):
+        atomic_write_json(path, result)
     return _preserve_succeeded_sections(result, original, succeeded_action_ids or set())
 
 

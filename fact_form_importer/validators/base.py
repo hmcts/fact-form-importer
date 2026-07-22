@@ -390,7 +390,10 @@ def _validate_counter_service(
         "counter_service_assistance",
         vocabularies,
     )
-    _validate_optional_phone_or_email(
+    # FaCT's counter-service contract names this generically, but validates it
+    # as an email address.  Preserve invalid/phone-shaped source text in the
+    # audit evidence and warning while excluding it from the request body.
+    _validate_optional_email(
         submission,
         "counter_service.appointment_contact",
         submission.counter_service.get("appointment_contact"),
@@ -463,33 +466,6 @@ def _validate_optional_phone(submission: CourtSubmission, field: str, value: Any
 
     for issue in normalise_uk_phone(value, field).issues:
         add_issue_once(submission, issue)
-
-
-def _validate_optional_phone_or_email(
-    submission: CourtSubmission,
-    field: str,
-    value: Any,
-) -> None:
-    cleaned = null_if_empty_like(value)
-    if cleaned is None:
-        return
-
-    email_result = normalise_email(cleaned, field)
-    phone_result = normalise_uk_phone(cleaned, field)
-    if not email_result.issues or not phone_result.issues:
-        return
-
-    add_issue_once(
-        submission,
-        Issue(
-            field=field,
-            code=INVALID_EMAIL,
-            severity="warning",
-            message="Value is not a valid email address or UK phone number",
-            raw_value=value,
-            cleaned_value=cleaned,
-        ),
-    )
 
 
 def _validate_optional_postcode(submission: CourtSubmission, field: str, value: Any) -> None:

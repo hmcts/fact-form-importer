@@ -236,6 +236,8 @@ def build_llm_test_request() -> LlmNormalisationRequest:
             "contact.explanation": [
                 "Make the text suitable for public display.",
                 "Preserve the factual meaning.",
+                "Return no more than 250 characters, including punctuation.",
+                "If the submitted value exceeds 250 characters, shorten it factually and set needs_human_review to true.",
                 "Remove days and opening/closing times represented by structured opening hours.",
                 "Use operation 'clear' with value null if only a generic contact-centre label remains.",
                 "For example, 'National Contact Centre for Civil and Family Court, Monday to Thursday 9am to 5pm, Friday 9am to 4:30pm' must be cleared.",
