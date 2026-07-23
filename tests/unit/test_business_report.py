@@ -1,6 +1,6 @@
 import json
 
-from fact_form_importer.execution.approvals import LlmApprovalLedger, LlmDenial
+from fact_form_importer.execution.approvals import LlmApproval, LlmApprovalLedger, LlmDenial
 from fact_form_importer.execution.business_report import (
     build_business_report,
     business_report_csv,
@@ -143,3 +143,91 @@ def test_write_attempt_counts_support_new_metrics_and_legacy_unknown():
     )
 
     assert _write_attempt_counts([("court", action)]) == (2, 1, 2)
+
+
+def test_business_report_uses_the_complete_plan_for_action_totals():
+    report = build_business_report(
+        "run",
+        ExecutionLedger(run_id="run"),
+        ExecutionReviewLedger(run_id="run"),
+        LlmApprovalLedger(run_id="run"),
+        execution_summary={
+            "action_status_counts": {
+                "planned": 20,
+                "awaiting_approval": 3,
+                "ready": 2,
+                "blocked": 1,
+                "running": 0,
+                "succeeded": 4,
+                "failed": 0,
+                "unknown": 0,
+            }
+        },
+    )
+
+    assert report["action_completion"]["planned_action_count"] == 30
+    assert report["action_completion"]["not_completed_actions"] == 25
+    assert report["action_completion"]["completed_terminal_actions"] == 5
+    assert report["action_completion"]["success_percentage"] == 80.0
+
+
+def test_business_report_includes_deterministic_repairs_and_manual_os_selection():
+    report = build_business_report(
+        "run",
+        ExecutionLedger(run_id="run"),
+        ExecutionReviewLedger(run_id="run"),
+        LlmApprovalLedger(
+            run_id="run",
+            approvals={
+                "address-review": LlmApproval(
+                    review_id="address-review",
+                    selected_uprn="uprn-1",
+                    rationale="The organisation and street match the court",
+                )
+            },
+        ),
+        manifest={
+            "records": [
+                {
+                    "court_slug": "example-court",
+                    "actions": [
+                        {
+                            "migration_assumptions": [
+                                "Omitted 1 unusable counter-service opening period(s)."
+                            ],
+                            "request_body_normalisations": {
+                                "addressLine1": {
+                                    "from": "HMCTS | Tribunal",
+                                    "to": "HMCTS - Tribunal",
+                                }
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+        submissions=[
+            {
+                "court_slug": "example-court",
+                "issues": [
+                    {"code": "TIME_FORMAT_RECOVERED"},
+                    {"code": "INVALID_EMAIL"},
+                ],
+            }
+        ],
+        llm_review={
+            "items": [
+                {
+                    "review_id": "address-review",
+                    "court_slug": "example-court",
+                }
+            ]
+        },
+    )
+
+    themes = {theme["theme"] for theme in report["themes"]}
+    assert "Unusable counter-service hours omitted" in themes
+    assert "Unambiguous malformed times recovered" in themes
+    assert "Invalid optional contact values omitted" in themes
+    assert "Harmless public-text punctuation normalised" in themes
+    assert "OS address candidates selected manually" in themes

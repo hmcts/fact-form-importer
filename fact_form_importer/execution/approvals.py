@@ -14,7 +14,7 @@ from fact_form_importer.execution.atomic_state import atomic_write_json, file_lo
 from fact_form_importer.execution.models import utc_now
 
 
-APPROVAL_LEDGER_VERSION = "1.5"
+APPROVAL_LEDGER_VERSION = "1.6"
 LEGACY_ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-single-os-candidate-v1"
 ADDRESS_AUTO_APPROVAL_POLICY_VERSION = "high-supplied-os-candidate-v2"
 ADDRESS_AUTO_APPROVAL_POLICY_VERSIONS = {
@@ -41,6 +41,7 @@ class ApprovalDecision(BaseModel):
     policy_version: Optional[str] = None
     rationale: Optional[str] = None
     approved_value_hash: Optional[str] = None
+    selected_uprn: Optional[str] = None
 
 
 class LlmApproval(BaseModel):
@@ -50,6 +51,7 @@ class LlmApproval(BaseModel):
     policy_version: Optional[str] = None
     rationale: Optional[str] = None
     approved_address_patch: Optional[dict[str, Optional[str]]] = None
+    selected_uprn: Optional[str] = None
     approved_value_hash: Optional[str] = None
     approved_field_value: Optional[str] = None
     field_value_overridden: bool = False
@@ -199,17 +201,28 @@ class LlmApprovalStore:
         run_id: str,
         review_id: str,
         address_patch: dict[str, Optional[str]],
+        *,
+        selected_uprn: str | None = None,
+        rationale: str | None = None,
     ) -> LlmApprovalLedger:
         """Record the exact reviewer-approved address while retaining decision history."""
 
-        value_hash = _canonical_hash(address_patch)
+        selected_uprn = (selected_uprn or "").strip() or None
+        rationale = (rationale or "").strip() or None
+        if selected_uprn and not rationale:
+            raise ValueError("Enter a reason for selecting this OS address candidate")
         with self._lock, file_lock(self.path_for(run_id)):
             ledger = self._load_unlocked(run_id)
             existing = ledger.approvals.get(review_id)
+            effective_uprn = selected_uprn or (existing.selected_uprn if existing else None)
+            value_hash = _canonical_hash(
+                {"address_patch": address_patch, "selected_uprn": effective_uprn}
+            )
             if (
                 existing
                 and existing.approval_method == "manual"
                 and existing.approved_value_hash == value_hash
+                and (not rationale or existing.rationale == rationale)
             ):
                 return ledger
             history = list(existing.decision_history) if existing else []
@@ -221,14 +234,16 @@ class LlmApprovalStore:
                         policy_version=existing.policy_version,
                         rationale=existing.rationale,
                         approved_value_hash=existing.approved_value_hash,
+                        selected_uprn=existing.selected_uprn,
                     )
                 )
             ledger.approvals[review_id] = LlmApproval(
                 review_id=review_id,
                 approval_method="manual",
-                rationale="Reviewer approved the displayed address text",
+                rationale=rationale or "Reviewer approved the displayed address text",
                 approved_address_patch=address_patch,
                 approved_value_hash=value_hash,
+                selected_uprn=effective_uprn,
                 decision_history=history,
             )
             ledger.denials.pop(review_id, None)

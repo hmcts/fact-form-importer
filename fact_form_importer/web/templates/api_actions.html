@@ -1,8 +1,17 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>FaCT API action plan: {{ archive.manifest.run_id }}</h1>
-<nav><a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a></nav>
-<p>Actions are generated from importable records. Before a write, the importer re-resolves the court slug and checks the target section. Any existing section data blocks that action for review.</p>
-<table><thead><tr><th>Court</th><th>Resource</th><th>Method</th><th>Plan status</th><th>Execution status</th><th>Path</th><th>Reason</th></tr></thead><tbody>{% for action in actions %}<tr><td>{{ action.court_slug }}</td><td>{{ action.resource }}</td><td>{{ action.method }}</td><td>{{ action.readiness }}</td><td>{{ action.execution_status }}</td><td>{{ action.path }}</td><td>{{ action.reason }}</td></tr>{% else %}<tr><td colspan="7">No actions match.</td></tr>{% endfor %}</tbody></table>
-{% if pages > 1 %}<p>Page {{ page }} of {{ pages }}</p>{% endif %}
+<h1>Generated API section plan: {{ archive.manifest.run_id }}</h1>
+<nav><a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a> <a href="{{ url_for('courts', run_id=archive.manifest.run_id) }}">Current court actions</a></nav>
+<p>This is the generated plan. “Plan validation” records whether the proposed request body passed importer validation at run time. “Current execution state” includes later approvals and API outcomes.</p>
+<div class="summary">
+  <div><strong>Section actions in plan</strong><br>{{ total_action_count }}</div>
+  <div><strong>Actions matching this filter</strong><br>{{ filtered_action_count }}</div>
+  <div><strong>Validated at planning</strong><br>{{ plan_ready_action_count }}</div>
+  <div><strong>Invalid at planning</strong><br>{{ plan_pending_action_count }}</div>
+  <div><strong>Currently available</strong><br>{{ execution_summary.action_status_counts.planned + execution_summary.action_status_counts.ready }}</div>
+  <div><strong>Held by review decisions</strong><br>{{ execution_summary.action_status_counts.awaiting_approval }}</div>
+</div>
+<form method="get"><label for="readiness">Plan validation</label><select id="readiness" name="readiness"><option value="">All</option><option value="ready" {% if readiness == 'ready' %}selected{% endif %}>Validated</option><option value="pending" {% if readiness == 'pending' %}selected{% endif %}>Invalid or incomplete</option></select><button type="submit">Filter</button></form>
+<table><thead><tr><th>Court</th><th>Section</th><th>Request method</th><th>Plan validation</th><th>Current execution state</th><th>Endpoint</th><th>Planning reason</th></tr></thead><tbody>{% for action in actions %}<tr><td>{{ action.court_slug }}</td><td>{{ action.resource | replace('_', ' ') }}</td><td>{{ action.method }}</td><td>{{ action.readiness | replace('ready', 'validated') }}</td><td>{{ action.execution_status | replace('_', ' ') }}</td><td><code>{{ action.path }}</code></td><td>{{ action.reason or 'No planning blocker recorded.' }}</td></tr>{% else %}<tr><td colspan="7">No section actions match.</td></tr>{% endfor %}</tbody></table>
+{% if pages > 1 %}<p>Page {{ page }} of {{ pages }}{% if page > 1 %} · <a href="{{ url_for('api_actions', run_id=archive.manifest.run_id, readiness=readiness, page=page-1) }}">Previous</a>{% endif %}{% if page < pages %} · <a href="{{ url_for('api_actions', run_id=archive.manifest.run_id, readiness=readiness, page=page+1) }}">Next</a>{% endif %}</p>{% endif %}
 {% endblock %}

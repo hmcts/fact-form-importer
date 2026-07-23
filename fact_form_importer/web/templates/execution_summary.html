@@ -7,8 +7,7 @@
   <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
   <a href="{{ url_for('execution_summary_json', run_id=archive.manifest.run_id) }}">Download JSON</a>
   <a href="{{ url_for('business_report', run_id=archive.manifest.run_id) }}">Business outcome report</a>
-  <a href="#request-types">By request type</a>
-  <a href="#attention-actions">Per-court attention list</a>
+  {% if execution_summary.attention_action_count %}<a href="#attention-actions">Actions needing attention</a>{% endif %}
 </nav>
 {% if execution_job %}
 <section id="execution-job" data-job-id="{{ execution_job.job_id }}" data-job-state="{{ execution_job.state }}">
@@ -22,7 +21,7 @@
 {% endif %}
 {% if writes_enabled %}
 <form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every safe and fully approved section action?');">
-  <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Execution in progress…{% else %}Run all safe actions{% endif %}</button>
+  <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}API execution in progress…{% else %}Run all available FaCT API actions{% endif %}</button>
 </form>
 {% endif %}
 {% set review_progress = execution_summary.review_progress_counts %}
@@ -30,32 +29,33 @@
 <p>Review categories overlap. The unique total counts each court once and is separate from archived form-ingestion statuses.</p>
 <div class="summary">
   <div><strong>Unique courts needing review</strong><br><a href="{{ url_for('records', run_id=archive.manifest.run_id, work='outstanding') }}">{{ review_progress.unique_courts_outstanding }}</a></div>
-  <div><strong>Review decisions pending</strong><br>{{ review_progress.pending_value_decisions }}<br><span class="muted">across {{ review_progress.pending_value_decision_courts }} courts, including results without an API action</span></div>
-  <div><strong>Denied review decisions</strong><br>{{ review_progress.denied_value_decisions }}<br><span class="muted">across {{ review_progress.denied_value_decision_courts }} courts; dependent actions remain held</span></div>
-  <div><strong>Source corrections</strong><br>{{ review_progress.source_correction_items }}<br><span class="muted">across {{ review_progress.source_correction_courts }} courts</span></div>
-  <div><strong>Existing-data approvals pending</strong><br>{{ review_progress.existing_data_approvals_pending }}<br><span class="muted">across {{ review_progress.existing_data_approval_courts }} courts</span></div>
-  <div><strong>Ambiguous comparisons</strong><br>{{ review_progress.ambiguous_comparisons }}</div>
-  <div><strong>FaCT sections not yet compared</strong><br>{{ execution_summary.replacement_approval_counts.not_checked }}</div>
+  <div><strong>Pending value decisions</strong><br>{{ review_progress.pending_value_decisions }}<br><span class="muted">across {{ review_progress.pending_value_decision_courts }} courts</span></div>
+  <div><strong>Courts needing source correction</strong><br>{{ review_progress.source_correction_courts }}<br><span class="muted">{{ review_progress.source_correction_items }} issues</span></div>
+  <div><strong>Live FaCT changes awaiting approval</strong><br>{{ review_progress.existing_data_approvals_pending }}<br><span class="muted">across {{ review_progress.existing_data_approval_courts }} courts</span></div>
+  <div><strong>Duplicate-type decisions pending</strong><br>{{ review_progress.ambiguous_comparisons }}<br><span class="muted">across {{ review_progress.ambiguous_comparison_courts }} courts</span></div>
+  <div><strong>Invalid section actions</strong><br>{{ review_progress.invalid_section_actions }}<br><span class="muted">across {{ review_progress.invalid_section_courts }} courts</span></div>
+  {% if execution_summary.replacement_approval_counts.not_checked %}<div><strong>Live sections not yet compared</strong><br>{{ execution_summary.replacement_approval_counts.not_checked }}</div>{% endif %}
 </div>
-<p class="muted">Unchecked sections are not assumed to need approval. The comparison scan must first determine whether live FaCT data would change.</p>
+<p class="muted">Review categories overlap. The unique total counts each court once.</p>
 
 <h2>API execution</h2>
 <div class="summary">
-  <div><strong>Execution value dependencies pending</strong><br>{{ review_progress.pending_execution_value_dependencies }}<br><span class="muted">across {{ review_progress.pending_execution_value_dependency_courts }} planned courts</span></div>
-  {% for label, value in [('Planned courts', execution_summary.selected_court_count), ('Planned section actions', execution_summary.planned_action_count), ('Planned courts held by approvals', execution_summary.court_hold_counts.held_by_approvals), ('Section actions held by approvals', execution_summary.action_status_counts.awaiting_approval), ('Courts held by denied values', execution_summary.court_hold_counts.denied_value), ('Courts without a known approval hold', execution_summary.court_hold_counts.without_known_approval_hold), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts with blocked, failed or uncertain API outcomes', execution_summary.court_status_counts.attention_required), ('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('High-confidence fields auto-approved', execution_summary.llm_approval_counts.auto_approved_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Results denied', execution_summary.llm_approval_counts.denied), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  {% for label, value in [('Courts in API plan', execution_summary.selected_court_count), ('Section actions in API plan', execution_summary.planned_action_count), ('Actions without a review hold', execution_summary.action_status_counts.planned + execution_summary.action_status_counts.ready), ('Actions held by review decisions', execution_summary.action_status_counts.awaiting_approval), ('Completed courts', execution_summary.court_status_counts.completed), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked before write', execution_summary.action_status_counts.blocked), ('Rejected API actions', execution_summary.action_status_counts.failed), ('Uncertain write outcomes', execution_summary.action_status_counts.unknown)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
+<p><a class="button-link" href="{{ url_for('courts', run_id=archive.manifest.run_id) }}">View paginated court action list</a></p>
 
+{% if execution_summary.attention_action_count %}
 <h2>Common error themes</h2>
 <table>
   <thead><tr><th>Theme</th><th>Actions</th><th>Courts</th><th>Example reason</th></tr></thead>
   <tbody>{% for theme in execution_summary.common_error_themes %}
     <tr><td><strong>{{ theme.label }}</strong><br><code>{{ theme.code }}</code></td><td>{{ theme.action_count }}</td><td>{{ theme.court_count }}<br><small>Examples: {{ theme.courts[:5] | join(', ') }}</small></td><td>{{ theme.example_reason }}</td></tr>
-  {% else %}<tr><td colspan="4">No actions currently need attention.</td></tr>{% endfor %}</tbody>
+  {% endfor %}</tbody>
 </table>
 
-<h2 id="request-types">Attention by API request type</h2>
+<details><summary>Technical breakdown by API request type</summary>
 <p>This separates deliberate preflight blocks from requests that reached FaCT and failed.</p>
 {% for request_type in execution_summary.attention_by_request_type %}
 <h3>{{ request_type.label }}</h3>
@@ -75,25 +75,20 @@
     </tr>
   {% endfor %}</tbody>
 </table>
-{% else %}
-<p>No API request types currently need attention.</p>
 {% endfor %}
+</details>
 
 <h2 id="attention-actions">Actions needing attention</h2>
+<p>Showing up to 50 of {{ execution_summary.attention_action_count }} actions. Use the court action list to filter and inspect individual courts.</p>
 <table>
   <thead><tr><th>Court</th><th>Source rows</th><th>Action</th><th>Status</th><th>HTTP</th><th>Reason</th></tr></thead>
-  <tbody>{% for action in execution_summary.attention_actions %}
+  <tbody>{% for action in execution_summary.attention_actions[:50] %}
     <tr><td>{{ action.court_slug }}</td><td>{{ action.source_row_numbers | join(', ') }}</td><td>{{ action.resource }}<br><code>{{ action.method }} {{ action.path }}</code></td><td>{{ action.status }}</td><td>{{ action.http_status or '' }}</td><td>{{ action.reason }}</td></tr>
-  {% else %}<tr><td colspan="6">No actions currently need attention.</td></tr>{% endfor %}</tbody>
+  {% endfor %}</tbody>
 </table>
-
-<h2>Court status</h2>
-<table>
-  <thead><tr><th>Court</th><th>Source rows</th><th>Status</th><th>Action outcomes</th></tr></thead>
-  <tbody>{% for court in execution_summary.courts %}
-    <tr><td>{{ court.court_slug }}</td><td>{{ court.source_row_numbers | join(', ') }}</td><td>{{ court.status }}</td><td>{% for action in court.actions %}{{ action.resource }}: {{ action.status }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td></tr>
-  {% else %}<tr><td colspan="4">No importable courts have an API action plan.</td></tr>{% endfor %}</tbody>
-</table>
+{% else %}
+<p class="success"><strong>No API actions currently have blocked, rejected or uncertain outcomes.</strong></p>
+{% endif %}
 {% if execution_job and execution_job.state in ['queued', 'running'] %}
 <script>
 window.setTimeout(async function refreshExecution() {

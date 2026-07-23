@@ -23,6 +23,7 @@ from fact_form_importer.web.app import (
     _action_evidence,
     _action_execution_status,
     _change_has_hold,
+    _comparison_summary,
     _load_readiness_report,
     _operational_submissions,
     _plain_record_action_reason,
@@ -54,14 +55,14 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert workflow.status_code == 200
     assert b"1. Review LLM and address results" in workflow.data
     assert b"2. Review changes to live FaCT data" in workflow.data
-    assert b"3. Review and execute courts" in workflow.data
+    assert b"3. Execute available API actions" in workflow.data
     assert b"This is not an approval queue" in workflow.data
     courts = client.get(f"/runs/{run_id}/courts")
     assert courts.status_code == 200
-    assert b"Review and run" in courts.data
+    assert b"View court actions" in courts.data
     court = client.get(f"/runs/{run_id}/courts/example-court")
     assert court.status_code == 200
-    assert b"Check all target sections" in court.data
+    assert b"Refresh this court's live comparisons" in court.data
     assert client.get(f"/runs/{run_id}/records?status=processed").status_code == 200
     review = client.get(f"/runs/{run_id}/records?status=needs_human_review")
     assert b"review-court" in review.data
@@ -69,18 +70,75 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert detail.status_code == 200
     assert b"Raw submitted values" in detail.data
     assert client.get(f"/runs/{run_id}/issues").status_code == 200
-    assert b"LLM Review Factors" in client.get(f"/runs/{run_id}/llm-review-factors").data
-    assert b"OS-Held Address Actions" in client.get(f"/runs/{run_id}/os-address-factors").data
+    assert b"Archived LLM review factors" in client.get(
+        f"/runs/{run_id}/llm-review-factors"
+    ).data
+    assert b"Archived OS address review factors" in client.get(
+        f"/runs/{run_id}/os-address-factors"
+    ).data
     assert client.get(f"/runs/{run_id}/api-actions?readiness=ready").status_code == 200
     execution_page = client.get(f"/runs/{run_id}/execution-summary")
     assert execution_page.status_code == 200
-    assert b"Attention by API request type" in execution_page.data
+    assert b"No API actions currently have blocked" in execution_page.data
     execution_json = client.get(f"/runs/{run_id}/execution-summary.json")
     assert execution_json.status_code == 200
     assert execution_json.headers["Content-Disposition"].startswith("attachment")
     assert b"Duplicate form decision workbook" in client.get(f"/runs/{run_id}").data
-    assert b"LLM review rows" in client.get("/").data
-    assert b"OS-held address rows" in client.get("/").data
+    landing_page = client.get("/").data
+    assert b"Source submissions" in landing_page
+    assert b"Authoritative submissions" in landing_page
+    assert b"Superseded submissions" in landing_page
+
+
+def test_landing_page_distinguishes_source_authoritative_and_superseded_rows(tmp_path):
+    output_root, _ = _archive(tmp_path)
+    manifest_path = next((output_root / "final").glob("*/run_manifest.json"))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["summary"].update(
+        {
+            "source_submission_count": 472,
+            "authoritative_submission_count": 418,
+            "superseded_submission_count": 54,
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    page = create_app(output_root).test_client().get("/").data
+
+    assert b">472</td><td>418</td><td>54</td>" in page
+    assert b"Authoritative plus superseded submissions equals the source total" in page
+
+
+def test_comparison_summary_categories_are_mutually_exclusive():
+    summary = _comparison_summary(
+        [
+            {"comparison": {"is_no_change": True, "has_existing_data": True}},
+            {"comparison": {"is_no_change": False, "has_existing_data": False}},
+            {"comparison": {"is_no_change": False, "has_existing_data": True}},
+            {
+                "comparison": {
+                    "is_no_change": True,
+                    "has_existing_data": False,
+                    "merge_conflicts": [{"business_type": "duplicate"}],
+                }
+            },
+        ]
+    )
+
+    assert summary == {
+        "total": 4,
+        "checked": 4,
+        "not_checked": 0,
+        "no_change": 1,
+        "empty_target": 1,
+        "approval_required": 1,
+        "approved": 0,
+        "conflicts": 1,
+    }
+    assert sum(
+        summary[key]
+        for key in ("no_change", "empty_target", "approval_required", "approved", "conflicts")
+    ) == summary["checked"]
 
 
 def test_records_page_is_a_plain_language_todo_list_with_action_links(tmp_path):
@@ -166,7 +224,7 @@ def test_records_page_is_a_plain_language_todo_list_with_action_links(tmp_path):
     assert b"Information only" in page.data
     assert b"Review this row in Step 1" in page.data
     assert b"1 section action(s) planned" in page.data
-    assert b"Review and run this court" in page.data
+    assert b"View court actions" in page.data
     assert b"/llm-actions?status=pending&amp;q=3" in page.data
     assert b"/courts/review-court" in page.data
     assert detail.status_code == 200
@@ -247,7 +305,7 @@ def test_live_review_total_includes_processed_pending_value_and_refreshes_on_app
     assert after["review_progress_counts"]["pending_value_decisions"] == 0
     assert b"Form ingestion result" in run_page.data
     assert b"Current review progress" in run_page.data
-    assert b"Ingestion-review rows" in run_page.data
+    assert b"Needs source-data review" in run_page.data
     assert b"example-court" not in completed_queue.data
 
 
@@ -408,7 +466,7 @@ def test_llm_actions_page_displays_evidence_and_approves_without_executing(tmp_p
     page = client.get(f"/runs/{run_id}/llm-actions")
 
     assert page.status_code == 200
-    assert b"LLM Actions Review" in page.data
+    assert b"Model and address value decisions" in page.data
     assert b"Free water dispensers" in page.data
     assert b"Approve" in page.data
 
@@ -673,13 +731,18 @@ def test_duplicate_item_resolution_unactionable_closure_and_business_downloads(t
         {
             "resource": "contact_detail",
             "proposed_items": [
+                    {
+                        "courtContactDescriptionId": "old-type",
+                        "email": "first@example.test",
+                        "phoneNumber": "020 1111 1111",
+                    },
                 {
                     "courtContactDescriptionId": "old-type",
-                    "phoneNumber": "020 1111 1111",
-                }
+                    "email": "duplicate@example.test",
+                },
             ],
-            "proposed_item_ids": ["source-item-1"],
-            "proposed_item_source_fields": [["contacts[1]"]],
+            "proposed_item_ids": ["source-item-1", "source-item-2"],
+            "proposed_item_source_fields": [["contacts[1]"], ["contacts[2]"]],
         }
     )
     readiness_path.write_text(json.dumps(readiness))
@@ -704,8 +767,15 @@ def test_duplicate_item_resolution_unactionable_closure_and_business_downloads(t
         }
     ]
     submissions_path.write_text(json.dumps(submissions))
-    service = ApiExecutionService(output_root, AppConfig(), _FakeExecutionClient())
+    execution_client = _FakeExecutionClient()
+    service = ApiExecutionService(output_root, AppConfig(), execution_client)
     client = create_app(output_root, execution_service=service).test_client()
+    comparison = build_target_comparison("example-court", action, [])
+    service.review_store.save_comparison(run_id, comparison)
+
+    review_page = client.get(f"/runs/{run_id}/api-changes")
+    assert b"Testing aid: omit every submitted entry in this section" in review_page.data
+    assert b"Omit all submitted entries in this section" in review_page.data
 
     remapped = client.post(
         f"/runs/{run_id}/api-changes/example-court-1/items/source-item-1/resolve",
@@ -726,6 +796,20 @@ def test_duplicate_item_resolution_unactionable_closure_and_business_downloads(t
         "source-item-1"
     ]
     assert resolution.replacement_type_id == "new-type"
+    omitted = client.post(
+        f"/runs/{run_id}/api-changes/example-court-1/items/omit-all",
+        data={
+            "rationale": "Testing confirmed that all duplicate submitted contacts should be ignored",
+            "change_id": comparison.change_id,
+        },
+    )
+    assert omitted.status_code == 302
+    assert "omitted=2" in omitted.headers["Location"]
+    resolutions = service.get_execution_review(run_id).collection_item_resolutions
+    assert {
+        item_id: value.decision for item_id, value in resolutions.items()
+    } == {"source-item-1": "omit", "source-item-2": "omit"}
+    assert execution_client.writes == []
     assert closed.status_code == 302
     assert service.get_execution_review(run_id).court_dispositions["3"].rationale == (
         "No defensible FaCT court match exists"
@@ -746,6 +830,10 @@ def test_review_mutation_routes_return_plain_400_errors_and_record_redirects(tmp
     assert client.post(
         f"/runs/{run_id}/api-changes/missing/items/missing/resolve",
         data={"decision": "invalid", "rationale": "Test"},
+    ).status_code == 400
+    assert client.post(
+        f"/runs/{run_id}/api-changes/missing/items/omit-all",
+        data={"rationale": ""},
     ).status_code == 400
     assert client.post(
         f"/runs/{run_id}/api-changes/missing/refresh",
@@ -935,6 +1023,106 @@ def test_address_review_fields_are_editable_and_posted_value_is_approved(tmp_pat
     assert approval.approved_address_patch["addressLine2"] == "PO Box 12"
 
 
+def test_unresolved_address_renders_manual_candidate_selector_and_requires_reason(
+    tmp_path,
+):
+    output_root, run_id = _archive(tmp_path)
+    archive_path = output_root / "final" / run_id
+    readiness_path = archive_path / "api_readiness_report.json"
+    readiness = json.loads(readiness_path.read_text())
+    action = readiness["records"][0]["actions"][0]
+    action.update(
+        {
+            "resource": "address",
+            "readiness": "pending",
+            "reason": "Address verification requires review: Multiple candidates",
+            "source_fields": ["addresses[1]"],
+            "source_row_number": 2,
+            "address_verification": {
+                "status": "review_required",
+                "message": "Multiple candidates",
+            },
+        }
+    )
+    readiness_path.write_text(json.dumps(readiness))
+    (archive_path / "llm_actions_review.json").write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "manual-address",
+                        "kind": "address",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "addresses[1]",
+                        "address_index": 1,
+                        "submitted_address": {
+                            "index": 1,
+                            "address_type": "Visit",
+                            "line_1": "Submitted Court",
+                            "town_or_city": "London",
+                            "postcode": "SW1A 1AA",
+                        },
+                        "llm_input": {"candidates": [{"uprn": "uprn-1"}]},
+                        "os_candidates": [
+                            {
+                                "uprn": "uprn-1",
+                                "address": None,
+                                "organisation_name": "Selected Court",
+                                "building_number": "1",
+                                "building_name": None,
+                                "thoroughfare_name": "Main Street",
+                                "post_town": "London",
+                                "postcode": "SW1A 1AA",
+                            }
+                        ],
+                        "model_result": {
+                            "uprn": None,
+                            "confidence": "low",
+                            "needs_human_review": True,
+                            "reason": "No unique selection",
+                        },
+                        "outcome": "no_selection",
+                        "dependent_action_ids": ["example-court-1"],
+                        "actionable": False,
+                        "approvable": False,
+                    }
+                ],
+            }
+        )
+    )
+    service = ApiExecutionService(output_root, AppConfig(), _FakeExecutionClient())
+    client = create_app(output_root, execution_service=service).test_client()
+
+    page = client.get(f"/runs/{run_id}/llm-actions?status=pending")
+    missing_reason = client.post(
+        f"/runs/{run_id}/llm-actions/manual-address/approve",
+        data={"selected_uprn": "uprn-1"},
+    )
+    approved = client.post(
+        f"/runs/{run_id}/llm-actions/manual-address/approve",
+        data={
+            "selected_uprn": "uprn-1",
+            "selection_rationale": "The organisation and street identify the court",
+            "addressLine1": "Selected Court",
+            "addressLine2": "1 Main Street",
+            "townCity": "London",
+            "postcode": "SW1A 1AA",
+        },
+    )
+
+    assert page.status_code == 200
+    assert b"Select the OS address candidate to use" in page.data
+    assert b'name="selected_uprn"' in page.data
+    assert b"Reason for selecting this candidate" in page.data
+    assert missing_reason.status_code == 400
+    assert approved.status_code == 302
+    decision = service.approval_store.load(run_id).approvals["manual-address"]
+    assert decision.selected_uprn == "uprn-1"
+    assert decision.rationale.startswith("The organisation")
+
+
 def test_llm_actions_page_labels_strict_address_policy_approval(tmp_path):
     output_root, run_id = _archive(tmp_path)
     archive_path = output_root / "final" / run_id
@@ -989,7 +1177,7 @@ def test_llm_actions_page_labels_strict_address_policy_approval(tmp_path):
     assert b"Save address and continue" not in page.data
     assert b"Edit approved address" in page.data
     assert b"Save edited address" in page.data
-    assert b"Addresses auto-approved" in summary.data
+    assert b"Actions without a review hold" in summary.data
     assert service.get_execution_summary(run_id)["llm_approval_counts"]["auto_approved"] == 1
     assert execution_client.writes == []
 
@@ -1079,7 +1267,7 @@ def test_review_overview_and_api_change_routes_cover_value_source_and_target_gat
     assert "completed=1" in approved_target.headers["Location"]
     assert changes_page.status_code == 200
     assert b"This is not a 1-item approval queue" in changes_page.data
-    assert b"New workbook runs fetch current FaCT sections automatically" in changes_page.data
+    assert b"planned section actions compared with live FaCT" in changes_page.data
     assert b"effective difference" in changes_page.data
     assert execution_client.writes == []
     assert client.get(
@@ -1233,11 +1421,11 @@ def test_api_changes_defaults_to_pending_advances_approval_and_hides_stale_job(
     )
 
     assert pending.status_code == 200
-    assert b"Needs review (2)" in pending.data
+    assert b"Human decisions pending (2)" in pending.data
     assert b"court-1" in pending.data
     assert b"court-3" not in pending.data
     assert b"Approve and continue" in pending.data
-    assert b"Approve all 2 approvable changes" in pending.data
+    assert b"Approve all 2 live-data changes" in pending.data
     assert b"Latest comparison scan" not in pending.data
     assert b"court-3" in all_sections.data
     assert "view=pending" in advanced.headers["Location"]
@@ -1650,7 +1838,7 @@ def test_review_ui_checks_actions_but_refuses_writes_when_circuit_breaker_is_off
     client = app.test_client()
 
     detail = client.get(f"/runs/{run_id}/records/2")
-    assert b"Check target sections" in detail.data
+    assert b"Refresh this court's live comparisons" in detail.data
     assert b"Writes are disabled locally" in detail.data
 
     checked = client.post(
@@ -1749,7 +1937,7 @@ def test_review_ui_executes_all_safe_actions_for_a_run_and_shows_summary(tmp_pat
     app = create_app(output_root, config=AppConfig(), execution_service=execution)
     client = app.test_client()
 
-    assert b"Run all safe actions" in client.get(f"/runs/{run_id}").data
+    assert b"Run all available FaCT API actions" in client.get(f"/runs/{run_id}").data
     response = client.post(f"/runs/{run_id}/execute-safe")
 
     assert response.status_code == 302

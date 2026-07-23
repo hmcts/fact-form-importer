@@ -424,11 +424,13 @@ valid UK phone number or email address from free text, and contact-detail phone
 and email pairs move misplaced values into the paired empty field where safe.
 Time cleaning also repairs unambiguous punctuation and redundant zero-minute
 entries, such as `08:.30`, `15::00`, `10.00 AM` with `00:00`, and `14:00PM`
-with `00:00`. Exact text statuses such as `Appointment only` and `Counter
-service not available` are classified as statuses rather than invalid clock
-values, but still require review because FaCT opening-time entries require real
-opening and closing times. The original spreadsheet text remains available in
-`submissions_raw.json`.
+with `00:00`. It can recover one complete `HH:MM` value followed by recognised
+noise such as `?` or a duration suffix and records `TIME_FORMAT_RECOVERED` with
+the original and repaired values. It does not infer ranges or repair ambiguous
+values such as `09-4.30:09-4.30`. An explicit `No counter service available`
+status becomes `counterService=false` without invented hours; a contradictory
+assistance selection remains for review. The original spreadsheet text remains
+available in `submissions_raw.json`.
 
 `ingest_summary.json` contains counts for ingested submissions, skipped empty
 rows, failed rows, warning rows, and mapping warnings. Use it as the first check
@@ -620,17 +622,23 @@ evidence. A verified or safely normalised address reuses that evidence during
 execution; an older or unverified report does a fresh, shared rate-limited
 postcode lookup before the write. A 400/404 postcode response blocks only that
 address action with the API's reason. A 429, timeout, or service outage is
-`unknown` and can be checked again later. The only request-body text repair is
-conventional address notation that FaCT rejects: `C/o` becomes `care of` and
-`&` becomes `and`; the archived raw submission is never changed.
+`unknown` and can be checked again later. Request-body text repairs are limited
+to conventional equivalents that FaCT accepts: `C/o` becomes `care of`, `&`
+becomes `and`, a vertical-bar separator becomes ` - `, and standalone `N/A`
+becomes `Not applicable`. Every change is recorded in
+`request_body_normalisations`; archived raw and cleaned evidence is unchanged.
 Scottish postcodes are supported following the FaCT Data API contract change in
 PR #313. The importer only pre-classifies `BT`, `IM`, `JE`, and `GY` postcode
 regions as unsupported; all valid Scottish postcodes proceed to the FaCT/OS
 lookup and normal address validation.
-Invalid API phone/email formats and unrepresentable opening-time data are also
-blocked before a write. A new `run` is still the best way to see these reasons
-in the immutable plan, while the same checks protect historic reports at
-execution time.
+Invalid optional contact emails are omitted from the request while the raw
+value and warning remain auditable. If no useful channel or explanation remains,
+that empty proposed contact item is omitted so live merge data is preserved.
+Counter-service metadata may be sent without hours; unusable counter periods
+are omitted and existing live periods survive the merge. Ordinary court-opening
+types still need a usable period, except `No counter service available`. A new
+`run` gives the clearest immutable plan, while the current-run overlay reconciles
+these changes for unsucceeded actions only.
 
 Execution state is written separately to
 `out/execution-state/<run-id>.json`, never back into the archived action plan.
@@ -684,6 +692,16 @@ unexecuted action state, and invalidates stale FaCT comparisons. Address type,
 areas of law, court types, and selected UPRN remain read-only; execution still
 requires the selected UPRN at the approved postcode.
 
+When the model returned no selection but the immutable run contains supplied OS
+candidates with UPRNs, the address review page provides a manual candidate
+selector. The reviewer chooses one supplied candidate, may edit the five mapped
+address text fields, and must record a rationale. Approval-ledger schema 1.6
+stores the chosen UPRN, rationale, canonical patch/hash, timestamp and decision
+history without changing the immutable OS/LLM artifact. These decisions are
+excluded from policy and bulk approval, are unavailable after execution starts,
+succeeds or becomes uncertain, invalidate stale target approvals when changed,
+and still require the selected UPRN in a fresh postcode lookup before writing.
+
 The structured field response has an explicit `set`, `clear`, or `unresolved`
 operation. `clear` is initially allowed only for optional
 `contacts[*].explanation`: opening days and times are removed because structured
@@ -695,15 +713,16 @@ PO Box addresses are allowed and have no separate manual-only dependency. They
 follow the same OS lookup, LLM confidence, approval-policy, and execution rules
 as every other address.
 
-Verification for this workflow: 347 unit tests pass, Ruff is clean, exact global
-coverage is 90.26%, and every configured 95% core coverage gate passes
-(API manifest 95.12% and web 96.63%).
+Verification for this workflow: 433 unit tests pass, Ruff is clean, exact global
+coverage is 90.19%, and every configured 95% core coverage gate passes
+(API manifest 95.47% and web 95.08%).
 
-The latest full OS/LLM run is `20260715T120042Z-979a4cb6`: 423 source rows,
-369 authoritative rows, 54 superseded rows across 50 duplicate courts, 97
-operational review rows, and no duplicate-slug issues on authoritative rows.
-Compared with the original `20260714T171215Z-f001d1e3` archive, the Records
-review queue fell from 188 rows to 97 and LLM calls fell from 422 to 368.
+The latest full OS/LLM run is `20260722T112455Z-b4cce71d`, generated from
+`input/input-csv-4.xlsx`: 472 source submissions, 416 authoritative submissions,
+56 superseded submissions, 299 processed with warnings, 117 ingestion-review
+rows, no failed rows, and 415 LLM calls. Its mutable 2.4 execution overlay
+preserves 2,212 succeeded actions and reconciles deterministic repairs without
+executing FaCT requests.
 
 Each check or write also creates
 `out/execution-state/<run-id>.summary.json` and refreshes the latest
@@ -722,6 +741,12 @@ was sent and FaCT rejected it. A dependent numeric field reported as required
 can either be blank or contain submitted text that could not be converted to
 the API integer type; inspect the archived action evidence before approving a
 placeholder.
+
+Business-report schema 1.2 also records the deterministic migration themes:
+omitted unusable counter hours, explicit no-counter-service answers, safely
+recovered times, omitted invalid optional contact values, harmless punctuation
+normalisation, and manually selected OS candidates. Reports contain counts,
+court examples and reviewer rationale but no raw values or request bodies.
 
 `run_manifest.json` records the source display name, completion time, run
 summary, and SHA-256 hashes of every archived artifact. Use it to identify a
@@ -813,10 +838,11 @@ Denied values are excluded from `Approve all remaining results`, do not count as
 pending human review, never satisfy an execution dependency, and can be returned
 to pending with `Reconsider`. Bulk approval is atomic across every LLM review
 page and includes only remaining usable pending results; it excludes denied,
-read-only, approved and already-executed results and never performs a FaCT API
-request. These decisions are stored in backward-compatible approval-ledger
-schema 1.3, while execution-summary schema 2.0 reports denied result and court
-hold counts separately.
+manual OS-candidate selections, overlength explanation repairs, read-only,
+approved and already-executed results and never performs a FaCT API request.
+These decisions are stored in backward-compatible approval-ledger schema 1.6,
+while execution-summary schema 2.0 reports denied result and court hold counts
+separately.
 
 Rows whose submitted court slug does not exist can select a different existing
 FaCT court from either the LLM review or record-audit page. The reviewer enters
@@ -1085,7 +1111,9 @@ Current issue meanings:
   court slug. All affected rows are blocked from automatic import until a
   reviewer decides whether to merge, discard, or correct them.
 - `INVALID_EMAIL`: an email value could not be parsed as a valid email address.
-  Optional invalid emails are preserved for review rather than silently dropped.
+  The raw value and warning are preserved, but the optional invalid value is
+  omitted from FaCT request bodies. An otherwise-empty proposed contact item is
+  omitted so merge semantics preserve live data.
 - `INVALID_PHONE`: a phone value could not be parsed as a possible UK phone
   number. Optional invalid phones are preserved for review.
 - `INVALID_POSTCODE`: a populated address postcode does not match the expected
@@ -1106,6 +1134,9 @@ Current issue meanings:
   check later rather than treating it as a bad address.
 - `INVALID_TIME`: an opening-hours value could not be parsed as a valid `HH:MM`
   time.
+- `TIME_FORMAT_RECOVERED`: one unambiguous `HH:MM` value was recovered from
+  recognised formatting noise. It records the original and repaired values and
+  is non-blocking.
 - `MISSING_COURT_IDENTIFIER`: the row has business data but no usable court
   slug. This is a failed record until a valid court slug is added.
 - `OPENING_HOURS_AMBIGUOUS`: opening hours need review because the time values
@@ -1199,3 +1230,49 @@ downloadable Markdown, CSV and JSON versions. These reports separate terminal
 action success from acceptance among requests actually sent, distinguish API
 latency from importer persistence time, group common themes, include reviewer
 rationale and recommended decisions, and exclude raw values/request bodies.
+
+## Review UI counts and wording
+
+The UI deliberately separates three different units which previously appeared
+under the ambiguous label "rows":
+
+- **Source submissions** are every non-header workbook row. For the current
+  `input-csv-4.xlsx` this is 472.
+- **Authoritative submissions** are the latest retained forms after duplicate
+  suppression. **Superseded submissions** are the older duplicates, and those
+  two figures always add up to source submissions.
+- **Planned courts** and **section actions** are execution units. One court can
+  have several actions, so neither number should be compared directly with the
+  workbook-row total.
+
+The four immutable ingestion results (processed, warnings, needs source review
+and failed) add up to authoritative submissions. Live human-review totals are a
+separate, deduplicated view of outstanding value decisions, source corrections,
+existing-data decisions and ambiguous comparisons; they change as reviewers
+record decisions.
+
+Step 2 is a read-only comparison until a reviewer records a decision. Its
+checked outcomes are mutually exclusive: already identical, empty target,
+live-data approval required/approved, or ambiguous. Unchecked sections are
+reported separately. Step 3 is explicitly labelled **Execute available API
+actions**: its buttons perform FaCT writes when writes are enabled, while
+"View court actions" links are navigation only. The Results page reports the
+full manifest plan, not only actions that already have execution-ledger entries.
+
+Archived issue, LLM-factor and OS-factor pages are labelled as immutable audit
+evidence and do not imply that every row still needs action. Current reviewer
+work belongs in the workflow, value-decision, live-data-decision and court-action
+pages. Execution-summary schema 2.3 also counts manually selectable OS candidates
+consistently with the detailed value queue and avoids reloading mutable review
+state once per action when rebuilding the summary. A denied value is reported as
+a denial hold, not simultaneously as a pending approval.
+
+For conflicting address, contact or opening-hours collections, Step 2 retains
+the individual retain/remap/omit controls and also provides a clearly labelled
+testing aid to omit every submitted entry in that one section. The bulk decision
+requires one rationale, writes all item decisions atomically, invalidates that
+section's stale comparison/approval and never calls FaCT. It does not omit other
+sections for the court; existing live collection entries remain protected by
+merge semantics. Step 2 loads archived vocabulary choices once per resource per
+request rather than once per planned action, keeping resolution redirects usable
+on large runs.

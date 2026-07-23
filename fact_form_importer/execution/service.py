@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -49,7 +50,7 @@ from fact_form_importer.llm.review import (
     filter_llm_actions_review,
     load_or_derive_llm_actions_review,
 )
-from fact_form_importer.models.court_submission import CourtSubmission
+from fact_form_importer.models.court_submission import Address, CourtSubmission
 from fact_form_importer.output.duplicate_review import select_authoritative_submissions
 from fact_form_importer.output.archive import load_run_archive
 from fact_form_importer.output.fact_api_manifest import (
@@ -59,7 +60,10 @@ from fact_form_importer.output.fact_api_manifest import (
     validate_fact_api_action_body,
 )
 from fact_form_importer.validators.fact_api_courts import CourtReference
-from fact_form_importer.validators.os_addresses import RateLimitedPostcodeLookup
+from fact_form_importer.validators.os_addresses import (
+    OsAddressCandidate,
+    RateLimitedPostcodeLookup,
+)
 
 
 @dataclass(frozen=True)
@@ -437,6 +441,54 @@ class ApiExecutionService:
         self._save_execution_summary(run_id)
         return ledger
 
+    def omit_all_collection_items(
+        self, run_id: str, action_id: str, rationale: str
+    ) -> tuple[ExecutionReviewLedger, int]:
+        """Omit every submitted item in one collection section without writing."""
+
+        rationale = rationale.strip()
+        if not rationale:
+            raise ValueError("Enter a reason for omitting every submitted entry")
+        record_and_action = next(
+            (
+                (record, action)
+                for record in self._readiness_report(run_id).get("records", [])
+                for action in record.get("actions", [])
+                if action.get("action_id") == action_id
+            ),
+            None,
+        )
+        if record_and_action is None:
+            raise ValueError("That collection action does not exist in this run")
+        record, action = record_and_action
+        resource = str(action.get("resource") or "")
+        if resource not in {"address", "contact_detail", "court_opening_hours"}:
+            raise ValueError("Only collection sections can omit all submitted entries")
+        item_ids = [str(item_id) for item_id in action.get("proposed_item_ids") or []]
+        if len(item_ids) < 2:
+            raise ValueError("Omit all is available only for sections with multiple entries")
+        court_slug = str(record.get("court_slug") or "")
+        court_state = self.store.load(run_id).courts.get(court_slug)
+        action_state = court_state.actions.get(action_id) if court_state else None
+        if action_state and action_state.status in {"running", "succeeded", "unknown"}:
+            raise ValueError(
+                "Submitted entries cannot be omitted after execution starts or becomes uncertain"
+            )
+        resolutions = [
+            CollectionItemResolution(
+                item_id=item_id,
+                action_id=action_id,
+                resource=resource,
+                decision="omit",
+                rationale=rationale,
+            )
+            for item_id in item_ids
+        ]
+        ledger = self.review_store.resolve_collection_items(run_id, resolutions)
+        self._reset_dependent_actions(run_id, {action_id})
+        self._save_execution_summary(run_id)
+        return ledger, len(resolutions)
+
     def close_unactionable_court(
         self, run_id: str, source_row_number: int, rationale: str
     ) -> ExecutionReviewLedger:
@@ -475,6 +527,10 @@ class ApiExecutionService:
             for item in llm_report.get("items", [])
             if item.get("address_mode") == "po_box" and item.get("review_id")
         }
+        type_options_by_resource = {
+            resource: self._archived_type_options(run_id, resource)
+            for resource in ("address", "contact_detail", "court_opening_hours")
+        }
         review_ids_by_action: dict[str, set[str]] = {
             str(action.get("action_id") or ""): {
                 str(review_id)
@@ -486,7 +542,7 @@ class ApiExecutionService:
         }
         for item in llm_report.get("items", []):
             if (
-                not item.get("actionable")
+                not _review_item_can_hold_action(item)
                 or item.get("address_mode") == "po_box"
                 or not item.get("review_id")
             ):
@@ -572,8 +628,8 @@ class ApiExecutionService:
                         ),
                         "pending_value_holds": pending_value_holds,
                         "collection_items": collection_items,
-                        "type_options": self._archived_type_options(
-                            run_id, str(action.get("resource") or "")
+                        "type_options": type_options_by_resource.get(
+                            str(action.get("resource") or ""), []
                         ),
                         "execution_status": self._effective_action_status(
                             run_id,
@@ -625,7 +681,7 @@ class ApiExecutionService:
                 )
         for value in report.get("items", []):
             if (
-                not value.get("actionable")
+                not _review_item_can_hold_action(value)
                 or value.get("address_mode") == "po_box"
                 or not value.get("review_id")
             ):
@@ -663,6 +719,7 @@ class ApiExecutionService:
             item["approved_address_patch"] = (
                 approval.approved_address_patch if approval else None
             )
+            item["selected_uprn"] = approval.selected_uprn if approval else None
             item["decision_history"] = (
                 [decision.model_dump(mode="json") for decision in approval.decision_history]
                 if approval
@@ -683,6 +740,19 @@ class ApiExecutionService:
                     }
                 )
                 item["proposed_address"] = proposed
+            if approval and approval.selected_uprn:
+                selected = _os_candidate_for_uprn(item, approval.selected_uprn)
+                if selected is not None:
+                    item["immutable_outcome"] = item.get("outcome")
+                    item["outcome"] = "accepted"
+                    item["selected_candidate"] = selected.as_dict()
+                    result = dict(item.get("model_result") or {})
+                    result["uprn"] = approval.selected_uprn
+                    result["reason"] = approval.rationale
+                    result["needs_human_review"] = False
+                    item["model_result"] = result
+                    item["approvable"] = True
+                    item["actionable"] = True
             item["requires_manual_text_review"] = _requires_manual_text_review(item)
             item["field_editable"] = bool(
                 _is_optional_explanation_review(item)
@@ -739,6 +809,22 @@ class ApiExecutionService:
             ]
             item["dependent_actions"] = linked_actions
             if linked_actions:
+                item["actionable"] = True
+            candidate_options = _manual_os_candidate_options(item)
+            item["manual_candidate_options"] = candidate_options
+            item["manual_candidate_selectable"] = bool(
+                item.get("kind") == "address"
+                and item.get("immutable_outcome", item.get("outcome"))
+                in {"no_selection", "no_result"}
+                and candidate_options
+                and linked_actions
+                and not {
+                    action.get("status") for action in linked_actions
+                }
+                & {"running", "succeeded", "unknown"}
+            )
+            if item["manual_candidate_selectable"]:
+                item["approvable"] = True
                 item["actionable"] = True
             item["planning_blockers"] = _planning_blockers(
                 item,
@@ -797,6 +883,8 @@ class ApiExecutionService:
         review_id: str,
         *,
         address_patch: dict[str, str | None] | None = None,
+        selected_uprn: str | None = None,
+        selection_rationale: str | None = None,
         field_value: str | None = None,
         omit_field: bool = False,
         omission_rationale: str | None = None,
@@ -813,9 +901,9 @@ class ApiExecutionService:
         )
         if current_item is None:
             raise ValueError(f"LLM review item '{review_id}' does not exist in run '{run_id}'")
-        if (
-            not current_item.get("approvable", current_item.get("actionable"))
-            or current_item.get("outcome") != "accepted"
+        if not current_item.get("approvable", current_item.get("actionable")) or (
+            current_item.get("outcome") != "accepted"
+            and not current_item.get("manual_candidate_selectable")
         ):
             raise ValueError("This LLM result is read-only and cannot be approved")
         if current_item and current_item.get("approval_status") == "already_executed":
@@ -825,9 +913,21 @@ class ApiExecutionService:
         if current_item.get("kind") == "address":
             if execution_job_active:
                 raise ValueError("Wait for the active execution job to finish before editing an address")
-            patch = _normalise_reviewed_address_patch(
-                address_patch or current_item.get("api_body_patch") or {}
+            previous = self.approval_store.load(run_id).approvals.get(review_id)
+            effective_uprn = (selected_uprn or "").strip() or (
+                previous.selected_uprn if previous else None
             )
+            if current_item.get("manual_candidate_selectable") and not effective_uprn:
+                raise ValueError("Select an OS address candidate before approval")
+            base_patch = (
+                _manual_candidate_api_patch(current_item, effective_uprn)
+                if effective_uprn
+                else current_item.get("api_body_patch") or {}
+            )
+            requested_patch = dict(base_patch)
+            if address_patch is not None:
+                requested_patch.update(address_patch)
+            patch = _normalise_reviewed_address_patch(requested_patch)
             prohibited = {
                 action.get("status")
                 for action in current_item.get("dependent_actions", [])
@@ -836,18 +936,24 @@ class ApiExecutionService:
                 raise ValueError(
                     "This address cannot be edited after execution starts, succeeds, or becomes uncertain"
                 )
-            previous = self.approval_store.load(run_id).approvals.get(review_id)
             immutable_patch = _normalise_reviewed_address_patch(
                 current_item.get("immutable_api_body_patch") or {}
-            )
+            ) if current_item.get("immutable_api_body_patch") else {}
             if (
                 previous
                 and previous.approval_method == "policy"
                 and patch == immutable_patch
+                and not effective_uprn
             ):
                 ledger = self.approval_store.load(run_id)
             else:
-                ledger = self.approval_store.approve_address(run_id, review_id, patch)
+                ledger = self.approval_store.approve_address(
+                    run_id,
+                    review_id,
+                    patch,
+                    selected_uprn=effective_uprn,
+                    rationale=selection_rationale,
+                )
                 action_ids = {
                     str(action_id)
                     for action_id in current_item.get("dependent_action_ids", [])
@@ -953,6 +1059,7 @@ class ApiExecutionService:
             if item.get("review_id")
             and item.get("approval_status") == "pending"
             and not item.get("requires_manual_text_review")
+            and not item.get("manual_candidate_selectable")
         }
         ledger, added = self.approval_store.approve_many(run_id, review_ids)
         if added:
@@ -1159,6 +1266,7 @@ class ApiExecutionService:
         report = self._llm_review_report(run_id)
         readiness = self._readiness_report(run_id)
         approvals, _ = self.approval_store.reconcile_policies(run_id, report, readiness)
+        report = self._summary_review_report(run_id, report, readiness, approvals)
         summary = build_execution_summary(
             run_id,
             readiness,
@@ -1179,12 +1287,16 @@ class ApiExecutionService:
         return self.get_execution_summary(run_id)
 
     def get_business_report(self, run_id: str) -> dict[str, Any]:
-        self._readiness_report(run_id)
+        readiness = self._readiness_report(run_id)
         return build_business_report(
             run_id,
             self.store.load(run_id),
             self.review_store.load(run_id),
             self.approval_store.load(run_id),
+            manifest=readiness,
+            submissions=list(self._submissions_by_row(run_id).values()),
+            llm_review=self._llm_review_report(run_id),
+            execution_summary=self.get_execution_summary(run_id),
         )
 
     def _record(self, run_id: str, court_slug: str) -> dict[str, Any]:
@@ -1258,8 +1370,60 @@ class ApiExecutionService:
                     run_id,
                     str(derived.get("manifest_version") or API_MANIFEST_VERSION),
                 )
+            self._reconcile_deterministic_plan_repairs(run_id, derived)
             return derived
         return report
+
+    def _reconcile_deterministic_plan_repairs(
+        self, run_id: str, report: dict[str, Any]
+    ) -> None:
+        """Reset only safe, unsucceeded blockers repaired by a derived plan."""
+
+        ledger = self.store.load(run_id)
+        changed = False
+        invalidated: set[str] = set()
+        records_by_slug = {
+            str(record.get("court_slug") or ""): record
+            for record in report.get("records", [])
+        }
+        for court_slug, court in ledger.courts.items():
+            record = records_by_slug.get(court_slug)
+            if record is None:
+                continue
+            actions = {
+                str(action.get("action_id") or ""): action
+                for action in record.get("actions", [])
+            }
+            for action_id, state in list(court.actions.items()):
+                if state.status not in {"blocked", "awaiting_approval", "planned", "ready"}:
+                    continue
+                action = actions.get(action_id)
+                if action is None:
+                    if state.status == "blocked" and _is_deterministic_repair_reason(
+                        state.reason
+                    ):
+                        court.actions.pop(action_id, None)
+                        invalidated.add(action_id)
+                        changed = True
+                    continue
+                if (
+                    state.status == "blocked"
+                    and action.get("readiness") == "ready"
+                    and _is_deterministic_repair_reason(state.reason)
+                ):
+                    state.status = "planned"
+                    state.reason = None
+                    state.last_checked_at = None
+                    state.last_response_status = None
+                    invalidated.add(action_id)
+                    changed = True
+            self._update_court_status(court, record.get("actions", []))
+        if not changed:
+            return
+        self.store.save(ledger)
+        self.review_store.invalidate_actions(run_id, invalidated)
+        # Force the next page/JSON read to rebuild from the reconciled ledger.
+        self.store.summary_path_for(run_id).unlink(missing_ok=True)
 
     def _llm_review_report(self, run_id: str) -> dict[str, Any]:
         if run_id in self._llm_review_cache:
@@ -1323,16 +1487,78 @@ class ApiExecutionService:
         approvals: LlmApprovalLedger | None = None,
         review_report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        readiness = report or self._readiness_report(run_id)
+        approval_ledger = approvals or self.approval_store.load(run_id)
+        llm_report = review_report or self._llm_review_report(run_id)
+        llm_report = self._summary_review_report(
+            run_id, llm_report, readiness, approval_ledger
+        )
         summary = build_execution_summary(
             run_id,
-            report or self._readiness_report(run_id),
+            readiness,
             ledger or self.store.load(run_id),
-            review_report=review_report or self._llm_review_report(run_id),
-            approvals=approvals or self.approval_store.load(run_id),
+            review_report=llm_report,
+            approvals=approval_ledger,
             execution_review=self.review_store.load(run_id),
             submissions=self._review_summary_submissions(run_id),
         )
         return self.store.save_summary(run_id, summary)
+
+    def _summary_review_report(
+        self,
+        run_id: str,
+        report: dict[str, Any],
+        readiness: dict[str, Any],
+        approvals: LlmApprovalLedger,
+    ) -> dict[str, Any]:
+        """Count manual OS choices consistently with the LLM review page."""
+
+        action_links: dict[str, set[str]] = defaultdict(set)
+        actions_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
+        for record in readiness.get("records", []):
+            court_slug = str(record.get("court_slug") or "")
+            for action in record.get("actions", []):
+                action_id = str(action.get("action_id") or "")
+                if not action_id:
+                    continue
+                actions_by_id[action_id] = (court_slug, action)
+                for review_id in action.get("llm_review_ids", []):
+                    if review_id:
+                        action_links[str(review_id)].add(action_id)
+
+        execution = self.store.load(run_id)
+        items = []
+        for original in report.get("items", []):
+            item = dict(original)
+            review_id = str(item.get("review_id") or "")
+            action_ids = {
+                str(action_id)
+                for action_id in item.get("dependent_action_ids", [])
+                if action_id
+            } | action_links.get(review_id, set())
+            linked_statuses = set()
+            for action_id in action_ids:
+                linked = actions_by_id.get(action_id)
+                if linked is None:
+                    continue
+                court_slug, _ = linked
+                court_state = execution.courts.get(court_slug)
+                action_state = court_state.actions.get(action_id) if court_state else None
+                linked_statuses.add(action_state.status if action_state else "planned")
+            approval = approvals.approvals.get(review_id)
+            manually_selectable = bool(
+                item.get("kind") == "address"
+                and item.get("outcome") in {"no_selection", "no_result"}
+                and _manual_os_candidate_options(item)
+                and action_ids
+                and not linked_statuses & {"running", "succeeded", "unknown"}
+            )
+            if manually_selectable or (approval and approval.selected_uprn):
+                item["approvable"] = True
+                item["actionable"] = True
+                item["dependent_action_ids"] = sorted(action_ids)
+            items.append(item)
+        return {**report, "items": items}
 
     def _review_summary_submissions(self, run_id: str) -> list[dict[str, Any]]:
         submissions = self._submissions_by_row(run_id)
@@ -2112,7 +2338,13 @@ class ApiExecutionService:
         derived = {
             str(item["review_id"])
             for item in review_report.get("items", [])
-            if item.get("actionable")
+            if (
+                item.get("actionable")
+                or (
+                    item.get("kind") == "address"
+                    and item.get("os_candidates")
+                )
+            )
             and item.get("address_mode") != "po_box"
             and action_id in item.get("dependent_action_ids", [])
             and item.get("review_id")
@@ -2133,10 +2365,12 @@ class ApiExecutionService:
                 item
                 for item in review_report.get("items", [])
                 if item.get("kind") == "address"
-                and item.get("outcome") == "accepted"
                 and item.get("review_id") in review_ids
                 and item.get("review_id") in approvals.approvals
-                and item.get("api_body_patch")
+                and (
+                    item.get("api_body_patch")
+                    or approvals.approvals[str(item.get("review_id"))].approved_address_patch
+                )
             ),
             None,
         )
@@ -2159,10 +2393,12 @@ class ApiExecutionService:
             _review_item_with_approved_patch(item, approvals)
             for item in review_report.get("items", [])
             if item.get("kind") == "address"
-            and item.get("outcome") == "accepted"
             and item.get("review_id") in review_ids
             and item.get("review_id") in approvals.approvals
-            and item.get("api_body_patch")
+            and (
+                item.get("api_body_patch")
+                or approvals.approvals[str(item.get("review_id"))].approved_address_patch
+            )
         ]
         verifications = action.get("address_verifications") or []
         for index, verification in enumerate(verifications[:item_count]):
@@ -2525,13 +2761,87 @@ def _is_usable_review_item(item: dict[str, Any]) -> bool:
     return operation == "clear" or result.get("value") is not None
 
 
+def _review_item_can_hold_action(item: dict[str, Any]) -> bool:
+    return bool(
+        item.get("actionable")
+        or (
+            item.get("kind") == "address"
+            and item.get("os_candidates")
+            and item.get("dependent_action_ids")
+        )
+    )
+
+
 def _review_item_with_approved_patch(
     item: dict[str, Any], approvals: LlmApprovalLedger
 ) -> dict[str, Any]:
     approval = approvals.approvals.get(str(item.get("review_id") or ""))
-    if approval is None or approval.approved_address_patch is None:
+    if approval is None:
         return item
-    return {**item, "api_body_patch": approval.approved_address_patch}
+    result = dict(item.get("model_result") or {})
+    if approval.selected_uprn:
+        result["uprn"] = approval.selected_uprn
+    return {
+        **item,
+        "outcome": "accepted" if approval.selected_uprn else item.get("outcome"),
+        "model_result": result,
+        "api_body_patch": approval.approved_address_patch or item.get("api_body_patch"),
+    }
+
+
+def _os_candidate_for_uprn(
+    item: dict[str, Any], uprn: str
+) -> OsAddressCandidate | None:
+    for value in item.get("os_candidates") or []:
+        if not isinstance(value, dict) or str(value.get("uprn") or "") != uprn:
+            continue
+        try:
+            return OsAddressCandidate(**value)
+        except TypeError:
+            return None
+    return None
+
+
+def _manual_candidate_api_patch(
+    item: dict[str, Any], uprn: str | None
+) -> dict[str, str | None]:
+    if not uprn:
+        raise ValueError("Select an OS address candidate before approval")
+    candidate = _os_candidate_for_uprn(item, uprn)
+    if candidate is None:
+        raise ValueError("The selected UPRN was not supplied in this run's OS evidence")
+    try:
+        source = Address.model_validate(item.get("submitted_address") or {})
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The submitted address evidence is incomplete") from exc
+    proposed = candidate.proposed_address(source)
+    if proposed is None:
+        raise ValueError("That OS candidate cannot be mapped safely to a FaCT address")
+    return {
+        "addressLine1": proposed.get("line_1"),
+        "addressLine2": proposed.get("line_2"),
+        "townCity": proposed.get("town_or_city"),
+        "county": proposed.get("county"),
+        "postcode": proposed.get("postcode"),
+    }
+
+
+def _manual_os_candidate_options(item: dict[str, Any]) -> list[dict[str, Any]]:
+    if item.get("kind") != "address":
+        return []
+    options = []
+    for value in item.get("os_candidates") or []:
+        if not isinstance(value, dict):
+            continue
+        uprn = str(value.get("uprn") or "")
+        if not uprn:
+            continue
+        try:
+            patch = _manual_candidate_api_patch(item, uprn)
+        except ValueError:
+            continue
+        options.append({"uprn": uprn, "candidate": value, "api_body_patch": patch})
+    return options
 
 
 _ADDRESS_PATCH_FIELDS = (
@@ -2840,6 +3150,20 @@ def _legacy_address_reason_is_only_blocker(action: dict[str, Any]) -> bool:
         return False
     expected = f"Address verification requires review: {evidence.get('message') or ''}"
     return str(action.get("reason") or "").strip() == expected.strip()
+
+
+def _is_deterministic_repair_reason(reason: str | None) -> bool:
+    value = str(reason or "")
+    return any(
+        marker in value
+        for marker in (
+            "openingTimesDetails must contain at least one valid opening period",
+            "openingTimesDetails requires each opening time to be before its closing time",
+            "email does not match the FaCT API email format",
+            "accessibleToiletDescription contains characters rejected by the FaCT API",
+            "addressLine1 contains characters rejected by the FaCT API",
+        )
+    )
 
 
 def _legacy_lift_request_defaults(

@@ -281,6 +281,40 @@ def test_parse_time_cell_handles_meridiem_and_text_failures():
     assert result.issues[0].code == "INVALID_TIME"
 
 
+@pytest.mark.parametrize(
+    ("hour", "minute", "expected"),
+    [
+        ("09:00 am", "240 minutes", "09:00"),
+        ("16:30 pm", "60 minutes", "16:30"),
+        ("09:00", "?", "09:00"),
+        ("17:00", "?", "17:00"),
+    ],
+)
+def test_parse_time_parts_recovers_one_unambiguous_time_with_known_noise(
+    hour, minute, expected
+):
+    result = parse_time_parts(hour, minute)
+
+    assert result.value == expected
+    assert result.status == "valid_time"
+    assert result.issues[0].code == "TIME_FORMAT_RECOVERED"
+    assert result.issues[0].raw_value == f"{hour}:{minute}"
+    assert result.issues[0].cleaned_value == expected
+
+
+@pytest.mark.parametrize("value", ["09:00:?", "09:00:240 minutes"])
+def test_parse_time_cell_recovers_safe_trailing_noise(value):
+    result = parse_time_cell(value)
+
+    assert result.value == "09:00"
+    assert result.issues[0].code == "TIME_FORMAT_RECOVERED"
+
+
+@pytest.mark.parametrize("value", ["09-4.30:09-4.30", "morning 09:00 afternoon"])
+def test_parse_time_cell_does_not_guess_ambiguous_values(value):
+    assert parse_time_cell(value).status == "invalid"
+
+
 def test_split_multiselect():
     assert split_multiselect(None) == []
     assert split_multiselect("One; Two ; N/A; Three") == ["One", "Two", "Three"]

@@ -14,7 +14,7 @@ from fact_form_importer.cleaners.phones import extract_uk_phones, normalise_uk_p
 from fact_form_importer.cleaners.postcodes import normalise_uk_postcode
 from fact_form_importer.cleaners.slug import normalise_court_slug
 from fact_form_importer.cleaners.strings import null_if_empty_like
-from fact_form_importer.cleaners.times import parse_time_parts
+from fact_form_importer.cleaners.times import KNOWN_TEXT_STATUSES, parse_time_parts
 from fact_form_importer.ingest.column_mapping import (
     ColumnMapping,
     ColumnRef,
@@ -460,14 +460,18 @@ def _build_time_from_refs(
     if not all(field in refs for field in required_fields):
         return None
 
+    raw_open_hour = get_cell(raw_row, refs[f"{prefix}opening_hour"].column)
+    raw_open_minute = get_cell(raw_row, refs[f"{prefix}opening_minute"].column)
+    raw_close_hour = get_cell(raw_row, refs[f"{prefix}closing_hour"].column)
+    raw_close_minute = get_cell(raw_row, refs[f"{prefix}closing_minute"].column)
     open_result = parse_time_parts(
-        get_cell(raw_row, refs[f"{prefix}opening_hour"].column),
-        get_cell(raw_row, refs[f"{prefix}opening_minute"].column),
+        raw_open_hour,
+        raw_open_minute,
         f"{field_prefix}.open",
     )
     close_result = parse_time_parts(
-        get_cell(raw_row, refs[f"{prefix}closing_hour"].column),
-        get_cell(raw_row, refs[f"{prefix}closing_minute"].column),
+        raw_close_hour,
+        raw_close_minute,
         f"{field_prefix}.close",
     )
     time_issues = open_result.issues + close_result.issues
@@ -494,8 +498,19 @@ def _build_time_from_refs(
         open=open_result.value,
         close=close_result.value,
         status=status,
+        status_text=_known_time_status_text(
+            raw_open_hour, raw_open_minute, raw_close_hour, raw_close_minute
+        ),
         issues=time_issues,
     )
+
+
+def _known_time_status_text(*values: object) -> Optional[str]:
+    for value in values:
+        cleaned = null_if_empty_like(value)
+        if cleaned and cleaned.casefold() in KNOWN_TEXT_STATUSES:
+            return cleaned.casefold()
+    return None
 
 
 def _clean_string_ref(raw_row: dict[str, Any], column_ref: ColumnRef) -> Optional[str]:

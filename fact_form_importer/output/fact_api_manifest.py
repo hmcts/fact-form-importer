@@ -26,7 +26,7 @@ from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "2.0"
+API_MANIFEST_VERSION = "2.4"
 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
@@ -60,6 +60,11 @@ _FACT_API_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 _FACT_API_CI_IOM_POSTCODE_PATTERN = re.compile(r"^(?:IM|JE|GY)", re.IGNORECASE)
 _ADDRESS_CARE_OF_PATTERN = re.compile(r"\bc\s*/\s*o\b", re.IGNORECASE)
 _FACT_API_OPENING_DAYS = {"EVERYDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"}
+_NO_COUNTER_SERVICE_STATUSES = {
+    "no counter service",
+    "no counter service available",
+    "counter service not available",
+}
 
 CourtLookup = Callable[[str], Optional[CourtReference]]
 
@@ -231,6 +236,8 @@ def _build_record(
             body = {"courtId": court_id or "{court_id}", **body}
         original_body = dict(body)
         body = normalise_fact_api_action_body(resource, body)
+        if _invalid_email_only_contact_item(resource, original_body, body):
+            return
         if not body:
             return
         action_reason = reason
@@ -337,6 +344,7 @@ def _build_record(
         counter_body,
         counter_reason,
         source_fields=["counter_service"],
+        migration_assumptions=_counter_service_assumptions(submission),
     )
 
     for address in submission.addresses:
@@ -389,6 +397,7 @@ def _build_record(
             body,
             reason,
             source_fields=[f"opening_hours[{opening_hours.index}]"],
+            migration_assumptions=_opening_hours_assumptions(opening_hours),
         )
 
     actions = _group_collection_actions(actions)
@@ -665,8 +674,9 @@ def _counter_service_body(
         and _FACT_API_EMAIL_PATTERN.fullmatch(raw_appointment_contact)
         else None
     )
-    times = _counter_opening_times(counter)
-    evidence = bool(assists_with or appointment_contact or times)
+    no_counter_service = _has_no_counter_service_status(counter)
+    times = [] if no_counter_service else _counter_opening_times(counter)
+    evidence = bool(assists_with or appointment_contact or times or no_counter_service)
     if not evidence:
         return {}, None
 
@@ -675,17 +685,82 @@ def _counter_service_body(
     )
     body = _without_none(
         {
-            "counterService": True,
+            "counterService": not no_counter_service,
             "assistWithForms": "Forms" in assists_with,
             "assistWithDocuments": "Documents" in assists_with,
             "assistWithSupport": "Support at court" in assists_with,
-            "appointmentNeeded": bool(appointment_contact),
-            "appointmentContact": appointment_contact,
+            "appointmentNeeded": bool(appointment_contact) and not no_counter_service,
+            "appointmentContact": appointment_contact if not no_counter_service else None,
             "courtTypes": court_type_ids or None,
             "openingTimesDetails": times or None,
         }
     )
-    return body, type_reason
+    contradiction = (
+        "Counter service is explicitly unavailable but assistance options are also selected"
+        if no_counter_service and assists_with
+        else None
+    )
+    return body, _combine_reasons(type_reason, contradiction)
+
+
+def _has_no_counter_service_status(counter: dict[str, Any]) -> bool:
+    return any(
+        isinstance(value, (dict, OpeningTime))
+        and (
+            value.get("status_text") if isinstance(value, dict) else value.status_text
+        )
+        in _NO_COUNTER_SERVICE_STATUSES
+        for value in _counter_time_values(counter)
+    )
+
+
+def _counter_time_values(counter: dict[str, Any]) -> list[Any]:
+    return [
+        counter.get(field)
+        for field in (
+            "monday_to_friday",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+        )
+    ]
+
+
+def _counter_service_assumptions(submission: CourtSubmission) -> list[str]:
+    counter = submission.counter_service
+    assumptions = []
+    if _has_no_counter_service_status(counter):
+        assumptions.append(
+            "The source explicitly states that no counter service is available, so the "
+            "request sends counterService=false without appointment details or opening times."
+        )
+    omitted = sum(
+        _counter_time_is_unusable(value) for value in _counter_time_values(counter)
+    )
+    if omitted and not _has_no_counter_service_status(counter):
+        assumptions.append(
+            f"Omitted {omitted} unusable counter-service opening period(s). Submitted "
+            "counter details remain usable and existing live hours are preserved by merge."
+        )
+    return assumptions
+
+
+def _counter_time_is_unusable(value: Any) -> bool:
+    if not isinstance(value, (dict, OpeningTime)):
+        return False
+    status = value.get("status") if isinstance(value, dict) else value.status
+    opening = value.get("open") if isinstance(value, dict) else value.open
+    closing = value.get("close") if isinstance(value, dict) else value.close
+    if status in {"invalid", "known_text_status"}:
+        return True
+    return bool(
+        status == "valid_time"
+        and opening
+        and closing
+        and (opening >= closing or (opening == "00:00" and closing == "00:00"))
+    )
 
 
 def _address_body(address, vocabularies: Vocabularies | None) -> tuple[dict[str, Any], str | None]:
@@ -726,6 +801,8 @@ def _contact_body(contact, vocabularies: Vocabularies | None) -> tuple[dict[str,
                 "courtContactDescriptionId": description_id,
                 "explanation": contact.explanation,
                 "phoneNumber": _valid_phone_or_none(contact.phone),
+                # Keep the source value here so request-only normalisation can
+                # record an auditable omission when the optional email is invalid.
                 "email": contact.email,
             }
         ),
@@ -740,6 +817,11 @@ def _opening_hours_body(
     times = _opening_times(opening_hours)
     if opening_hours.type and type_id is None:
         reason = _combine_reasons(reason, "Opening-hours type does not have a FaCT API UUID")
+    if not times and not _is_no_counter_service_opening_type(opening_hours.type):
+        reason = _combine_reasons(
+            reason,
+            "openingTimesDetails must contain at least one valid opening period for this opening-hours type",
+        )
     return (
         _without_none(
             {
@@ -751,10 +833,42 @@ def _opening_hours_body(
     )
 
 
+def _is_no_counter_service_opening_type(value: str | None) -> bool:
+    return bool(value and value.strip().casefold() in _NO_COUNTER_SERVICE_STATUSES)
+
+
+def _opening_hours_assumptions(opening_hours: Any) -> list[str]:
+    recovered = sum(
+        issue.code == "TIME_FORMAT_RECOVERED"
+        for value in (
+            opening_hours.monday_to_friday,
+            opening_hours.monday,
+            opening_hours.tuesday,
+            opening_hours.wednesday,
+            opening_hours.thursday,
+            opening_hours.friday,
+        )
+        if isinstance(value, OpeningTime)
+        for issue in value.issues
+    )
+    if not recovered:
+        return []
+    return [
+        f"Recovered {recovered} unambiguous opening-time value(s) from recognised "
+        "formatting noise. Original values remain in immutable audit evidence."
+    ]
+
+
 def _counter_opening_times(counter: dict[str, Any]) -> list[dict[str, str]]:
     if counter.get("same_monday_to_friday") is True:
-        return _time_detail("EVERYDAY", counter.get("monday_to_friday"))
-    return _weekday_time_details(counter)
+        details = _time_detail("EVERYDAY", counter.get("monday_to_friday"))
+    else:
+        details = _weekday_time_details(counter)
+    return [
+        detail
+        for detail in details
+        if detail["openingTime"] < detail["closingTime"]
+    ]
 
 
 def _opening_times(opening_hours) -> list[dict[str, str]]:
@@ -895,7 +1009,10 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
     if resource == "contact_detail":
         errors.extend(_contact_validation_errors(body))
     if resource in {"counter_service_opening_hours", "court_opening_hours"}:
-        errors.extend(_opening_times_validation_errors(body))
+        # FaCT permits an absent list. Product rules about which ordinary
+        # opening-hour types need periods are applied while planning, where
+        # the human-readable vocabulary name is still available.
+        errors.extend(_opening_times_validation_errors(body, require_periods=False))
     if resource == "counter_service_opening_hours":
         appointment_contact = body.get("appointmentContact")
         if body.get("appointmentNeeded") is True and appointment_contact is None:
@@ -968,6 +1085,11 @@ def normalise_fact_api_action_body(resource: str, body: dict[str, Any]) -> dict[
         value = cleaned.get("explanation")
         if isinstance(value, str):
             cleaned["explanation"] = _normalise_fact_api_explanation(value)
+        email = cleaned.get("email")
+        if email is not None and (
+            not isinstance(email, str) or not _FACT_API_EMAIL_PATTERN.fullmatch(email)
+        ):
+            cleaned.pop("email", None)
     elif resource == "counter_service_opening_hours":
         appointment_contact = cleaned.get("appointmentContact")
         if appointment_contact is not None and (
@@ -1000,6 +1122,8 @@ def _normalise_fact_api_public_text(value: str) -> str:
         )
     )
     value = _ADDRESS_CARE_OF_PATTERN.sub("care of", value)
+    value = re.sub(r"\bN\s*/\s*A\b", "Not applicable", value, flags=re.IGNORECASE)
+    value = value.replace("|", " - ")
     return value.replace("&", " and ")
 
 
@@ -1024,6 +1148,12 @@ def _body_normalisations(
     changes: dict[str, dict[str, str]] = {}
     for field, original_value in original.items():
         cleaned_value = cleaned.get(field)
+        if isinstance(original_value, str) and field not in cleaned:
+            changes[field] = {
+                "from": original_value,
+                "to": "Omitted because the optional value is invalid",
+            }
+            continue
         if (
             isinstance(original_value, str)
             and isinstance(cleaned_value, str)
@@ -1031,6 +1161,17 @@ def _body_normalisations(
         ):
             changes[field] = {"from": original_value, "to": cleaned_value}
     return changes
+
+
+def _invalid_email_only_contact_item(
+    resource: str, original: dict[str, Any], cleaned: dict[str, Any]
+) -> bool:
+    if resource != "contact_detail":
+        return False
+    email = original.get("email")
+    if not isinstance(email, str) or _FACT_API_EMAIL_PATTERN.fullmatch(email):
+        return False
+    return not any(cleaned.get(field) for field in ("phoneNumber", "email", "explanation"))
 
 
 def _address_validation_errors(body: dict[str, Any]) -> list[str]:
@@ -1083,12 +1224,16 @@ def _contact_validation_errors(body: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _opening_times_validation_errors(body: dict[str, Any]) -> list[str]:
+def _opening_times_validation_errors(
+    body: dict[str, Any], *, require_periods: bool = True
+) -> list[str]:
     details = body.get("openingTimesDetails")
     if not isinstance(details, list) or not details:
-        return [
-            "openingTimesDetails must contain at least one valid opening period for the FaCT API"
-        ]
+        return (
+            ["openingTimesDetails must contain at least one valid opening period for the FaCT API"]
+            if require_periods
+            else []
+        )
 
     errors = []
     seen_days = set()

@@ -187,6 +187,7 @@ def test_ingest_workbook_preserves_known_counter_service_status_for_review(tmp_p
 
     opening_time = result.submissions[0].counter_service["monday_to_friday"]
     assert opening_time.status == "known_text_status"
+    assert opening_time.status_text == "appointment only"
     assert all(issue.code != "INVALID_TIME" for issue in result.submissions[0].issues)
 
 

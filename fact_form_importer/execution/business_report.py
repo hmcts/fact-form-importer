@@ -17,24 +17,31 @@ def build_business_report(
     ledger: ExecutionLedger,
     review: ExecutionReviewLedger,
     approvals: LlmApprovalLedger,
+    *,
+    manifest: dict[str, Any] | None = None,
+    submissions: list[dict[str, Any]] | None = None,
+    llm_review: dict[str, Any] | None = None,
+    execution_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     actions = [
         (court_slug, action)
         for court_slug, court in ledger.courts.items()
         for action in court.actions.values()
     ]
+    statuses = (
+        "planned",
+        "awaiting_approval",
+        "ready",
+        "blocked",
+        "running",
+        "succeeded",
+        "failed",
+        "unknown",
+    )
+    summary_counts = (execution_summary or {}).get("action_status_counts", {})
     action_counts = {
-        status: sum(action.status == status for _, action in actions)
-        for status in (
-            "planned",
-            "awaiting_approval",
-            "ready",
-            "blocked",
-            "running",
-            "succeeded",
-            "failed",
-            "unknown",
-        )
+        status: int(summary_counts.get(status, sum(action.status == status for _, action in actions)))
+        for status in statuses
     }
     completed = sum(
         action_counts[status] for status in ("succeeded", "blocked", "failed", "unknown")
@@ -78,6 +85,13 @@ def build_business_report(
             disposition.rationale,
             court_slug=disposition.court_slug,
         )
+    _append_repair_themes(
+        themes,
+        manifest or {},
+        submissions or [],
+        approvals,
+        llm_review or {},
+    )
     theme_rows = []
     for value in themes.values():
         courts = sorted(value.pop("courts"))
@@ -95,10 +109,15 @@ def build_business_report(
         for attempt in action.attempts
     )
     return {
-        "report_version": "1.1",
+        "report_version": "1.3",
         "run_id": run_id,
         "action_completion": {
             **action_counts,
+            "planned_action_count": sum(action_counts.values()),
+            "not_completed_actions": sum(
+                action_counts[status]
+                for status in ("planned", "awaiting_approval", "ready", "running")
+            ),
             "completed_terminal_actions": completed,
             "success_percentage": _percentage(action_counts["succeeded"], completed),
         },
@@ -126,8 +145,9 @@ def business_report_markdown(report: dict[str, Any]) -> str:
         "",
         "## Outcome",
         "",
-        f"- Action completion success: {completion['succeeded']} of {completion['completed_terminal_actions']} ({completion['success_percentage']}%).",
-        f"- API write acceptance: {acceptance['accepted']} of {acceptance['requests_sent']} requests sent ({acceptance['acceptance_percentage']}%).",
+        f"- Planned section actions: {completion.get('planned_action_count', sum(completion.get(status, 0) for status in ('planned', 'awaiting_approval', 'ready', 'blocked', 'running', 'succeeded', 'failed', 'unknown')))}.",
+        f"- Completed outcomes: {completion['succeeded']} succeeded of {completion['completed_terminal_actions']} terminal outcomes ({completion['success_percentage']}%).",
+        f"- API write responses: {acceptance['accepted']} accepted of {acceptance['requests_sent']} writes sent ({acceptance['acceptance_percentage']}%).",
         f"- API writes rejected: {acceptance['rejected']}; uncertain write outcomes: {acceptance['uncertain']}.",
         f"- Blocked: {completion['blocked']}; failed: {completion['failed']}; unknown: {completion['unknown']}.",
         "",
@@ -206,6 +226,104 @@ def _append_decision_theme(
             value["examples"].append(court_slug)
     if rationale and rationale not in value["reviewer_rationales"]:
         value["reviewer_rationales"].append(rationale)
+
+
+def _append_repair_themes(
+    themes: dict[str, dict[str, Any]],
+    manifest: dict[str, Any],
+    submissions: list[dict[str, Any]],
+    approvals: LlmApprovalLedger,
+    llm_review: dict[str, Any],
+) -> None:
+    for record in manifest.get("records", []):
+        court_slug = str(record.get("court_slug") or "") or None
+        for action in record.get("actions", []):
+            assumptions = " ".join(action.get("migration_assumptions") or []).casefold()
+            if "unusable counter-service opening period" in assumptions:
+                _append_decision_theme(
+                    themes,
+                    "Unusable counter-service hours omitted",
+                    "Valid counter-service fields were retained; absent hours preserve live values.",
+                    court_slug=court_slug,
+                )
+            if "explicitly states that no counter service is available" in assumptions:
+                _append_decision_theme(
+                    themes,
+                    "Explicit no-counter-service entries",
+                    "The request records counterService=false without inventing hours.",
+                    court_slug=court_slug,
+                )
+            if "recovered" in assumptions and "opening-time" in assumptions:
+                _append_decision_theme(
+                    themes,
+                    "Unambiguous malformed times recovered",
+                    "The original and repaired time are retained in audit evidence.",
+                    court_slug=court_slug,
+                )
+            normalisations = action.get("request_body_normalisations") or {}
+            if any(
+                isinstance(change, dict)
+                and "optional value is invalid" in str(change.get("to") or "").casefold()
+                for change in normalisations.values()
+            ):
+                _append_decision_theme(
+                    themes,
+                    "Invalid optional contact values omitted",
+                    "The raw value remains in audit evidence but is not sent to FaCT.",
+                    court_slug=court_slug,
+                )
+            if any(
+                isinstance(change, dict)
+                and (
+                    "|" in str(change.get("from") or "")
+                    or re.search(r"\bN\s*/\s*A\b", str(change.get("from") or ""), re.I)
+                )
+                for change in normalisations.values()
+            ):
+                _append_decision_theme(
+                    themes,
+                    "Harmless public-text punctuation normalised",
+                    "Only the request body was normalised; source evidence was preserved.",
+                    court_slug=court_slug,
+                )
+
+    for submission in submissions:
+        court_slug = str(submission.get("court_slug") or "") or None
+        issue_codes = {
+            str(issue.get("code") or "")
+            for issue in submission.get("issues", [])
+            if isinstance(issue, dict)
+        }
+        if "TIME_FORMAT_RECOVERED" in issue_codes:
+            _append_decision_theme(
+                themes,
+                "Unambiguous malformed times recovered",
+                "The original and repaired time are retained in audit evidence.",
+                court_slug=court_slug,
+            )
+        if "INVALID_EMAIL" in issue_codes:
+            _append_decision_theme(
+                themes,
+                "Invalid optional contact values omitted",
+                "The raw value remains in audit evidence but is not sent to FaCT.",
+                court_slug=court_slug,
+            )
+
+    review_by_id = {
+        str(item.get("review_id")): item
+        for item in llm_review.get("items", [])
+        if item.get("review_id")
+    }
+    for review_id, approval in approvals.approvals.items():
+        if not approval.selected_uprn:
+            continue
+        item = review_by_id.get(review_id, {})
+        _append_decision_theme(
+            themes,
+            "OS address candidates selected manually",
+            approval.rationale or "Reviewer selected a supplied OS candidate.",
+            court_slug=str(item.get("court_slug") or "") or None,
+        )
 
 
 def _write_attempt_counts(

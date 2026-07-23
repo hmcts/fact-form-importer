@@ -21,7 +21,7 @@ from fact_form_importer.validators.os_addresses import (
     AddressVerificationBatch,
     OsAddressCandidate,
 )
-from fact_form_importer.validators.vocabularies import Vocabularies
+from fact_form_importer.validators.vocabularies import Vocabularies, VocabularyEntry
 
 
 def test_explicit_contact_explanation_clear_is_preserved_for_merge_execution():
@@ -194,6 +194,146 @@ def test_manifest_omits_non_email_counter_appointment_contact():
     )
     assert "appointmentContact is required" in required_reason
     assert "appointmentContact does not match" in invalid_reason
+
+
+def test_counter_service_can_be_sent_without_hours_and_omits_reversed_periods():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="processed_with_warnings",
+        counter_service={
+            "assists_with": ["Forms"],
+            "same_monday_to_friday": True,
+            "monday_to_friday": OpeningTime(
+                open="17:00", close="09:00", status="valid_time"
+            ),
+        },
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+    action = next(
+        action
+        for action in manifest.records[0].actions
+        if action.resource == "counter_service_opening_hours"
+    )
+
+    assert action.readiness == "ready"
+    assert "openingTimesDetails" not in action.body
+    assert "Omitted 1 unusable" in action.migration_assumptions[0]
+    assert validate_fact_api_action_body(action.resource, action.body) is None
+
+
+def test_explicit_no_counter_service_is_sent_without_times_but_conflicts_are_held():
+    no_service = OpeningTime(
+        status="known_text_status", status_text="no counter service available"
+    )
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="processed_with_warnings",
+        counter_service={
+            "same_monday_to_friday": True,
+            "monday_to_friday": no_service,
+        },
+    )
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+    action = manifest.records[0].actions[0]
+
+    assert action.body["counterService"] is False
+    assert action.body["appointmentNeeded"] is False
+    assert "openingTimesDetails" not in action.body
+    assert action.readiness == "ready"
+
+    submission.counter_service["assists_with"] = ["Forms"]
+    conflicted = build_fact_api_import_manifest(
+        [submission], "run-2", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest.records[0].actions[0]
+    assert conflicted.readiness == "pending"
+    assert "explicitly unavailable" in conflicted.reason
+
+
+def test_no_counter_service_opening_type_is_valid_without_periods():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="processed_with_warnings",
+        opening_hours=[OpeningHoursSet(index=1, type="No counter service available")],
+    )
+    vocabularies = _vocabularies()
+    vocabularies.vocabularies["opening_hour_types"].append(
+        VocabularyEntry(
+            code="no_counter",
+            name="No counter service available",
+            api_id="none-id",
+        )
+    )
+
+    action = build_fact_api_import_manifest(
+        [submission], "run-1", vocabularies, lambda slug: CourtReference("court-id", slug)
+    ).manifest.records[0].actions[0]
+
+    assert action.readiness == "ready"
+    assert "openingTimesDetails" not in action.body
+
+
+def test_regular_opening_type_without_periods_remains_pending():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="needs_human_review",
+        opening_hours=[OpeningHoursSet(index=1, type="Court open")],
+    )
+    action = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest.records[0].actions[0]
+
+    assert action.readiness == "pending"
+    assert "at least one valid opening period" in action.reason
+
+
+def test_invalid_optional_contact_email_is_omitted_or_drops_empty_item():
+    submission = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="example-court",
+        status="processed_with_warnings",
+        contacts=[
+            ContactDetail(
+                index=1,
+                description="Enquiries",
+                phone="020 7946 0000",
+                email="invalid&mail@example.test",
+            ),
+            ContactDetail(
+                index=2,
+                description="Enquiries",
+                email="invalid&mail@example.test",
+            ),
+        ],
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [submission], "run-1", _vocabularies(), lambda slug: CourtReference("court-id", slug)
+    ).manifest
+    action = manifest.records[0].actions[0]
+
+    assert action.resource == "contact_detail"
+    assert action.body["phoneNumber"] == "020 7946 0000"
+    assert "email" not in action.body
+    assert action.request_body_normalisations["email"]["to"].startswith("Omitted")
+    assert len(manifest.records[0].actions) == 1
+
+
+def test_request_only_public_punctuation_repairs_are_audited():
+    assert normalise_fact_api_action_body(
+        "accessibility_options", {"accessibleToiletDescription": "N/A"}
+    )["accessibleToiletDescription"] == "Not applicable"
+    assert normalise_fact_api_action_body(
+        "address", {"addressLine1": "HMCTS | Upper Tribunal"}
+    )["addressLine1"] == "HMCTS - Upper Tribunal"
 
 
 def test_manifest_marks_invalid_api_text_pending_and_resolves_court_uuid_at_execution():
@@ -966,7 +1106,7 @@ def test_fact_api_contract_validation_allows_scottish_postcodes(postcode, town):
             "appointmentNeeded": False,
         },
     )
-    assert "openingTimesDetails" in empty_times_reason
+    assert empty_times_reason is None
 
     invalid_time_order_reason = validate_fact_api_action_body(
         "court_opening_hours",

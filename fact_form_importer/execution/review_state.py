@@ -311,11 +311,20 @@ class ExecutionReviewStore:
     def resolve_collection_item(
         self, run_id: str, resolution: CollectionItemResolution
     ) -> ExecutionReviewLedger:
+        return self.resolve_collection_items(run_id, [resolution])
+
+    def resolve_collection_items(
+        self, run_id: str, resolutions: list[CollectionItemResolution]
+    ) -> ExecutionReviewLedger:
+        """Persist one or more item decisions in a single atomic ledger update."""
+
         with self._lock, file_lock(self.path_for(run_id)):
             ledger = self._load_unlocked(run_id)
-            ledger.collection_item_resolutions[resolution.item_id] = resolution
+            action_ids = {resolution.action_id for resolution in resolutions}
+            for resolution in resolutions:
+                ledger.collection_item_resolutions[resolution.item_id] = resolution
             for change_id, comparison in list(ledger.comparisons.items()):
-                if comparison.action_id != resolution.action_id:
+                if comparison.action_id not in action_ids:
                     continue
                 ledger.comparisons.pop(change_id, None)
                 ledger.target_approvals.pop(change_id, None)

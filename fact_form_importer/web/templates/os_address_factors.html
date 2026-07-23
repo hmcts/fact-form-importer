@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>OS-Held Address Actions: {{ archive.manifest.run_id }}</h1>
+<h1>Archived OS address review factors: {{ archive.manifest.run_id }}</h1>
 <nav>
   <a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">Run summary</a>
-  <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">All records</a>
+  <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending') }}">Current pending address decisions</a>
 </nav>
-<p>These address actions are held because FaCT's Ordnance Survey lookup could not safely verify or normalise them. This does not independently change the court row's import status; it prevents only the affected address action from being sent.</p>
-<p class="muted">{{ factor_summary.os_action_blocking_submission_count }} rows, {{ factor_summary.os_action_blocking_address_count }} held address actions.</p>
+<p>These are immutable address-verification results that required review at ingestion time. Automatic or manual approval may since have resolved them, so this is evidence rather than a current work queue.</p>
+<p class="muted">{{ factor_summary.os_action_blocking_address_count }} archived address factors across {{ factor_summary.os_action_blocking_submission_count }} authoritative submissions.</p>
 <table>
   <thead><tr><th>Row</th><th>Court</th><th>Address</th><th>OS result</th><th>Why held</th><th>LLM candidate note</th></tr></thead>
   <tbody>{% for factor in factors %}
@@ -18,7 +18,7 @@
       <td>{{ factor.message }}</td>
       <td>{% if factor.llm_suggestion %}{{ factor.llm_suggestion.reason }}{% else %}No LLM candidate suggestion.{% endif %}</td>
     </tr>
-  {% else %}<tr><td colspan="6">No address actions are currently held by OS verification.</td></tr>{% endfor %}</tbody>
+  {% else %}<tr><td colspan="6">No archived OS address review factors were recorded.</td></tr>{% endfor %}</tbody>
 </table>
 {% if pages > 1 %}<p>Page {{ page }} of {{ pages }}{% if page > 1 %} · <a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id, page=page-1) }}">Previous</a>{% endif %}{% if page < pages %} · <a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id, page=page+1) }}">Next</a>{% endif %}</p>{% endif %}
 {% endblock %}

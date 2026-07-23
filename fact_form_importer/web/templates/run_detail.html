@@ -5,67 +5,49 @@
 <h1>Run {{ archive.manifest.run_id }}</h1>
 <p>{{ archive.manifest.source_name }} · {{ archive.manifest.completed_at }}</p>
 <nav>
-  <a href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}"><strong>Review workflow</strong></a>
-  <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">All records</a>
-  <a href="{{ url_for('records', run_id=archive.manifest.run_id, status='needs_human_review') }}">Needs review</a>
-  <a href="{{ url_for('review_overview', run_id=archive.manifest.run_id) }}">Review overview</a>
-  <a href="{{ url_for('issues', run_id=archive.manifest.run_id) }}">Issues</a>
-  {% if factor_summary.llm_review_submission_count %}<a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id) }}">LLM review factors</a>{% endif %}
-  {% if execution_summary.llm_approval_counts.total or summary.get('llm_requested') %}<a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id) }}">LLM actions review</a>{% endif %}
-  {% if factor_summary.os_action_blocking_submission_count %}<a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id) }}">OS-held addresses</a>{% endif %}
-  <a href="{{ url_for('api_actions', run_id=archive.manifest.run_id) }}">Readiness report</a>
-  <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">API changes review</a>
-  <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Execution summary</a>
+  <a href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}"><strong>Workflow</strong></a>
+  <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Records and audit</a>
+  <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">API results</a>
 </nav>
-<p><a class="button-link" href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}">Start or continue review</a></p>
+<p><a class="button-link" href="{{ url_for('workflow', run_id=archive.manifest.run_id) }}">Open review workflow</a></p>
 <h2>Form ingestion result</h2>
 <div class="summary">
-  {% for label, value in [('Form rows', summary.get('source_submission_count', summary.get('submission_count', status_total))),('Authoritative rows', summary.get('authoritative_submission_count', summary.get('submission_count', status_total))),('Superseded duplicate rows', summary.get('superseded_submission_count', 0)),('Unique court slugs', summary.get('unique_court_slug_count', factor_summary.unique_court_slug_count)),('Processed rows', summary.get('processed_count', 0)),('Warning rows', summary.get('processed_with_warnings_count', 0)),('Ingestion-review rows', summary.get('needs_human_review_count', 0)),('Failed rows', summary.get('failed_count', 0)),('Addresses checked', summary.get('address_verification_count', 0)),('LLM calls', summary.get('llm_calls', 0))] %}
+  {% for label, value in [('Source workbook submissions', summary.get('source_submission_count', summary.get('row_count', summary.get('submission_count', status_total)))),('Authoritative submissions', summary.get('authoritative_submission_count', summary.get('submission_count', status_total))),('Superseded duplicate submissions', summary.get('superseded_submission_count', 0)),('Processed without warnings', summary.get('processed_count', 0)),('Processed with warnings', summary.get('processed_with_warnings_count', 0)),('Needs source-data review', summary.get('needs_human_review_count', 0)),('Failed ingestion', summary.get('failed_count', 0))] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
-<p class="muted">These are immutable results from ingesting the workbook. Approving review decisions does not rewrite the archived ingestion status. Operational status counts cover authoritative rows; older duplicate submissions remain available in Records/Audit.</p>
-{% if factor_summary.llm_review_submission_count or factor_summary.os_action_blocking_submission_count %}
-<h2>Review Factors</h2>
-<div class="summary">
-  {% if factor_summary.llm_review_submission_count %}<div><strong>LLM review rows</strong><br><a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id) }}">{{ factor_summary.llm_review_submission_count }}</a><br><span class="muted">{{ factor_summary.llm_review_issue_count }} field factors</span></div>{% endif %}
-  {% if factor_summary.os_action_blocking_submission_count %}<div><strong>OS-held address rows</strong><br><a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id) }}">{{ factor_summary.os_action_blocking_submission_count }}</a><br><span class="muted">{{ factor_summary.os_action_blocking_address_count }} address actions</span></div>{% endif %}
-</div>
-<p class="muted">LLM review rows have a model-specific issue that contributes to human review. OS-held addresses require a decision before that address action can be sent, but do not independently change the court row's import status.</p>
-{% endif %}
+<p class="muted">These figures reconcile in two ways: the four ingestion outcomes sum to authoritative submissions, and authoritative plus superseded submissions equals the source workbook total. They are immutable archive results.</p>
 {% set review_progress = execution_summary.review_progress_counts %}
 <h2>Current review progress</h2>
 <p>These live figures update from the approval and comparison ledgers. Categories overlap; the unique court total counts each authoritative court once.</p>
 <div class="summary">
   <div><strong>Unique courts needing review</strong><br><a href="{{ url_for('records', run_id=archive.manifest.run_id, work='outstanding') }}">{{ review_progress.unique_courts_outstanding }}</a></div>
-  <div><strong>Review decisions pending</strong><br>{{ review_progress.pending_value_decisions }}<br><span class="muted">across {{ review_progress.pending_value_decision_courts }} courts, including results without an API action</span></div>
-  <div><strong>Denied review decisions</strong><br>{{ review_progress.denied_value_decisions }}<br><span class="muted">across {{ review_progress.denied_value_decision_courts }} courts; dependent actions remain held</span></div>
-  <div><strong>Source corrections</strong><br>{{ review_progress.source_correction_items }}<br><span class="muted">across {{ review_progress.source_correction_courts }} courts</span></div>
-  <div><strong>Existing-data approvals pending</strong><br>{{ review_progress.existing_data_approvals_pending }}<br><span class="muted">across {{ review_progress.existing_data_approval_courts }} courts</span></div>
-  <div><strong>Ambiguous comparisons</strong><br>{{ review_progress.ambiguous_comparisons }}<br><span class="muted">across {{ review_progress.ambiguous_comparison_courts }} courts</span></div>
-  <div><strong>Invalid planned sections</strong><br>{{ review_progress.invalid_section_actions }}<br><span class="muted">across {{ review_progress.invalid_section_courts }} courts</span></div>
-  <div><strong>FaCT sections not yet compared</strong><br>{{ execution_summary.replacement_approval_counts.not_checked }}</div>
+  <div><strong>Pending value decisions</strong><br>{{ review_progress.pending_value_decisions }}<br><span class="muted">across {{ review_progress.pending_value_decision_courts }} courts</span></div>
+  <div><strong>Courts needing source correction</strong><br>{{ review_progress.source_correction_courts }}<br><span class="muted">{{ review_progress.source_correction_items }} issues</span></div>
+  <div><strong>Live FaCT changes awaiting approval</strong><br>{{ review_progress.existing_data_approvals_pending }}<br><span class="muted">across {{ review_progress.existing_data_approval_courts }} courts</span></div>
+  <div><strong>Duplicate-type decisions pending</strong><br>{{ review_progress.ambiguous_comparisons }}<br><span class="muted">across {{ review_progress.ambiguous_comparison_courts }} courts</span></div>
+  <div><strong>Invalid section actions</strong><br>{{ review_progress.invalid_section_actions }}<br><span class="muted">across {{ review_progress.invalid_section_courts }} courts</span></div>
+  {% if execution_summary.replacement_approval_counts.not_checked %}<div><strong>Live sections not yet compared</strong><br>{{ execution_summary.replacement_approval_counts.not_checked }}</div>{% endif %}
 </div>
-<p class="muted">Unchecked FaCT sections are not counted as human approvals: the read-only comparison scan must first determine whether live data would actually change.</p>
+<p class="muted">Categories overlap. “Unique courts needing review” counts each court once across pending value decisions, source corrections, live-data approvals, duplicate-type decisions and invalid sections.</p>
 
 <h2>Approval outcomes</h2>
 <div class="summary">
-  {% for label, value in [('Automatically approved results', execution_summary.llm_approval_counts.auto_approved_total), ('Addresses auto-approved', execution_summary.llm_approval_counts.auto_approved_addresses), ('High-confidence fields auto-approved', execution_summary.llm_approval_counts.auto_approved_fields), ('Results manually approved', execution_summary.llm_approval_counts.manual_approved), ('Results denied', execution_summary.llm_approval_counts.denied)] %}
+  {% for label, value in [('Automatically approved values', execution_summary.llm_approval_counts.auto_approved_total), ('Manually approved values used by actions', execution_summary.llm_approval_counts.manual_approved), ('Denied values attached to actions', execution_summary.llm_approval_counts.denied)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
 
 <h2>API execution</h2>
-<p>These figures cover the {{ execution_summary.selected_court_count }} courts that have planned API sections. They are separate from the immutable ingestion-review row count above.</p>
+<p>These figures cover only courts with a generated section-action plan. “Without a review hold” does not guarantee a write: every action is still validated and preflighted immediately before execution.</p>
 <div class="summary">
-  <div><strong>Execution value dependencies pending</strong><br>{{ review_progress.pending_execution_value_dependencies }}<br><span class="muted">across {{ review_progress.pending_execution_value_dependency_courts }} planned courts</span></div>
-  {% for label, value in [('Planned courts', execution_summary.selected_court_count), ('Planned section actions', execution_summary.planned_action_count), ('Planned courts held by approvals', execution_summary.court_hold_counts.held_by_approvals), ('Section actions held by approvals', execution_summary.action_status_counts.awaiting_approval), ('Courts without a known approval hold', execution_summary.court_hold_counts.without_known_approval_hold), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts with blocked, failed or uncertain API outcomes', execution_summary.court_status_counts.attention_required), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked actions', execution_summary.action_status_counts.blocked), ('Failed actions', execution_summary.action_status_counts.failed), ('Unknown actions', execution_summary.action_status_counts.unknown)] %}
+  {% for label, value in [('Courts in API plan', execution_summary.selected_court_count), ('Section actions in API plan', execution_summary.planned_action_count), ('Actions without a review hold', execution_summary.action_status_counts.planned + execution_summary.action_status_counts.ready), ('Actions held by review decisions', execution_summary.action_status_counts.awaiting_approval), ('Completed courts', execution_summary.court_status_counts.completed), ('Courts with blocked, failed or uncertain outcomes', execution_summary.court_status_counts.attention_required), ('Succeeded actions', execution_summary.action_status_counts.succeeded), ('Blocked before write', execution_summary.action_status_counts.blocked), ('Rejected API actions', execution_summary.action_status_counts.failed), ('Uncertain write outcomes', execution_summary.action_status_counts.unknown)] %}
   <div><strong>{{ label }}</strong><br>{{ value }}</div>
   {% endfor %}
 </div>
 {% if writes_enabled %}
 <form method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe and fully approved action? Submitted values will be merged into current FaCT data.');">
-  <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Execution in progress…{% else %}Run all safe actions{% endif %}</button>
+  <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}API execution in progress…{% else %}Run all available FaCT API actions{% endif %}</button>
 </form>
 {% else %}
 <p class="muted">Run-level writes are disabled. Set <code>FACT_DATA_API_WRITES_ENABLED=true</code> only when ready to make FaCT changes.</p>
@@ -78,5 +60,17 @@
   {% if primary_artifacts %}<h3>Import payload</h3><ul>{% for artifact in primary_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>{% endif %}
   {% if report_artifacts %}<h3>Review reports</h3><ul>{% for artifact in report_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>{% endif %}
   {% if other_artifacts %}<h3>Other archived files</h3><ul>{% for artifact in other_artifacts %}<li><a href="{{ url_for('download', run_id=archive.manifest.run_id, artifact_name=artifact.name) }}">{{ artifact.label }}</a> ({{ artifact.bytes }} bytes)</li>{% endfor %}</ul>{% endif %}
+</details>
+<details>
+  <summary>Archived processing diagnostics</summary>
+  <p>These figures describe what happened during ingestion; they are not current work queues.</p>
+  <ul>
+    <li>Addresses checked against OS: {{ summary.get('address_verification_count', 0) }}</li>
+    <li>LLM calls: {{ summary.get('llm_calls', 0) }}</li>
+    {% if factor_summary.llm_review_submission_count %}<li><a href="{{ url_for('llm_review_factors', run_id=archive.manifest.run_id) }}">Archived LLM review factors</a>: {{ factor_summary.llm_review_issue_count }} factors across {{ factor_summary.llm_review_submission_count }} submissions</li>{% endif %}
+    {% if factor_summary.os_action_blocking_submission_count %}<li><a href="{{ url_for('os_address_factors', run_id=archive.manifest.run_id) }}">Archived OS address review factors</a>: {{ factor_summary.os_action_blocking_address_count }} addresses across {{ factor_summary.os_action_blocking_submission_count }} submissions</li>{% endif %}
+    <li><a href="{{ url_for('issues', run_id=archive.manifest.run_id) }}">Archived ingestion issues</a></li>
+    <li><a href="{{ url_for('api_actions', run_id=archive.manifest.run_id) }}">Generated API section plan</a></li>
+  </ul>
 </details>
 {% endblock %}

@@ -6,15 +6,16 @@
   <a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id) }}">LLM and address values</a>
   <a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">API changes</a>
 </nav>
-<p><strong>{{ overview.needs_review_rows }}</strong> form rows need review. Row categories overlap when one submission has more than one blocker.</p>
-<h2>Form-row blockers</h2>
+<p><strong>{{ overview.needs_review_rows }}</strong> authoritative submissions were classified as needing source review during ingestion. This immutable count is not the current to-do total.</p>
+<h2>Archived ingestion-review reasons</h2>
+<p class="muted">Categories overlap when one authoritative submission has more than one reason.</p>
 <div class="summary">
 {% for category in overview.row_categories %}
   <div><strong><a href="{{ url_for('records', run_id=archive.manifest.run_id, status='needs_human_review', category=category.code) }}">{{ category.label }}</a></strong><br>{{ category.row_count }} rows<br><span class="muted">{{ category.issue_count }} issues</span></div>
 {% else %}<div>No form rows are currently blocked.</div>{% endfor %}
 </div>
-<h2>API-action and approval holds</h2>
-<p class="muted">These are work items rather than row statuses. One row may contribute several section actions.</p>
+<h2>Current API-action holds</h2>
+<p class="muted">These are live work items rather than ingestion statuses. One submission may contribute several section actions.</p>
 <div class="summary">
 {% for category in overview.hold_categories %}
   <div><strong>{% if category.code == 'llm_approval' %}<a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending', queue='llm') }}">{{ category.label }}</a>{% else %}<a href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id, hold=category.code) }}">{{ category.label }}</a>{% endif %}</strong><br>{{ category.item_count }} items<br><span class="muted">{{ category.row_count }} rows</span></div>

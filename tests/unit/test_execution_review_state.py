@@ -107,6 +107,42 @@ def test_singleton_merge_preserves_unsubmitted_nested_professional_fields():
     assert comparison.operations[0]["body"]["professionalInformation"] == professional
 
 
+def test_counter_service_merge_preserves_live_hours_when_submission_omits_them():
+    action = {
+        "action_id": "court-counter",
+        "resource": "counter_service_opening_hours",
+        "method": "PUT",
+        "path": "/courts/id/v1/opening-hours/counter-service",
+        "body": {
+            "courtId": "id",
+            "counterService": True,
+            "assistWithForms": True,
+            "assistWithDocuments": False,
+            "assistWithSupport": False,
+            "appointmentNeeded": False,
+        },
+    }
+    current = {
+        "counterService": True,
+        "assistWithForms": False,
+        "assistWithDocuments": False,
+        "assistWithSupport": False,
+        "appointmentNeeded": False,
+        "openingTimesDetails": [
+            {
+                "dayOfWeek": "EVERYDAY",
+                "openingTime": "09:00",
+                "closingTime": "17:00",
+            }
+        ],
+    }
+
+    comparison = build_target_comparison("court", action, current)
+
+    assert comparison.proposed["assistWithForms"] is True
+    assert comparison.proposed["openingTimesDetails"] == current["openingTimesDetails"]
+
+
 def test_singleton_explicit_clear_supports_nested_field_paths():
     action = {
         "action_id": "court-professional-information",
@@ -404,15 +440,18 @@ def test_item_resolution_and_court_disposition_invalidate_only_affected_comparis
     store.save_comparisons("run", [first, second])
     store.approve_targets("run", {first.change_id, second.change_id})
 
-    resolved = store.resolve_collection_item(
+    resolved = store.resolve_collection_items(
         "run",
-        CollectionItemResolution(
-            item_id="item-1",
-            action_id="first-action",
-            resource="contact_detail",
-            decision="omit",
-            rationale="Duplicate entry",
-        ),
+        [
+            CollectionItemResolution(
+                item_id=item_id,
+                action_id="first-action",
+                resource="contact_detail",
+                decision="omit",
+                rationale="Duplicate entry",
+            )
+            for item_id in ("item-1", "item-2")
+        ],
     )
     closed = store.close_court(
         "run",
@@ -427,4 +466,5 @@ def test_item_resolution_and_court_disposition_invalidate_only_affected_comparis
     assert second.change_id in resolved.comparisons
     assert closed.comparisons == {}
     assert closed.collection_item_resolutions["item-1"].rationale == "Duplicate entry"
+    assert closed.collection_item_resolutions["item-2"].decision == "omit"
     assert closed.court_dispositions["3"].status == "unactionable"

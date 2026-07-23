@@ -245,9 +245,8 @@ def create_app(
         archives = list_run_archives(output_root)
         service = app.config["EXECUTION_SERVICE"]
         for archive in archives:
-            archive["factor_summary"] = _run_factor_summary(archive)
             try:
-                archive["execution_summary"] = service.get_execution_summary(
+                archive["execution_summary"] = service.get_cached_execution_summary(
                     str(archive["manifest"]["run_id"])
                 )
             except ValueError:
@@ -258,13 +257,6 @@ def create_app(
             llm_enabled=app.config["APP_CONFIG"].llm_enabled,
             address_verification_available=_address_verification_available(
                 app.config["APP_CONFIG"]
-            ),
-            has_llm_review_factors=any(
-                archive["factor_summary"]["llm_review_submission_count"] > 0 for archive in archives
-            ),
-            has_os_address_factors=any(
-                archive["factor_summary"]["os_action_blocking_submission_count"] > 0
-                for archive in archives
             ),
         )
 
@@ -333,7 +325,7 @@ def create_app(
     @app.get("/runs/<run_id>/courts")
     def courts(run_id: str):
         archive = _archive_or_404(output_root, run_id)
-        summary = app.config["EXECUTION_SERVICE"].get_execution_summary(run_id)
+        summary = app.config["EXECUTION_SERVICE"].get_cached_execution_summary(run_id)
         status = request.args.get("status") or ""
         query = (request.args.get("q") or "").strip().casefold()
         court_rows = [
@@ -351,6 +343,7 @@ def create_app(
             query=query,
             page=page,
             pages=pages,
+            filtered_court_count=len(court_rows),
             execution_summary=summary,
             writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
             active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
@@ -372,7 +365,7 @@ def create_app(
             for change in service.get_api_changes_review(run_id).get("changes", [])
             if change.get("court_slug") == court_slug
         }
-        summary = service.get_execution_summary(run_id)
+        summary = service.get_cached_execution_summary(run_id)
         court_summary = next(
             (court for court in summary.get("courts", []) if court.get("court_slug") == court_slug),
             None,
@@ -606,9 +599,16 @@ def create_app(
         code = request.args.get("code")
         if code:
             issues = [issue for issue in issues if issue.get("code") == code]
+        issue_count = len(issues)
         page, pages, issues_page = _paginate(issues, request.args.get("page"))
         return render_template(
-            "issues.html", archive=archive, issues=issues_page, code=code, page=page, pages=pages
+            "issues.html",
+            archive=archive,
+            issues=issues_page,
+            code=code,
+            issue_count=issue_count,
+            page=page,
+            pages=pages,
         )
 
     @app.get("/runs/<run_id>/llm-review-factors")
@@ -709,8 +709,10 @@ def create_app(
             query=request.args.get("q") or "",
             field_page=field_page,
             field_pages=field_pages,
+            filtered_field_count=len(field_items),
             address_page=address_page,
             address_pages=address_pages,
+            filtered_address_count=len(address_items),
             approval_complete=request.args.get("complete") == "1",
             bulk_approved=request.args.get("bulk_approved"),
             court_target_error=request.args.get("court_target_error"),
@@ -741,6 +743,8 @@ def create_app(
                 run_id,
                 review_id,
                 address_patch=address_patch,
+                selected_uprn=request.form.get("selected_uprn"),
+                selection_rationale=request.form.get("selection_rationale"),
                 field_value=field_value,
                 omit_field=omit_field,
                 omission_rationale=request.form.get("omission_rationale"),
@@ -912,6 +916,30 @@ def create_app(
             )
         )
 
+    @app.post("/runs/<run_id>/api-changes/<action_id>/items/omit-all")
+    def omit_all_collection_items(run_id: str, action_id: str):
+        _archive_or_404(output_root, run_id)
+        try:
+            _, omitted = app.config[
+                "EXECUTION_SERVICE"
+            ].omit_all_collection_items(
+                run_id,
+                action_id,
+                request.form.get("rationale") or "",
+            )
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(
+            url_for(
+                "api_changes_review",
+                run_id=run_id,
+                view=request.form.get("view") or "pending",
+                page=request.form.get("page") or 1,
+                omitted=omitted,
+                _anchor=f"change-{request.form.get('change_id') or ''}",
+            )
+        )
+
     @app.post("/runs/<run_id>/api-changes/approve-all")
     def approve_all_api_changes(run_id: str):
         _archive_or_404(output_root, run_id)
@@ -963,7 +991,7 @@ def create_app(
         readiness = request.args.get("readiness")
         ledger = app.config["EXECUTION_SERVICE"].get_ledger(run_id)
 
-        actions = [
+        all_actions = [
             {
                 "court_slug": record.get("court_slug"),
                 "execution_status": _action_execution_status(
@@ -973,6 +1001,10 @@ def create_app(
             }
             for record in manifest.get("records", [])
             for action in record.get("actions", [])
+        ]
+        actions = [
+            action
+            for action in all_actions
             if not readiness or action.get("readiness") == readiness
         ]
         page, pages, actions_page = _paginate(actions, request.args.get("page"))
@@ -984,6 +1016,19 @@ def create_app(
             readiness=readiness,
             page=page,
             pages=pages,
+            filtered_action_count=len(actions),
+            total_action_count=len(all_actions),
+            plan_ready_action_count=sum(
+                action.get("readiness") == "ready" for action in all_actions
+            ),
+            plan_pending_action_count=sum(
+                action.get("readiness") == "pending" for action in all_actions
+            ),
+            execution_summary=app.config[
+                "EXECUTION_SERVICE"
+            ].get_cached_execution_summary(
+                run_id
+            ),
             writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
         )
 
@@ -999,7 +1044,9 @@ def create_app(
         return render_template(
             "execution_summary.html",
             archive=archive,
-            execution_summary=app.config["EXECUTION_SERVICE"].get_execution_summary(run_id),
+            execution_summary=app.config[
+                "EXECUTION_SERVICE"
+            ].get_cached_execution_summary(run_id),
             execution_job=job,
             active_execution_job=app.config["EXECUTION_JOB_RUNNER"].active(),
             writes_enabled=app.config["APP_CONFIG"].fact_data_api_writes_enabled,
@@ -1010,7 +1057,9 @@ def create_app(
         job = app.config["EXECUTION_JOB_RUNNER"].get(job_id)
         if job is None:
             abort(404)
-        summary = app.config["EXECUTION_SERVICE"].get_execution_summary(job.run_id)
+        summary = app.config["EXECUTION_SERVICE"].get_cached_execution_summary(
+            job.run_id
+        )
         return jsonify({"job": job.model_dump(mode="json"), "execution_summary": summary})
 
     @app.get("/runs/<run_id>/execution-summary.json")
@@ -1485,6 +1534,7 @@ def _workflow_payload(run_id: str, service: ApiExecutionService) -> dict[str, An
     )
     comparison_checked = int(comparisons.get("comparisons", 0))
     comparison_required = int(comparisons.get("required", 0))
+    action_counts = execution.get("action_status_counts", {})
     return {
         "first_incomplete": first_incomplete,
         "llm_pending": llm_pending,
@@ -1497,12 +1547,15 @@ def _workflow_payload(run_id: str, service: ApiExecutionService) -> dict[str, An
         "comparison_total": execution.get("planned_action_count", 0),
         "comparison_checked": comparison_checked,
         "comparison_no_approval": max(
-            comparison_checked - comparison_required, 0
+            comparison_checked - comparison_required - merge_conflicts, 0
         ),
         "comparison_approved": comparisons.get("approved", 0),
         "court_count": execution.get("selected_court_count", 0),
         "court_counts": court_counts,
-        "action_counts": execution.get("action_status_counts", {}),
+        "action_counts": action_counts,
+        "available_action_count": int(action_counts.get("planned", 0))
+        + int(action_counts.get("ready", 0)),
+        "held_action_count": int(action_counts.get("awaiting_approval", 0)),
     }
 
 
@@ -1516,9 +1569,15 @@ def _comparison_summary(changes: list[dict[str, Any]]) -> dict[str, int]:
         "total": len(changes),
         "checked": len(comparisons),
         "not_checked": len(changes) - len(comparisons),
-        "no_change": sum(bool(comparison.get("is_no_change")) for comparison in comparisons),
+        "no_change": sum(
+            bool(comparison.get("is_no_change"))
+            and not comparison.get("merge_conflicts")
+            for comparison in comparisons
+        ),
         "empty_target": sum(
-            not comparison.get("has_existing_data") and not comparison.get("is_no_change")
+            not comparison.get("has_existing_data")
+            and not comparison.get("is_no_change")
+            and not comparison.get("merge_conflicts")
             for comparison in comparisons
         ),
         "approval_required": sum(
@@ -1531,7 +1590,16 @@ def _comparison_summary(changes: list[dict[str, Any]]) -> dict[str, int]:
             )
             for change in changes
         ),
-        "approved": sum(bool(change.get("target_approved")) for change in changes),
+        "approved": sum(
+            bool(
+                (comparison := change.get("comparison"))
+                and comparison.get("has_existing_data")
+                and not comparison.get("is_no_change")
+                and not comparison.get("merge_conflicts")
+                and change.get("target_approved")
+            )
+            for change in changes
+        ),
         "conflicts": sum(
             bool(comparison.get("merge_conflicts")) for comparison in comparisons
         ),

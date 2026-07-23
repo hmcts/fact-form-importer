@@ -155,6 +155,35 @@ def test_address_override_records_hash_and_policy_decision_history(tmp_path):
     assert approval.decision_history[0].policy_version == ADDRESS_AUTO_APPROVAL_POLICY_VERSION
 
 
+def test_manual_candidate_approval_requires_rationale_and_records_uprn(tmp_path):
+    store = LlmApprovalStore(tmp_path / "out")
+    patch = {
+        "addressLine1": "Selected Court",
+        "addressLine2": "1 Main Street",
+        "townCity": "London",
+        "county": None,
+        "postcode": "SW1A 1AA",
+    }
+
+    with pytest.raises(ValueError, match="reason for selecting"):
+        store.approve_address(
+            "run-1", "address", patch, selected_uprn="uprn-2"
+        )
+
+    ledger = store.approve_address(
+        "run-1",
+        "address",
+        patch,
+        selected_uprn="uprn-2",
+        rationale="The organisation and street match the submitted court",
+    )
+
+    approval = ledger.approvals["address"]
+    assert approval.selected_uprn == "uprn-2"
+    assert approval.rationale.startswith("The organisation")
+    assert approval.approved_value_hash
+
+
 def test_denial_survives_policy_and_bulk_approval_until_reconsidered(tmp_path):
     store = LlmApprovalStore(tmp_path / "out")
     store.deny("run-1", "denied", "The result conflicts with the submitted evidence")

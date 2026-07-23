@@ -34,6 +34,7 @@ class OpeningTime(BaseModel):
     open: Optional[str] = None
     close: Optional[str] = None
     status: Optional[str] = None
+    status_text: Optional[str] = None
     issues: list[Issue] = Field(default_factory=list)
 
 

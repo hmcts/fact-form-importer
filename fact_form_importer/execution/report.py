@@ -36,7 +36,7 @@ _COURT_STATUSES = (
     "completed",
 )
 _ATTENTION_ACTION_STATUSES = {"blocked", "failed", "unknown"}
-EXECUTION_SUMMARY_VERSION = "2.1"
+EXECUTION_SUMMARY_VERSION = "2.3"
 _SOURCE_CORRECTION_CODES = {
     "COURT_SLUG_NOT_FOUND",
     "COURT_SLUG_SUGGESTED",
@@ -124,7 +124,10 @@ def build_execution_summary(
                 if action.get("source_selection_required") and not review_ledger.source_selections.get(court_slug):
                     hold_codes.append("source_selection")
                 review_ids = _action_review_ids(action, review_report)
-                if any(review_id not in approved_ids for review_id in review_ids):
+                if any(
+                    review_id not in approved_ids and review_id not in denied_ids
+                    for review_id in review_ids
+                ):
                     hold_codes.append("value_approval")
                 if any(review_id in denied_ids for review_id in review_ids):
                     hold_codes.append("denied_value")
@@ -234,7 +237,9 @@ def _replacement_approval_counts(
     required = [
         comparison
         for comparison in review.comparisons.values()
-        if comparison.has_existing_data and not comparison.is_no_change
+        if comparison.has_existing_data
+        and not comparison.is_no_change
+        and not comparison.merge_conflicts
     ]
     approved = sum(
         comparison.change_id in review.target_approvals for comparison in required
@@ -493,7 +498,12 @@ def _llm_approval_counts(
     approvals: LlmApprovalLedger,
     succeeded_action_ids: set[str],
 ) -> dict[str, int]:
-    actionable = [item for item in review_report.get("items", []) if item.get("actionable")]
+    actionable = [
+        item
+        for item in review_report.get("items", [])
+        if item.get("actionable")
+        and item.get("approvable", item.get("actionable"))
+    ]
     actionable_ids = {str(item.get("review_id")) for item in actionable}
     approved_ids = set(approvals.approvals)
     denied_ids = set(approvals.denials)

@@ -10,6 +10,7 @@ from fact_form_importer.models.court_submission import (
     OpeningTime,
 )
 from fact_form_importer.models.source import SourceMetadata
+from fact_form_importer.output.fact_api_manifest import API_MANIFEST_VERSION
 from fact_form_importer.validators.fact_api_courts import CourtReference
 
 
@@ -122,7 +123,7 @@ def test_overlay_derives_section_plan_and_preserves_succeeded_legacy_sections(tm
         "run", archive, tmp_path / "out", original, {"legacy-address", "legacy-orphan"}
     )
 
-    assert overlay["manifest_version"] == "2.0"
+    assert overlay["manifest_version"] == API_MANIFEST_VERSION
     assert overlay["derived_execution_overlay"] is True
     assert overlay["preserved_succeeded_section_count"] == 2
     example = next(

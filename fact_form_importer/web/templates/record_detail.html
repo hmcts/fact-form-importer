@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Record {{ submission.source.source_row_number }}</h1>
-<p><a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Back to records</a>{% if actions and operational_court_slug and submission.selection_status != 'superseded' %} · <a href="{{ url_for('court_detail', run_id=archive.manifest.run_id, court_slug=operational_court_slug) }}">Review and run this court</a>{% endif %}</p>
+<p><a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Back to records</a>{% if actions and operational_court_slug and submission.selection_status != 'superseded' %} · <a href="{{ url_for('court_detail', run_id=archive.manifest.run_id, court_slug=operational_court_slug) }}">View court actions</a>{% endif %}</p>
 {% if submission.selection_status == 'superseded' %}<p class="error"><strong>Superseded by later source row {{ submission.superseded_by_source_row_number }}.</strong> This row is retained for audit but has no LLM review dependencies or API actions.</p>{% endif %}
 
 <section>
@@ -42,12 +42,12 @@
   <p class="muted">Every action rechecks that this court exists and that the live section still matches its approved comparison. Existing data can be replaced only after the exact before/after section has been approved. This tool never creates a court.</p>
   <form method="post" action="{{ url_for('api_check_court', run_id=archive.manifest.run_id, court_slug=operational_court_slug) }}" class="inline-form">
     <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
-    <button type="submit" class="secondary">Check target sections</button>
+    <button type="submit" class="secondary">Refresh this court's live comparisons</button>
   </form>
   {% if writes_enabled %}
   <form method="post" action="{{ url_for('api_execute_court', run_id=archive.manifest.run_id, court_slug=operational_court_slug) }}" class="inline-form" onsubmit="return confirm('Run every safe and fully approved section action for this court?');">
     <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
-    <button type="submit" {% if active_execution_job %}disabled{% endif %}>Run all safe actions for this court</button>
+    <button type="submit" {% if active_execution_job %}disabled{% endif %}>Run available FaCT API actions for this court</button>
   </form>
   {% elif not writes_enabled %}
   <p class="muted">Writes are disabled locally. Set <code>FACT_DATA_API_WRITES_ENABLED=true</code> only when ready to make FaCT changes.</p>
@@ -66,7 +66,7 @@
           {% if writes_enabled %}
           <form method="post" action="{{ url_for('api_execute_action', run_id=archive.manifest.run_id, court_slug=operational_court_slug, action_id=action.action_id) }}" onsubmit="return confirm('Run this FaCT API action? It will be preflighted again before a write.');">
             <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
-            <button type="submit" {% if action.execution.status == 'succeeded' or active_execution_job %}disabled{% endif %}>Run action</button>
+            <button type="submit" {% if action.execution.status == 'succeeded' or active_execution_job %}disabled{% endif %}>Run this FaCT API action</button>
           </form>
           {% else %}<span class="muted">Writes disabled</span>{% endif %}
         </td>

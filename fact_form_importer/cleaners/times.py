@@ -18,6 +18,11 @@ KNOWN_TEXT_STATUSES = {
     "closed",
 }
 TIME_PATTERN = re.compile(r"^(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?$", re.IGNORECASE)
+_NOISY_FULL_TIME_PATTERN = re.compile(
+    r"^(\d{1,2}:\d{2})\s*(am|pm)?\s*(?::\s*(?:\?|\d+\s*minutes?)|\?)$",
+    re.IGNORECASE,
+)
+_MINUTE_NOISE_PATTERN = re.compile(r"^(?:\?|\d+\s*minutes?)$", re.IGNORECASE)
 
 
 def parse_time_parts(
@@ -36,6 +41,12 @@ def parse_time_parts(
     if hour is not None and minute is not None and hour.lower() == minute.lower():
         if hour.lower() in KNOWN_TEXT_STATUSES:
             return CleaningResult(value=None, status="known_text_status")
+
+    recovered = _recover_full_time_with_minute_noise(
+        hour, minute, field, raw_value=f"{hour_value}:{minute_value}"
+    )
+    if recovered is not None:
+        return recovered
 
     full_time_from_hour = _parse_full_time_from_hour_field(hour, minute, field, hour_value)
     if full_time_from_hour is not None:
@@ -58,22 +69,69 @@ def parse_time_cell(value: object, field: str = "time") -> CleaningResult:
 
     cleaned = _normalise_time_punctuation(cleaned) or ""
 
+    noisy_match = _NOISY_FULL_TIME_PATTERN.fullmatch(cleaned)
+    if noisy_match:
+        parsed = _parse_clock_value(
+            noisy_match.group(1), noisy_match.group(2), field, value
+        )
+        if parsed.status == "valid_time" and parsed.value:
+            return _recovered_time(field, value, parsed.value)
+
     match = TIME_PATTERN.match(cleaned.replace(".", ":"))
     if not match:
         return _invalid_time(field, value, "Time value could not be parsed")
 
-    hour = int(match.group(1))
-    minute = int(match.group(2) or "0")
-    meridiem = match.group(3)
+    return _parse_clock_value(
+        f"{match.group(1)}:{match.group(2) or '0'}", match.group(3), field, value
+    )
 
+
+def _parse_clock_value(
+    clock: str, meridiem: str | None, field: str, raw_value: object
+) -> CleaningResult:
+    hour_text, minute_text = clock.split(":", 1)
+    hour = int(hour_text)
+    minute = int(minute_text)
     if meridiem and hour <= 12:
         meridiem = meridiem.lower()
         if meridiem == "pm" and hour != 12:
             hour += 12
         if meridiem == "am" and hour == 12:
             hour = 0
+    return _format_time(hour, minute, field, raw_value)
 
-    return _format_time(hour, minute, field, value)
+
+def _recover_full_time_with_minute_noise(
+    hour: str | None,
+    minute: str | None,
+    field: str,
+    raw_value: object,
+) -> CleaningResult | None:
+    """Recover a complete time when the separate minute cell is obvious noise."""
+
+    if hour is None or minute is None or not _MINUTE_NOISE_PATTERN.fullmatch(minute):
+        return None
+    parsed = parse_time_cell(hour, field)
+    if parsed.status != "valid_time" or parsed.value is None:
+        return None
+    return _recovered_time(field, raw_value, parsed.value)
+
+
+def _recovered_time(field: str, raw_value: object, value: str) -> CleaningResult:
+    return CleaningResult(
+        value=value,
+        status="valid_time",
+        issues=[
+            Issue(
+                field=field,
+                code="TIME_FORMAT_RECOVERED",
+                severity="warning",
+                message="Recovered one unambiguous time and ignored recognised formatting noise",
+                raw_value=raw_value,
+                cleaned_value=value,
+            )
+        ],
+    )
 
 
 def _parse_hour_minute(

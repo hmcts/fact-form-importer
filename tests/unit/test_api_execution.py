@@ -506,6 +506,162 @@ def test_approved_address_uses_os_mapping_and_requires_fresh_uprn(tmp_path, monk
     assert missing_client.writes == []
 
 
+def test_manual_os_candidate_selection_releases_no_selection_address(
+    tmp_path, monkeypatch
+):
+    action = _address_action("example-court-1", "Submitted Court")
+    action.update(
+        {
+            "readiness": "pending",
+            "reason": "Address verification requires review: Multiple candidates",
+            "source_fields": ["addresses[1]"],
+            "source_row_number": 2,
+            "address_verification": {
+                "status": "review_required",
+                "message": "Multiple candidates",
+            },
+        }
+    )
+    run_id = _archive(tmp_path, actions=[action])
+    review_path = tmp_path / "out" / "final" / run_id / "llm_actions_review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "manual-address",
+                        "kind": "address",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "addresses[1]",
+                        "address_index": 1,
+                        "submitted_address": {
+                            "index": 1,
+                            "address_type": "Visit",
+                            "line_1": "Submitted Court",
+                            "town_or_city": "London",
+                            "county": "Greater London",
+                            "postcode": "SW1A 1AA",
+                        },
+                        "llm_input": {"candidates": [{"uprn": "uprn-2"}]},
+                        "os_candidates": [
+                            {
+                                "uprn": "uprn-2",
+                                "address": None,
+                                "organisation_name": "Selected Court",
+                                "building_number": "1",
+                                "building_name": None,
+                                "thoroughfare_name": "Main Street",
+                                "post_town": "London",
+                                "postcode": "SW1A 1AA",
+                            }
+                        ],
+                        "model_result": {
+                            "uprn": None,
+                            "confidence": "low",
+                            "needs_human_review": True,
+                            "reason": "No safe unique selection",
+                        },
+                        "outcome": "no_selection",
+                        "dependent_action_ids": ["example-court-1"],
+                        "actionable": False,
+                        "approvable": False,
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+    client = FakeFactApiClient(
+        target=ApiResponse(204),
+        address_lookup=ApiResponse(
+            200, {"results": [{"DPA": {"UPRN": "uprn-2"}}]}
+        ),
+    )
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    item = service.get_llm_actions_review(run_id)["items"][0]
+    assert item["manual_candidate_selectable"] is True
+    assert item["dependent_actions"][0]["status"] == "awaiting_approval"
+    summary = service.get_execution_summary(run_id)
+    assert summary["review_progress_counts"]["pending_value_decisions"] == 1
+    assert summary["review_progress_counts"][
+        "pending_execution_value_dependencies"
+    ] == 1
+    change = service.get_api_changes_review(run_id)["changes"][0]
+    assert change["pending_value_holds"][0]["review_id"] == "manual-address"
+    _, bulk_added = service.approve_all_pending_llm_reviews(run_id)
+    assert bulk_added == 0
+    with pytest.raises(ValueError, match="reason for selecting"):
+        service.approve_llm_review(
+            run_id, "manual-address", selected_uprn="uprn-2"
+        )
+    approvals = service.approve_llm_review(
+        run_id,
+        "manual-address",
+        selected_uprn="uprn-2",
+        selection_rationale="The court name and street match the submitted address",
+    )
+    assert approvals.approvals["manual-address"].selected_uprn == "uprn-2"
+    assert service.get_execution_summary(run_id)["review_progress_counts"][
+        "pending_value_decisions"
+    ] == 0
+    assert service.get_api_changes_review(run_id)["changes"][0][
+        "pending_value_holds"
+    ] == []
+
+    completed = service.execute_action(run_id, "example-court", "example-court-1")
+
+    assert completed.courts["example-court"].actions["example-court-1"].status == "succeeded"
+    assert client.writes[0][2]["addressLine1"] == "Selected Court"
+    assert client.writes[0][2]["addressLine2"] == "1 Main Street"
+
+
+def test_manual_os_candidate_rejects_unsupplied_uprn(tmp_path):
+    action = _address_action("example-court-1")
+    run_id = _archive(tmp_path, actions=[action])
+    _write_llm_review(tmp_path, run_id, ["manual-address"], kind="address")
+    path = tmp_path / "out" / "final" / run_id / "llm_actions_review.json"
+    report = json.loads(path.read_text())
+    item = report["items"][0]
+    item.update(
+        {
+            "outcome": "no_selection",
+            "actionable": False,
+            "approvable": False,
+            "submitted_address": {
+                "index": 1,
+                "line_1": "Court",
+                "town_or_city": "London",
+                "postcode": "SW1A 1AA",
+            },
+            "os_candidates": [
+                {
+                    "uprn": "uprn-1",
+                    "address": None,
+                    "organisation_name": "Court",
+                    "building_number": "1",
+                    "building_name": None,
+                    "thoroughfare_name": "Main Street",
+                    "post_town": "London",
+                    "postcode": "SW1A 1AA",
+                }
+            ],
+        }
+    )
+    path.write_text(json.dumps(report))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+
+    with pytest.raises(ValueError, match="not supplied"):
+        service.approve_llm_review(
+            run_id,
+            "manual-address",
+            selected_uprn="uprn-other",
+            selection_rationale="Test mismatch",
+        )
+
+
 def test_reviewer_edited_address_is_stored_invalidates_comparison_and_is_executed(
     tmp_path, monkeypatch
 ):
@@ -761,7 +917,9 @@ def test_denied_llm_result_is_excluded_from_bulk_approval_and_keeps_action_held(
     assert waiting.courts["example-court"].actions["example-court-1"].status == (
         "awaiting_approval"
     )
-    assert service.get_execution_summary(run_id)["llm_approval_counts"]["denied"] == 1
+    summary = service.get_execution_summary(run_id)
+    assert summary["llm_approval_counts"]["denied"] == 1
+    assert summary["courts"][0]["actions"][0]["hold_codes"] == ["denied_value"]
     assert client.writes == []
     with pytest.raises(ValueError, match="Reconsider"):
         service.approve_llm_review(run_id, "deny-me")
@@ -1538,6 +1696,68 @@ def test_execute_all_safe_actions_runs_courts_without_local_approval(tmp_path, m
     assert len(client.writes) == 2
     assert {court.status for court in ledger.courts.values()} == {"completed"}
     assert summary["action_status_counts"]["succeeded"] == 2
+
+
+def test_derived_plan_reconciliation_resets_only_deterministically_repaired_blockers(
+    tmp_path,
+):
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), FakeFactApiClient())
+    ledger = service.store.load("run")
+    ledger.courts["example-court"] = CourtExecutionState(
+        court_slug="example-court",
+        actions={
+            "counter": ActionExecutionState(
+                action_id="counter",
+                status="blocked",
+                reason=(
+                    "openingTimesDetails must contain at least one valid opening period "
+                    "for the FaCT API"
+                ),
+            ),
+            "obsolete": ActionExecutionState(
+                action_id="obsolete",
+                status="blocked",
+                reason=(
+                    "openingTimesDetails must contain at least one valid opening period "
+                    "for the FaCT API"
+                ),
+            ),
+            "unrelated": ActionExecutionState(
+                action_id="unrelated",
+                status="blocked",
+                reason="Multiple contact entries use business type 'type-id'",
+            ),
+            "uncertain": ActionExecutionState(
+                action_id="uncertain",
+                status="unknown",
+                reason=(
+                    "openingTimesDetails must contain at least one valid opening period "
+                    "for the FaCT API"
+                ),
+            ),
+        },
+    )
+    service.store.save(ledger)
+    report = {
+        "records": [
+            {
+                "court_slug": "example-court",
+                "actions": [
+                    {"action_id": "counter", "readiness": "ready"},
+                    {"action_id": "unrelated", "readiness": "ready"},
+                    {"action_id": "uncertain", "readiness": "ready"},
+                ],
+            }
+        ]
+    }
+
+    service._reconcile_deterministic_plan_repairs("run", report)
+    actions = service.store.load("run").courts["example-court"].actions
+
+    assert actions["counter"].status == "planned"
+    assert "obsolete" not in actions
+    assert actions["unrelated"].status == "blocked"
+    assert actions["uncertain"].status == "unknown"
 
 
 @pytest.mark.parametrize(

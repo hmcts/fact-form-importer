@@ -7,32 +7,32 @@
   <a href="{{ url_for('records', run_id=archive.manifest.run_id) }}">Records and audit</a>
   <a href="{{ url_for('execution_summary', run_id=archive.manifest.run_id) }}">Results</a>
 </nav>
-<p class="muted">Work through these steps in order. You may open any step at any time; execution still runs only actions whose approvals and preflights are complete.</p>
+<p class="muted">The first two steps record review decisions only. The clearly labelled button in Step 3 is the only run-level control here that sends writes to FaCT.</p>
 
 <section class="workflow-step" id="step-1">
   <h2>1. Review LLM and address results</h2>
-  <p><strong>{{ workflow.llm_pending }}</strong> review decisions pending from {{ workflow.llm_total }} results. <span class="muted">{{ workflow.llm_execution_pending }} currently hold planned API sections; the remainder are still reviewable evidence on blocker-affected rows.</span></p>
-  <a class="button-link" href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending') if workflow.llm_pending else url_for('llm_actions_review', run_id=archive.manifest.run_id) }}">{% if workflow.llm_pending %}Continue LLM review{% else %}View completed LLM review{% endif %}</a>
+  {% if workflow.llm_pending %}<p><strong>{{ workflow.llm_pending }}</strong> value decisions remain across all model and address evidence. <strong>{{ workflow.llm_execution_pending }}</strong> currently hold section actions; the remainder are reviewable evidence without an executable action.</p>{% else %}<p>All model and address value decisions are complete. The evidence remains available for audit.</p>{% endif %}
+  <a class="button-link" href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status='pending') if workflow.llm_pending else url_for('llm_actions_review', run_id=archive.manifest.run_id) }}">{% if workflow.llm_pending %}Open pending value decisions{% else %}View value-decision audit{% endif %}</a>
 </section>
 
 <section class="workflow-step" id="step-2">
   <h2>2. Review changes to live FaCT data</h2>
   {% if workflow.comparison_pending %}
   <p><strong>{{ workflow.comparison_pending }}</strong> of {{ workflow.comparison_total }} planned court sections still need the read-only FaCT comparison scan. This is not an approval queue: a section becomes a human decision only when the scan finds a non-empty live value that would change.</p>
-  <p class="muted">{{ workflow.comparison_checked }} checked so far · {{ workflow.comparison_pending }} not checked.</p>
+  <p class="muted">{{ workflow.comparison_checked }} checked so far: {{ workflow.change_approval_pending }} live changes await approval, {{ workflow.comparison_approved }} are approved, {{ workflow.comparison_no_approval }} need no live-data approval, and {{ workflow.merge_conflicts }} have duplicate-type decisions. {{ workflow.comparison_pending }} remain unchecked.</p>
   {% else %}
-  <p>All {{ workflow.comparison_total }} planned sections have been checked: <strong>{{ workflow.change_approval_pending }}</strong> existing-data changes need approval, {{ workflow.comparison_approved }} are approved and {{ workflow.comparison_no_approval }} need no existing-data approval. <strong>{{ workflow.merge_conflicts }}</strong> of the checked sections contain ambiguous submitted entries that remain blocked.</p>
+  <p>All {{ workflow.comparison_total }} planned sections have been checked. The exclusive outcomes are: <strong>{{ workflow.change_approval_pending }}</strong> live changes awaiting approval, {{ workflow.comparison_approved }} approved live changes, {{ workflow.comparison_no_approval }} empty or unchanged sections needing no live-data approval, and <strong>{{ workflow.merge_conflicts }}</strong> duplicate-type decisions requiring resolution.</p>
   {% endif %}
-  <a class="button-link" href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">Review FaCT changes</a>
+  <a class="button-link" href="{{ url_for('api_changes_review', run_id=archive.manifest.run_id) }}">Open live-data decisions</a>
 </section>
 
 <section class="workflow-step" id="step-3">
-  <h2>3. Review and execute courts</h2>
-  <p><strong>{{ workflow.court_count }}</strong> courts · {{ workflow.court_counts.completed or 0 }} completed · {{ workflow.court_counts.awaiting_approval or 0 }} awaiting approval · {{ workflow.court_counts.attention_required or 0 }} need attention.</p>
-  <a class="button-link" href="{{ url_for('courts', run_id=archive.manifest.run_id) }}">Review courts and actions</a>
+  <h2>3. Execute available API actions</h2>
+  <p><strong>{{ workflow.court_count }}</strong> courts are in the API plan. Across them, <strong>{{ workflow.available_action_count }}</strong> section actions have no recorded review hold and can be preflighted, while {{ workflow.held_action_count }} remain held by review decisions. {{ workflow.court_counts.completed or 0 }} courts are complete; {{ workflow.court_counts.attention_required or 0 }} have blocked, rejected or uncertain outcomes.</p>
+  <a class="button-link" href="{{ url_for('courts', run_id=archive.manifest.run_id) }}">View court action list</a>
   {% if writes_enabled %}
   <form class="inline-form" method="post" action="{{ url_for('api_execute_run', run_id=archive.manifest.run_id) }}" onsubmit="return confirm('Run every currently safe and fully approved action?');">
-    <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Execution in progress…{% else %}Run all safe actions{% endif %}</button>
+    <button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}API execution in progress…{% else %}Run all available FaCT API actions{% endif %}</button>
   </form>
   {% endif %}
 </section>

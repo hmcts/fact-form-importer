@@ -9,6 +9,11 @@ from typing import Any
 from pydantic import ValidationError
 
 from fact_form_importer.execution.atomic_state import atomic_write_json, file_lock
+from fact_form_importer.ingest.column_mapping import load_column_mapping
+from fact_form_importer.ingest.workbook_reader import (
+    _build_counter_service,
+    _build_opening_hours,
+)
 from fact_form_importer.llm.review import address_verification_batch_from_dict
 from fact_form_importer.models.court_submission import CourtSubmission
 from fact_form_importer.output.fact_api_manifest import (
@@ -65,6 +70,7 @@ def derive_latest_execution_overlay(
         return _preserve_succeeded_sections(
             existing_derived or original, original, succeeded_action_ids or set()
         )
+    submissions = [_with_current_time_repairs(submission) for submission in submissions]
     submissions, submission_selection = select_authoritative_submissions(submissions)
     overridden_submissions = []
     for submission in submissions:
@@ -118,6 +124,7 @@ def derive_latest_execution_overlay(
         address_verifications=address_verification_batch_from_dict(address_report),
         llm_review_items=llm_items,
     ).manifest.model_dump(mode="json")
+    _restore_stable_action_ids(result, original)
     # Early/test archives can contain schema-valid but deliberately abbreviated
     # submissions alongside a usable legacy action plan. Preserve any legacy
     # record whose source row could not be reconstructed from that evidence.
@@ -210,6 +217,35 @@ def _preserve_succeeded_sections(
     return merged
 
 
+def _restore_stable_action_ids(
+    derived: dict[str, Any], original: dict[str, Any]
+) -> None:
+    """Keep ledger/review dependencies stable when a section body is repaired."""
+
+    original_ids: dict[tuple[str, str, int | None], list[str]] = {}
+    for record in original.get("records", []):
+        slug = str(record.get("court_slug") or "")
+        for action in record.get("actions", []):
+            key = (
+                slug,
+                str(action.get("resource") or ""),
+                action.get("source_row_number"),
+            )
+            if action.get("action_id"):
+                original_ids.setdefault(key, []).append(str(action["action_id"]))
+    for record in derived.get("records", []):
+        slug = str(record.get("court_slug") or "")
+        for action in record.get("actions", []):
+            key = (
+                slug,
+                str(action.get("resource") or ""),
+                action.get("source_row_number"),
+            )
+            candidates = original_ids.get(key, [])
+            if len(candidates) == 1:
+                action["action_id"] = candidates[0]
+
+
 def _derive_vocabularies(
     manifest: dict[str, Any], submissions: dict[int, CourtSubmission]
 ) -> Vocabularies:
@@ -282,3 +318,29 @@ def _read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _with_current_time_repairs(submission: CourtSubmission) -> CourtSubmission:
+    """Reparse archived raw opening-hour cells into a mutable execution proposal."""
+
+    if not submission.raw:
+        return submission
+    mapping_path = Path(__file__).resolve().parents[2] / "config" / "column_mapping.json"
+    if not mapping_path.exists():
+        return submission
+    issues = []
+    mapping = load_column_mapping(mapping_path)
+    rebuilt = _build_opening_hours(
+        submission.raw,
+        mapping,
+        issues,
+    )
+    rebuilt_counter = _build_counter_service(submission.raw, mapping, issues)
+    if not rebuilt and not rebuilt_counter:
+        return submission
+    changed = submission.model_copy(deep=True)
+    if rebuilt:
+        changed.opening_hours = rebuilt
+    if rebuilt_counter:
+        changed.counter_service = rebuilt_counter
+    return changed
