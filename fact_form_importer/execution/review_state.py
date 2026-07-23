@@ -330,6 +330,52 @@ class ExecutionReviewStore:
                 ledger.target_approvals.pop(change_id, None)
             return self._save_unlocked(ledger)
 
+    def apply_test_decisions(
+        self,
+        run_id: str,
+        resolutions: list[CollectionItemResolution],
+        target_change_ids: set[str],
+    ) -> tuple[ExecutionReviewLedger, int, int]:
+        """Atomically omit test collection items and approve independent live diffs."""
+
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
+            action_ids = {resolution.action_id for resolution in resolutions}
+            for resolution in resolutions:
+                ledger.collection_item_resolutions[resolution.item_id] = resolution
+            for change_id, comparison in list(ledger.comparisons.items()):
+                if comparison.action_id not in action_ids:
+                    continue
+                ledger.comparisons.pop(change_id, None)
+                ledger.target_approvals.pop(change_id, None)
+
+            approved = 0
+            for change_id in sorted(target_change_ids):
+                comparison = ledger.comparisons.get(change_id)
+                if (
+                    comparison is None
+                    or not comparison.has_existing_data
+                    or comparison.is_no_change
+                    or comparison.merge_conflicts
+                ):
+                    continue
+                existing = ledger.target_approvals.get(change_id)
+                if existing and (
+                    existing.current_hash == comparison.current_hash
+                    and existing.proposed_hash == comparison.proposed_hash
+                ):
+                    continue
+                ledger.target_approvals[change_id] = TargetApproval(
+                    change_id=change_id,
+                    current_hash=comparison.current_hash,
+                    proposed_hash=comparison.proposed_hash,
+                )
+                approved += 1
+
+            changed = bool(resolutions or approved)
+            saved = self._save_unlocked(ledger) if changed else ledger
+            return saved, len(resolutions), approved
+
     def close_court(
         self, run_id: str, disposition: CourtDisposition
     ) -> ExecutionReviewLedger:

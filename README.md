@@ -1243,7 +1243,12 @@ under the ambiguous label "rows":
   two figures always add up to source submissions.
 - **Planned courts** and **section actions** are execution units. One court can
   have several actions, so neither number should be compared directly with the
-  workbook-row total.
+workbook-row total.
+
+The archived-runs landing page contains an open “What the columns mean” guide.
+It states explicitly that the API plan contains only courts with a currently
+confirmed FaCT target and can grow when an unmatched authoritative submission
+is assigned the correct target slug.
 
 The four immutable ingestion results (processed, warnings, needs source review
 and failed) add up to authoritative submissions. Live human-review totals are a
@@ -1276,3 +1281,19 @@ sections for the court; existing live collection entries remain protected by
 merge semantics. Step 2 loads archived vocabulary choices once per resource per
 request rather than once per planned action, keeping resolution redirects usable
 on large runs.
+
+Both decision pages also expose clearly labelled testing-only fast-forward
+controls. Step 1 approves ordinary pending values, uses the first safely mappable
+UPRN from the immutable supplied OS candidate list for unresolved addresses, and
+accepts a displayed explanation only when it already fits the API limit. Step 2
+approves checked, unambiguous populated-target changes and omits every submitted
+item in safely editable duplicate-type collection sections with an auditable
+testing rationale. Decisions are persisted atomically and proposal changes
+trigger a fresh read-only comparison scan. These controls never execute a FaCT
+write, never override an explicit denial, and skip missing candidates, invalid
+source values, unmatched courts, unsafe conflicts, and running, succeeded or
+unknown actions. Normal production review remains one decision at a time.
+
+Current verification: 440 unit tests pass, Ruff is clean, global coverage is
+90.10%, and the configured cleaners, ingestion, validators, API-manifest and web
+coverage groups all meet their exact 95% gates.

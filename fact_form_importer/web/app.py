@@ -814,6 +814,36 @@ def create_app(
             )
         )
 
+    @app.post("/runs/<run_id>/llm-actions/test-fast-forward")
+    def test_fast_forward_llm_actions(run_id: str):
+        _archive_or_404(output_root, run_id)
+        runner = app.config["EXECUTION_JOB_RUNNER"]
+        if runner.active():
+            abort(400, "Wait for the active FaCT job to finish")
+        try:
+            result = app.config[
+                "EXECUTION_SERVICE"
+            ].apply_test_llm_decisions(run_id)
+            job = (
+                runner.start(run_id, "comparison")
+                if result["invalidated_actions"]
+                else None
+            )
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(
+            url_for(
+                "api_changes_review",
+                run_id=run_id,
+                view="pending",
+                job_id=job.job_id if job else None,
+                test_llm_approved=result["approved"],
+                test_candidates=result["candidate_selections"],
+                test_fields=result["edited_fields"],
+                test_skipped=result["skipped"],
+            )
+        )
+
     @app.get("/runs/<run_id>/api-changes")
     def api_changes_review(run_id: str):
         archive = _archive_or_404(output_root, run_id)
@@ -955,6 +985,36 @@ def create_app(
                 run_id=run_id,
                 view="pending",
                 bulk_approved=approved,
+            )
+        )
+
+    @app.post("/runs/<run_id>/api-changes/test-fast-forward")
+    def test_fast_forward_api_changes(run_id: str):
+        _archive_or_404(output_root, run_id)
+        runner = app.config["EXECUTION_JOB_RUNNER"]
+        if runner.active():
+            abort(400, "Wait for the active FaCT job to finish")
+        try:
+            result = app.config[
+                "EXECUTION_SERVICE"
+            ].apply_test_api_change_decisions(run_id)
+            job = (
+                runner.start(run_id, "comparison")
+                if result["resolved_sections"]
+                else None
+            )
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(
+            url_for(
+                "api_changes_review",
+                run_id=run_id,
+                view="pending",
+                job_id=job.job_id if job else None,
+                test_changes=result["approved_changes"],
+                test_omitted=result["omitted_items"],
+                test_sections=result["resolved_sections"],
+                test_conflicts_skipped=result["skipped_conflicts"],
             )
         )
 

@@ -121,6 +121,24 @@ class LlmApprovalStore:
                 self._save(ledger)
             return ledger, added
 
+    def apply_test_approvals(
+        self, run_id: str, decisions: dict[str, LlmApproval]
+    ) -> tuple[LlmApprovalLedger, int]:
+        """Atomically record deterministic testing decisions for pending IDs."""
+
+        with self._lock, file_lock(self.path_for(run_id)):
+            ledger = self._load_unlocked(run_id)
+            added = 0
+            for review_id in sorted(decisions):
+                if review_id in ledger.approvals or review_id in ledger.denials:
+                    continue
+                ledger.approvals[review_id] = decisions[review_id]
+                added += 1
+            if added:
+                ledger.ledger_version = APPROVAL_LEDGER_VERSION
+                self._save(ledger)
+            return ledger, added
+
     def deny(self, run_id: str, review_id: str, rationale: str) -> LlmApprovalLedger:
         """Record a final human decision not to use a pending LLM result."""
 

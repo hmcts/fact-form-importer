@@ -86,6 +86,8 @@ def test_review_ui_lists_archives_and_displays_record_raw_data(tmp_path):
     assert b"Duplicate form decision workbook" in client.get(f"/runs/{run_id}").data
     landing_page = client.get("/").data
     assert b"Source submissions" in landing_page
+    assert b"What the columns mean" in landing_page
+    assert b"can grow when a reviewer supplies the correct FaCT court slug" in landing_page
     assert b"Authoritative submissions" in landing_page
     assert b"Superseded submissions" in landing_page
 
@@ -583,6 +585,7 @@ def test_llm_deny_then_bulk_approve_excludes_denied_and_never_writes(tmp_path):
 
     assert b"Deny and continue" in pending.data
     assert b"Approve all eligible remaining results" in pending.data
+    assert b"Fast-forward all Step 1 decisions for testing" in pending.data
     assert denied.headers["Location"].endswith("#review-approve-one")
     assert b"Reconsider" in denied_page.data
     assert "bulk_approved=2" in bulk.headers["Location"]
@@ -601,6 +604,112 @@ def test_llm_deny_then_bulk_approve_excludes_denied_and_never_writes(tmp_path):
     assert "status=pending" in reconsidered.headers["Location"]
     assert reconsidered.headers["Location"].endswith("#review-deny-me")
     assert execution_client.writes == []
+
+
+def test_testing_fast_forward_routes_redirect_to_the_next_workflow_step(tmp_path):
+    output_root, run_id = _archive(tmp_path)
+
+    class LlmFastForwardService:
+        def apply_test_llm_decisions(self, requested_run_id):
+            assert requested_run_id == run_id
+            return {
+                "approved": 7,
+                "candidate_selections": 3,
+                "edited_fields": 1,
+                "invalidated_actions": 2,
+                "skipped": 2,
+            }
+
+    class InactiveRunner:
+        def active(self):
+            return None
+
+        def start(self, requested_run_id, scope):
+            assert requested_run_id == run_id
+            assert scope == "comparison"
+            return SimpleNamespace(job_id="comparison-job")
+
+    llm_app = create_app(
+        output_root, execution_service=LlmFastForwardService()
+    )
+    llm_app.config["EXECUTION_JOB_RUNNER"] = InactiveRunner()
+    llm_client = llm_app.test_client()
+    llm_result = llm_client.post(
+        f"/runs/{run_id}/llm-actions/test-fast-forward"
+    )
+
+    assert llm_result.status_code == 302
+    assert "/api-changes?" in llm_result.headers["Location"]
+    assert "test_llm_approved=7" in llm_result.headers["Location"]
+    assert "test_candidates=3" in llm_result.headers["Location"]
+    assert "job_id=comparison-job" in llm_result.headers["Location"]
+
+    class ChangesFastForwardService:
+        def apply_test_api_change_decisions(self, requested_run_id):
+            assert requested_run_id == run_id
+            return {
+                "approved_changes": 11,
+                "omitted_items": 8,
+                "resolved_sections": 2,
+                "skipped_conflicts": 4,
+            }
+
+    changes_app = create_app(
+        output_root, execution_service=ChangesFastForwardService()
+    )
+    changes_app.config["EXECUTION_JOB_RUNNER"] = InactiveRunner()
+    changes_client = changes_app.test_client()
+    changes_result = changes_client.post(
+        f"/runs/{run_id}/api-changes/test-fast-forward"
+    )
+
+    assert changes_result.status_code == 302
+    assert "test_changes=11" in changes_result.headers["Location"]
+    assert "test_omitted=8" in changes_result.headers["Location"]
+    assert "test_conflicts_skipped=4" in changes_result.headers["Location"]
+
+    class RaisingService:
+        def apply_test_llm_decisions(self, requested_run_id):
+            raise ValueError("Unsafe test value")
+
+        def apply_test_api_change_decisions(self, requested_run_id):
+            raise ValueError("Unsafe test change")
+
+    raising_app = create_app(output_root, execution_service=RaisingService())
+    raising_app.config["EXECUTION_JOB_RUNNER"] = InactiveRunner()
+    raising_client = raising_app.test_client()
+    assert (
+        raising_client.post(
+            f"/runs/{run_id}/llm-actions/test-fast-forward"
+        ).status_code
+        == 400
+    )
+    assert (
+        raising_client.post(
+            f"/runs/{run_id}/api-changes/test-fast-forward"
+        ).status_code
+        == 400
+    )
+
+    class ActiveRunner:
+        def active(self):
+            return SimpleNamespace(job_id="active")
+
+    active_app = create_app(output_root, execution_service=RaisingService())
+    active_app.config["EXECUTION_JOB_RUNNER"] = ActiveRunner()
+    active_client = active_app.test_client()
+    assert (
+        active_client.post(
+            f"/runs/{run_id}/llm-actions/test-fast-forward"
+        ).status_code
+        == 400
+    )
+    assert (
+        active_client.post(
+            f"/runs/{run_id}/api-changes/test-fast-forward"
+        ).status_code
+        == 400
+    )
 
 
 def test_missing_court_target_can_be_validated_without_writing_and_collision_is_rejected(
@@ -1426,6 +1535,7 @@ def test_api_changes_defaults_to_pending_advances_approval_and_hides_stale_job(
     assert b"court-3" not in pending.data
     assert b"Approve and continue" in pending.data
     assert b"Approve all 2 live-data changes" in pending.data
+    assert b"Fast-forward all Step 2 decisions for testing" in pending.data
     assert b"Latest comparison scan" not in pending.data
     assert b"court-3" in all_sections.data
     assert "view=pending" in advanced.headers["Location"]

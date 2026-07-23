@@ -11,7 +11,10 @@ from fact_form_importer.execution.report import (
     _error_theme,
     _group_attention_by_request_type,
 )
-from fact_form_importer.execution.review_state import CollectionItemResolution
+from fact_form_importer.execution.review_state import (
+    CollectionItemResolution,
+    build_target_comparison,
+)
 from fact_form_importer.execution.service import ApiExecutionService
 from fact_form_importer.output.archive import publish_run_archive, stage_path
 from fact_form_importer.output.fact_api_manifest import API_MANIFEST_VERSION
@@ -308,6 +311,66 @@ def test_approve_all_target_changes_records_review_only_and_is_idempotent(tmp_pa
     assert repeated_added == 0
     assert len(ledger.target_approvals) == 1
     assert repeated.target_approvals.keys() == ledger.target_approvals.keys()
+    assert client.writes == []
+
+
+def test_testing_fast_forward_approves_live_changes_and_omits_conflicting_items(
+    tmp_path,
+):
+    building = _action("example-court-1")
+    contacts = {
+        "action_id": "example-court-2",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/court-id/v1/contact-details",
+        "readiness": "ready",
+        "source_row_number": 2,
+        "proposed_items": [
+            {
+                "courtContactDescriptionId": "type-1",
+                "email": "first@example.com",
+            },
+            {
+                "courtContactDescriptionId": "type-1",
+                "email": "second@example.com",
+            },
+        ],
+        "proposed_item_ids": ["contact-1", "contact-2"],
+    }
+    run_id = _archive(tmp_path, actions=[building, contacts])
+    client = FakeFactApiClient()
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    building_comparison = build_target_comparison(
+        "example-court", building, {"parking": False}
+    )
+    contact_comparison = build_target_comparison("example-court", contacts, [])
+    service.review_store.save_comparisons(
+        run_id, [building_comparison, contact_comparison]
+    )
+
+    result = service.apply_test_api_change_decisions(run_id)
+    repeated = service.apply_test_api_change_decisions(run_id)
+    ledger = service.get_execution_review(run_id)
+
+    assert result == {
+        "approved_changes": 1,
+        "omitted_items": 2,
+        "resolved_sections": 1,
+        "skipped_conflicts": 0,
+        "remaining_comparisons": 1,
+    }
+    assert repeated["approved_changes"] == 0
+    assert repeated["omitted_items"] == 0
+    assert building_comparison.change_id in ledger.target_approvals
+    assert contact_comparison.change_id not in ledger.comparisons
+    assert {
+        resolution.decision
+        for resolution in ledger.collection_item_resolutions.values()
+    } == {"omit"}
+    assert all(
+        "Testing fast-forward" in resolution.rationale
+        for resolution in ledger.collection_item_resolutions.values()
+    )
     assert client.writes == []
 
 
@@ -616,6 +679,109 @@ def test_manual_os_candidate_selection_releases_no_selection_address(
     assert completed.courts["example-court"].actions["example-court-1"].status == "succeeded"
     assert client.writes[0][2]["addressLine1"] == "Selected Court"
     assert client.writes[0][2]["addressLine2"] == "1 Main Street"
+
+
+def test_testing_fast_forward_selects_first_valid_os_candidate_without_writing(
+    tmp_path,
+):
+    action = _address_action("example-court-1", "Submitted Court")
+    action.update(
+        {
+            "readiness": "pending",
+            "reason": "Address verification requires review",
+            "source_fields": ["addresses[1]"],
+            "source_row_number": 2,
+            "address_verification": {
+                "status": "review_required",
+                "message": "Multiple candidates",
+            },
+        }
+    )
+    run_id = _archive(tmp_path, actions=[action])
+    review_path = tmp_path / "out" / "final" / run_id / "llm_actions_review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "review_version": "1.1",
+                "items": [
+                    {
+                        "review_id": "manual-address",
+                        "kind": "address",
+                        "source_row_number": 2,
+                        "court_slug": "example-court",
+                        "field": "addresses[1]",
+                        "address_index": 1,
+                        "submitted_address": {
+                            "index": 1,
+                            "address_type": "Visit",
+                            "line_1": "Submitted Court",
+                            "town_or_city": "London",
+                            "postcode": "SW1A 1AA",
+                        },
+                        "llm_input": {
+                            "candidates": [
+                                {"uprn": "uprn-first"},
+                                {"uprn": "uprn-second"},
+                            ]
+                        },
+                        "os_candidates": [
+                                {
+                                    "uprn": "uprn-first",
+                                    "address": None,
+                                    "organisation_name": "First Court",
+                                    "building_number": "1",
+                                    "building_name": None,
+                                    "thoroughfare_name": "Main Street",
+                                    "post_town": "London",
+                                    "postcode": "SW1A 1AA",
+                                },
+                                {
+                                    "uprn": "uprn-second",
+                                    "address": None,
+                                    "organisation_name": "Second Court",
+                                    "building_number": "2",
+                                    "building_name": None,
+                                    "thoroughfare_name": "Main Street",
+                                "post_town": "London",
+                                "postcode": "SW1A 1AA",
+                            },
+                        ],
+                        "model_result": {
+                            "uprn": None,
+                            "confidence": "low",
+                            "needs_human_review": True,
+                            "reason": "No safe unique selection",
+                        },
+                        "outcome": "no_selection",
+                        "dependent_action_ids": ["example-court-1"],
+                        "actionable": False,
+                        "approvable": False,
+                    }
+                ],
+            }
+        )
+    )
+    client = FakeFactApiClient()
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    result = service.apply_test_llm_decisions(run_id)
+    repeated = service.apply_test_llm_decisions(run_id)
+    approval = service.approval_store.load(run_id).approvals["manual-address"]
+
+    assert result["approved"] == 1
+    assert result["candidate_selections"] == 1
+    assert result["invalidated_actions"] == 1
+    assert repeated["approved"] == 0
+    assert approval.selected_uprn == "uprn-first"
+    assert approval.approved_address_patch == {
+        "addressLine1": "First Court",
+        "addressLine2": "1 Main Street",
+        "townCity": "London",
+        "county": None,
+        "postcode": "SW1A 1AA",
+    }
+    assert "Testing fast-forward" in approval.rationale
+    assert client.writes == []
 
 
 def test_manual_os_candidate_rejects_unsupplied_uprn(tmp_path):

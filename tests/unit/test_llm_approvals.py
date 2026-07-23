@@ -7,6 +7,7 @@ from fact_form_importer.execution.approvals import (
     ADDRESS_AUTO_APPROVAL_POLICY_VERSIONS,
     APPROVAL_LEDGER_VERSION,
     FIELD_AUTO_APPROVAL_POLICY_VERSION,
+    LlmApproval,
     LlmApprovalStore,
     policy_eligible_address_review_ids,
     policy_eligible_high_confidence_field_review_ids,
@@ -63,6 +64,30 @@ def test_policy_reconciliation_is_atomic_idempotent_and_preserves_manual_approva
         "high-supplied-os-candidate-v2",
     }
     assert not store.path_for("run-1").with_suffix(".json.tmp").exists()
+
+
+def test_testing_approvals_are_atomic_idempotent_and_preserve_denials(tmp_path):
+    store = LlmApprovalStore(tmp_path / "out")
+    store.deny("run-1", "denied", "The value is not supported by the source")
+    decisions = {
+        "approved": LlmApproval(
+            review_id="approved",
+            rationale="Testing fast-forward approved the proposed value",
+        ),
+        "denied": LlmApproval(
+            review_id="denied",
+            rationale="This must not replace the reviewer decision",
+        ),
+    }
+
+    first, first_added = store.apply_test_approvals("run-1", decisions)
+    second, second_added = store.apply_test_approvals("run-1", decisions)
+
+    assert first_added == 1
+    assert second_added == 0
+    assert set(second.approvals) == {"approved"}
+    assert set(second.denials) == {"denied"}
+    assert first.approvals["approved"].rationale.startswith("Testing fast-forward")
 
 
 def test_legacy_approval_ledger_defaults_existing_entries_to_manual(tmp_path):

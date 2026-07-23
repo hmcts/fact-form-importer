@@ -19,7 +19,11 @@ from uuid import UUID
 import httpx
 
 from fact_form_importer.config import AppConfig
-from fact_form_importer.execution.approvals import LlmApprovalLedger, LlmApprovalStore
+from fact_form_importer.execution.approvals import (
+    LlmApproval,
+    LlmApprovalLedger,
+    LlmApprovalStore,
+)
 from fact_form_importer.execution.business_report import build_business_report
 from fact_form_importer.execution.fact_api import ApiResponse, FactApiExecutionClient
 from fact_form_importer.execution.ledger import ExecutionLedgerStore
@@ -43,6 +47,7 @@ from fact_form_importer.execution.review_state import (
     ExecutionReviewStore,
     TargetComparison,
     build_target_comparison,
+    canonical_hash,
     merged_target_state,
     target_change_id,
 )
@@ -488,6 +493,79 @@ class ApiExecutionService:
         self._reset_dependent_actions(run_id, {action_id})
         self._save_execution_summary(run_id)
         return ledger, len(resolutions)
+
+    def apply_test_api_change_decisions(
+        self, run_id: str
+    ) -> dict[str, int]:
+        """Fast-forward safe Step 2 decisions for local testing without writing."""
+
+        payload = self.get_api_changes_review(run_id)
+        target_change_ids: set[str] = set()
+        resolutions: list[CollectionItemResolution] = []
+        resolved_action_ids: set[str] = set()
+        skipped_conflicts = 0
+        for change in payload.get("changes", []):
+            comparison = change.get("comparison")
+            if not isinstance(comparison, dict):
+                continue
+            if (
+                comparison.get("has_existing_data")
+                and not comparison.get("is_no_change")
+                and not comparison.get("merge_conflicts")
+                and not change.get("target_approved")
+            ):
+                target_change_ids.add(str(change["change_id"]))
+            if not comparison.get("merge_conflicts"):
+                continue
+            action = change.get("action") or {}
+            action_id = str(action.get("action_id") or "")
+            resource = str(action.get("resource") or "")
+            collection_items = change.get("collection_items") or []
+            if (
+                not action_id
+                or resource not in {"address", "contact_detail", "court_opening_hours"}
+                or not collection_items
+                or change.get("execution_status")
+                in {"running", "succeeded", "unknown"}
+            ):
+                skipped_conflicts += 1
+                continue
+            item_ids = {
+                str(item.get("item_id") or "")
+                for item in collection_items
+                if item.get("item_id")
+            }
+            if not item_ids:
+                skipped_conflicts += 1
+                continue
+            resolved_action_ids.add(action_id)
+            resolutions.extend(
+                CollectionItemResolution(
+                    item_id=item_id,
+                    action_id=action_id,
+                    resource=resource,
+                    decision="omit",
+                    rationale=(
+                        "Testing fast-forward omitted every submitted entry in this "
+                        "conflicting collection section"
+                    ),
+                )
+                for item_id in sorted(item_ids)
+            )
+
+        ledger, omitted_items, approved_changes = self.review_store.apply_test_decisions(
+            run_id, resolutions, target_change_ids
+        )
+        if resolved_action_ids:
+            self._reset_dependent_actions(run_id, resolved_action_ids)
+        self._save_execution_summary(run_id)
+        return {
+            "approved_changes": approved_changes,
+            "omitted_items": omitted_items,
+            "resolved_sections": len(resolved_action_ids),
+            "skipped_conflicts": skipped_conflicts,
+            "remaining_comparisons": len(ledger.comparisons),
+        }
 
     def close_unactionable_court(
         self, run_id: str, source_row_number: int, rationale: str
@@ -1069,6 +1147,104 @@ class ApiExecutionService:
                 review_report=self._llm_review_report(run_id),
             )
         return ledger, added
+
+    def apply_test_llm_decisions(self, run_id: str) -> dict[str, int]:
+        """Fast-forward deterministic pending Step 1 decisions without writing."""
+
+        report = self.get_llm_actions_review(run_id)
+        decisions: dict[str, LlmApproval] = {}
+        invalidated_action_ids: set[str] = set()
+        candidate_selections = 0
+        edited_fields = 0
+        ordinary_approvals = 0
+        skipped = 0
+        for item in report.get("items", []):
+            if item.get("approval_status") != "pending" or not item.get("review_id"):
+                continue
+            review_id = str(item["review_id"])
+            dependent_action_ids = {
+                str(action_id)
+                for action_id in item.get("dependent_action_ids", [])
+                if action_id
+            }
+            if item.get("manual_candidate_selectable"):
+                options = item.get("manual_candidate_options") or []
+                if not options:
+                    skipped += 1
+                    continue
+                option = options[0]
+                uprn = str(option.get("uprn") or "")
+                try:
+                    patch = _normalise_reviewed_address_patch(
+                        option.get("api_body_patch") or {}
+                    )
+                except ValueError:
+                    skipped += 1
+                    continue
+                rationale = (
+                    "Testing fast-forward selected the first valid OS candidate "
+                    "supplied for this address"
+                )
+                decisions[review_id] = LlmApproval(
+                    review_id=review_id,
+                    approval_method="manual",
+                    rationale=rationale,
+                    approved_address_patch=patch,
+                    selected_uprn=uprn,
+                    approved_value_hash=canonical_hash(
+                        {"address_patch": patch, "selected_uprn": uprn}
+                    ),
+                )
+                invalidated_action_ids.update(dependent_action_ids)
+                candidate_selections += 1
+                continue
+            if item.get("field_editable") and item.get(
+                "requires_manual_text_review"
+            ):
+                value = str((item.get("model_result") or {}).get("value") or "").strip()
+                if not value or len(value) > 250:
+                    skipped += 1
+                    continue
+                decisions[review_id] = LlmApproval(
+                    review_id=review_id,
+                    approval_method="manual",
+                    rationale="Testing fast-forward approved the displayed shortened text",
+                    approved_field_value=value,
+                    field_value_overridden=True,
+                    approved_value_hash=canonical_hash(
+                        {"value": value, "omitted": False}
+                    ),
+                )
+                invalidated_action_ids.update(dependent_action_ids)
+                edited_fields += 1
+                continue
+            if item.get("approvable", item.get("actionable")):
+                decisions[review_id] = LlmApproval(
+                    review_id=review_id,
+                    approval_method="manual",
+                    rationale="Testing fast-forward approved the archived proposed value",
+                )
+                ordinary_approvals += 1
+            else:
+                skipped += 1
+
+        ledger, added = self.approval_store.apply_test_approvals(run_id, decisions)
+        if invalidated_action_ids:
+            self.review_store.invalidate_actions(run_id, invalidated_action_ids)
+            self._reset_dependent_actions(run_id, invalidated_action_ids)
+        self._save_execution_summary(
+            run_id,
+            approvals=ledger,
+            review_report=self._llm_review_report(run_id),
+        )
+        return {
+            "approved": added,
+            "candidate_selections": candidate_selections,
+            "edited_fields": edited_fields,
+            "ordinary_approvals": ordinary_approvals,
+            "invalidated_actions": len(invalidated_action_ids),
+            "skipped": skipped,
+        }
 
     def _submissions_by_row(self, run_id: str) -> dict[int, dict[str, Any]]:
         cached = self._submission_cache.get(run_id)

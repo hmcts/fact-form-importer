@@ -90,6 +90,12 @@
 </div>
 {% if review.approval_counts.review_pending %}
 <section class="panel">
+  <h2>Testing only: fast-forward Step 1</h2>
+  <p>This records deterministic placeholder review decisions across every page: ordinary pending values are approved, the first valid supplied OS candidate is selected for unresolved addresses, and the displayed shortened text is accepted for an overlength explanation.</p>
+  <p><strong>It does not execute FaCT actions.</strong> Denied results, missing OS candidates, invalid source data, unmatched courts and completed or uncertain actions are not overridden. Any changed address/text comparisons are refreshed read-only before Step 2.</p>
+  <form method="post" action="{{ url_for('test_fast_forward_llm_actions', run_id=archive.manifest.run_id) }}"><button type="submit" {% if active_execution_job %}disabled{% endif %}>{% if active_execution_job %}Wait for the active FaCT job…{% else %}Fast-forward all Step 1 decisions for testing{% endif %}</button></form>
+</section>
+<section class="panel">
   <h2>Finish the remaining review</h2>
   <p>First deny any results that must not be used. This approves ordinary pending results across every page. Overlength explanation repairs and unresolved address candidate selections remain excluded so their exact values can be reviewed.</p>
   <form method="post" action="{{ url_for('approve_all_llm_actions', run_id=archive.manifest.run_id) }}"><button type="submit">Approve all eligible remaining results</button></form>

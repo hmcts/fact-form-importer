@@ -20,6 +20,20 @@
   <button type="submit">Start import</button>
 </form>
 <h2>Archived runs</h2>
+<details open>
+  <summary>What the columns mean</summary>
+  <dl>
+    <dt><strong>Run</strong></dt><dd>The archived import identifier. Select it to open that run.</dd>
+    <dt><strong>Completed</strong></dt><dd>When workbook ingestion and archive creation finished.</dd>
+    <dt><strong>Workbook</strong></dt><dd>The source Microsoft Forms export.</dd>
+    <dt><strong>Source submissions</strong></dt><dd>Every non-header form row before duplicate suppression.</dd>
+    <dt><strong>Authoritative submissions</strong></dt><dd>The latest retained submission for each court, used for validation, review and API planning.</dd>
+    <dt><strong>Superseded submissions</strong></dt><dd>Older duplicate submissions retained for audit but excluded from operational processing. Authoritative plus superseded equals source submissions.</dd>
+    <dt><strong>Ingestion result</strong></dt><dd>The immutable outcome for authoritative submissions. These four figures always add up to the authoritative total.</dd>
+    <dt><strong>Unique courts needing review</strong></dt><dd>The live, deduplicated number of courts with known human work remaining. It changes as decisions are recorded.</dd>
+    <dt><strong>API plan</strong></dt><dd>The current courts with a confirmed FaCT target, their planned section actions and completed actions. It excludes unmatched courts, but can grow when a reviewer supplies the correct FaCT court slug.</dd>
+  </dl>
+</details>
 <table>
   <thead><tr><th>Run</th><th>Completed</th><th>Workbook</th><th>Source submissions</th><th>Authoritative submissions</th><th>Superseded submissions</th><th>Ingestion result for authoritative submissions</th><th>Unique courts needing review</th><th>API plan</th></tr></thead>
   <tbody>{% for archive in archives %}{% set summary = archive.manifest.summary %}
@@ -27,5 +41,4 @@
     {% set review_progress = archive.execution_summary.get('review_progress_counts', {}) %}{% set action_counts = archive.execution_summary.get('action_status_counts', {}) %}<tr><td><a href="{{ url_for('run_detail', run_id=archive.manifest.run_id) }}">{{ archive.manifest.run_id }}</a></td><td>{{ archive.manifest.completed_at }}</td><td>{{ archive.manifest.source_name }}</td><td>{{ summary.get('source_submission_count', summary.get('row_count', summary.get('submission_count', status_total))) }}</td><td>{{ summary.get('authoritative_submission_count', summary.get('submission_count', status_total)) }}</td><td>{{ summary.get('superseded_submission_count', 0) }}</td><td>Processed: {{ summary.get('processed_count', 0) }}<br>Warnings: {{ summary.get('processed_with_warnings_count', 0) }}<br>Needs source review: {{ summary.get('needs_human_review_count', 0) }}<br>Failed: {{ summary.get('failed_count', 0) }}</td><td><a href="{{ url_for('records', run_id=archive.manifest.run_id, work='outstanding') }}">{{ review_progress.get('unique_courts_outstanding', 0) }}</a></td><td>{{ archive.execution_summary.get('selected_court_count', 0) }} courts<br>{{ archive.execution_summary.get('planned_action_count', 0) }} section actions<br>{{ action_counts.get('succeeded', 0) }} succeeded</td></tr>
   {% else %}<tr><td colspan="9">No completed archives yet.</td></tr>{% endfor %}</tbody>
 </table>
-<p class="muted">Source submissions are the workbook rows before duplicate suppression. Authoritative plus superseded submissions equals the source total. The four ingestion results always sum to authoritative submissions. Current review work is live and can change as decisions are recorded; archived ingestion results do not change.</p>
 {% endblock %}
