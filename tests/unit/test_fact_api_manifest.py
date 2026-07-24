@@ -124,6 +124,11 @@ def test_manifest_builds_ready_actions_with_preflight_and_source_evidence():
         "Migration policy: the form does not collect videoHearings, commonPlatform, "
         "or accessScheme, so this request defaults each field to false."
     ]
+    assert professional_information.fallback_fields == [
+        "professionalInformation.videoHearings",
+        "professionalInformation.commonPlatform",
+        "professionalInformation.accessScheme",
+    ]
     assert manifest.summary["api_manifest_ready_action_count"] == 8
     assert manifest.summary["api_manifest_pending_action_count"] == 0
 
@@ -256,7 +261,7 @@ def test_explicit_no_counter_service_is_sent_without_times_but_conflicts_are_hel
     assert "explicitly unavailable" in conflicted.reason
 
 
-def test_no_counter_service_opening_type_is_valid_without_periods():
+def test_no_counter_service_opening_type_is_omitted_without_periods():
     submission = CourtSubmission(
         source=SourceMetadata(source_row_number=2),
         court_slug="example-court",
@@ -272,12 +277,11 @@ def test_no_counter_service_opening_type_is_valid_without_periods():
         )
     )
 
-    action = build_fact_api_import_manifest(
+    manifest = build_fact_api_import_manifest(
         [submission], "run-1", vocabularies, lambda slug: CourtReference("court-id", slug)
-    ).manifest.records[0].actions[0]
+    ).manifest
 
-    assert action.readiness == "ready"
-    assert "openingTimesDetails" not in action.body
+    assert manifest.records == []
 
 
 def test_regular_opening_type_without_periods_remains_pending():
@@ -1107,6 +1111,20 @@ def test_fact_api_contract_validation_allows_scottish_postcodes(postcode, town):
         },
     )
     assert empty_times_reason is None
+    strict_empty_times_reason = validate_fact_api_action_body(
+        "counter_service_opening_hours",
+        {
+            "courtId": "court-id",
+            "counterService": True,
+            "assistWithForms": False,
+            "assistWithDocuments": False,
+            "assistWithSupport": False,
+            "appointmentNeeded": False,
+        },
+        require_opening_periods=True,
+    )
+    assert strict_empty_times_reason is not None
+    assert "at least one valid opening period" in strict_empty_times_reason
 
     invalid_time_order_reason = validate_fact_api_action_body(
         "court_opening_hours",

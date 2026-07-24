@@ -26,7 +26,7 @@ from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "2.4"
+API_MANIFEST_VERSION = "2.6"
 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
@@ -84,6 +84,9 @@ class FactApiAction(BaseModel):
     address_verification: Optional[dict[str, Any]] = None
     request_body_normalisations: dict[str, dict[str, str]] = Field(default_factory=dict)
     migration_assumptions: list[str] = Field(default_factory=list)
+    # Request-only fallbacks complete an empty FaCT section, but must not
+    # overwrite a populated live value because the form did not collect them.
+    fallback_fields: list[str] = Field(default_factory=list)
     llm_review_ids: list[str] = Field(default_factory=list)
     source_row_number: Optional[int] = None
     source_selection_required: bool = False
@@ -225,6 +228,7 @@ def _build_record(
         source_fields: list[str] | None = None,
         address_verification: dict[str, Any] | None = None,
         migration_assumptions: list[str] | None = None,
+        fallback_fields: list[str] | None = None,
         extra_llm_review_ids: list[str] | None = None,
     ) -> None:
         nonlocal action_number
@@ -258,6 +262,7 @@ def _build_record(
                 address_verification=address_verification,
                 request_body_normalisations=_body_normalisations(original_body, body),
                 migration_assumptions=migration_assumptions or [],
+                fallback_fields=fallback_fields or [],
                 llm_review_ids=sorted(
                     set(
                         accepted_review_ids_for_fields(llm_review_items, source_fields or [])
@@ -334,6 +339,11 @@ def _build_record(
         _professional_information_body(submission),
         source_fields=["interview_rooms"],
         migration_assumptions=_professional_information_assumptions(submission),
+        fallback_fields=[
+            "professionalInformation.videoHearings",
+            "professionalInformation.commonPlatform",
+            "professionalInformation.accessScheme",
+        ],
     )
 
     counter_body, counter_reason = _counter_service_body(submission, vocabularies)
@@ -815,9 +825,14 @@ def _opening_hours_body(
 ) -> tuple[dict[str, Any], str | None]:
     type_id, reason = _vocabulary_id(opening_hours.type, "opening_hour_types", vocabularies)
     times = _opening_times(opening_hours)
+    if not times and _is_no_counter_service_opening_type(opening_hours.type):
+        # This value describes the absence of a counter service; it is not a
+        # publishable court-opening period. FaCT rejects every opening-hours
+        # request without at least one period.
+        return {}, None
     if opening_hours.type and type_id is None:
         reason = _combine_reasons(reason, "Opening-hours type does not have a FaCT API UUID")
-    if not times and not _is_no_counter_service_opening_type(opening_hours.type):
+    if not times:
         reason = _combine_reasons(
             reason,
             "openingTimesDetails must contain at least one valid opening period for this opening-hours type",
@@ -935,7 +950,12 @@ def _vocabulary_id(
     return entry.api_id, None
 
 
-def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | None:
+def validate_fact_api_action_body(
+    resource: str,
+    body: dict[str, Any],
+    *,
+    require_opening_periods: bool = False,
+) -> str | None:
     """Return a human-readable reason when an action cannot satisfy FaCT's API contract.
 
     The same check is deliberately used while generating a report and immediately
@@ -1009,10 +1029,14 @@ def validate_fact_api_action_body(resource: str, body: dict[str, Any]) -> str | 
     if resource == "contact_detail":
         errors.extend(_contact_validation_errors(body))
     if resource in {"counter_service_opening_hours", "court_opening_hours"}:
-        # FaCT permits an absent list. Product rules about which ordinary
-        # opening-hour types need periods are applied while planning, where
-        # the human-readable vocabulary name is still available.
-        errors.extend(_opening_times_validation_errors(body, require_periods=False))
+        # Planning may be provisional because merge semantics can supply live
+        # periods. The final effective operation must always satisfy FaCT's
+        # non-empty list constraint.
+        errors.extend(
+            _opening_times_validation_errors(
+                body, require_periods=require_opening_periods
+            )
+        )
     if resource == "counter_service_opening_hours":
         appointment_contact = body.get("appointmentContact")
         if body.get("appointmentNeeded") is True and appointment_contact is None:

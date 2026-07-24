@@ -21,7 +21,15 @@ from fact_form_importer.execution.atomic_state import (
 from fact_form_importer.output.fact_api_manifest import MISSING_SUPPORT_PHONE_PLACEHOLDER
 
 
-EXECUTION_REVIEW_LEDGER_VERSION = "1.3"
+EXECUTION_REVIEW_LEDGER_VERSION = "1.4"
+PROFESSIONAL_INFORMATION_LIVE_PRESERVATION_POLICY = (
+    "explicit-professional-information-v1"
+)
+_LEGACY_PROFESSIONAL_FALLBACK_FIELDS = {
+    "professionalInformation.videoHearings",
+    "professionalInformation.commonPlatform",
+    "professionalInformation.accessScheme",
+}
 _REQUEST_FIELDS_BY_RESOURCE = {
     "building_facilities": {
         "courtId", "parking", "freeWaterDispensers", "snackVendingMachines",
@@ -100,6 +108,9 @@ class TargetApproval(BaseModel):
     current_hash: str
     proposed_hash: str
     approved_at: str = Field(default_factory=utc_now)
+    approval_method: str = "manual"
+    policy_version: Optional[str] = None
+    rationale: Optional[str] = None
 
 
 class CollectionItemResolution(BaseModel):
@@ -254,7 +265,13 @@ class ExecutionReviewStore:
         return ledger
 
     def approve_targets(
-        self, run_id: str, change_ids: set[str]
+        self,
+        run_id: str,
+        change_ids: set[str],
+        *,
+        approval_method: str = "manual",
+        policy_version: str | None = None,
+        rationale: str | None = None,
     ) -> tuple[ExecutionReviewLedger, int]:
         """Atomically approve a validated set of existing-data comparisons."""
 
@@ -288,6 +305,9 @@ class ExecutionReviewStore:
                     change_id=comparison.change_id,
                     current_hash=comparison.current_hash,
                     proposed_hash=comparison.proposed_hash,
+                    approval_method=approval_method,
+                    policy_version=policy_version,
+                    rationale=rationale,
                 )
                 added += 1
             return (self._save_unlocked(ledger) if added else ledger), added
@@ -435,6 +455,7 @@ def build_target_comparison(
         submitted = action.get("body", {})
         current_value = current if isinstance(current, dict) else {}
     proposed, operations, conflicts = merged_target_state(action, current_value, submitted)
+    submitted_evidence = _without_fallback_fields(submitted, action)
     return TargetComparison(
         change_id=target_change_id(court_slug, str(action["action_id"])),
         court_slug=court_slug,
@@ -442,7 +463,7 @@ def build_target_comparison(
         resource=str(action.get("resource") or ""),
         source_row_number=action.get("source_row_number"),
         current=current_value,
-        submitted=submitted,
+        submitted=submitted_evidence,
         proposed=proposed,
         current_hash=canonical_hash(current_value),
         proposed_hash=canonical_hash(proposed),
@@ -469,7 +490,11 @@ def merged_target_state(
     if resource not in {"address", "contact_detail", "court_opening_hours"}:
         current_value = dict(current) if isinstance(current, dict) else {}
         submitted_value = dict(submitted) if isinstance(submitted, dict) else {}
-        effective = _deep_merge(current_value, submitted_value)
+        effective = _deep_merge_with_fallbacks(
+            current_value,
+            submitted_value,
+            _fallback_fields(action),
+        )
         for field in action.get("clear_fields", []):
             _set_nested_value(effective, str(field), None)
         effective = _apply_request_defaults(resource, effective)
@@ -615,6 +640,69 @@ def _deep_merge(current: dict[str, Any], submitted: dict[str, Any]) -> dict[str,
         else:
             merged[field] = submitted_value
     return merged
+
+
+def _deep_merge_with_fallbacks(
+    current: dict[str, Any],
+    submitted: dict[str, Any],
+    fallback_fields: set[str],
+    prefix: str = "",
+) -> dict[str, Any]:
+    """Overlay submitted values while allowing live data to win over fallbacks."""
+
+    merged = dict(current)
+    for field, submitted_value in submitted.items():
+        path = f"{prefix}.{field}" if prefix else str(field)
+        current_value = merged.get(field)
+        if path in fallback_fields and current_value is not None:
+            continue
+        if isinstance(current_value, dict) and isinstance(submitted_value, dict):
+            merged[field] = _deep_merge_with_fallbacks(
+                current_value,
+                submitted_value,
+                fallback_fields,
+                path,
+            )
+        else:
+            merged[field] = submitted_value
+    return merged
+
+
+def _fallback_fields(action: dict[str, Any]) -> set[str]:
+    configured = {
+        str(field)
+        for field in action.get("fallback_fields", [])
+        if str(field).strip()
+    }
+    if configured:
+        return configured
+    if action.get("resource") != "professional_information":
+        return set()
+    assumptions = " ".join(
+        str(value) for value in action.get("migration_assumptions", [])
+    ).casefold()
+    if "form does not collect videohearings" in assumptions:
+        return set(_LEGACY_PROFESSIONAL_FALLBACK_FIELDS)
+    return set()
+
+
+def _without_fallback_fields(value: Any, action: dict[str, Any]) -> Any:
+    """Return submitted evidence without request-only fallback values."""
+
+    if not isinstance(value, dict):
+        return value
+    result = json.loads(json.dumps(value))
+    for path in _fallback_fields(action):
+        parts = path.split(".")
+        target = result
+        for part in parts[:-1]:
+            child = target.get(part)
+            if not isinstance(child, dict):
+                break
+            target = child
+        else:
+            target.pop(parts[-1], None)
+    return result
 
 
 def _set_nested_value(value: dict[str, Any], path: str, replacement: Any) -> None:

@@ -487,10 +487,20 @@ def create_app(
         )
         ledger = service.get_ledger(run_id)
         court_execution = ledger.courts.get(operational_court_slug)
+        api_changes = service.get_api_changes_review(run_id).get("changes", [])
+        api_changes_by_action = {
+            str(change.get("action", {}).get("action_id") or ""): change
+            for change in api_changes
+        }
         actions = [
             {
                 "body": action.get("body", {}),
                 **action,
+                "no_execution_required": bool(
+                    api_changes_by_action.get(
+                        str(action.get("action_id") or ""), {}
+                    ).get("no_execution_required")
+                ),
                 "execution": (
                     court_execution.actions.get(action.get("action_id")).model_dump(mode="json")
                     if court_execution and action.get("action_id") in court_execution.actions
@@ -506,9 +516,7 @@ def create_app(
             _llm_review_items_by_source_row(llm_review).get(source_row_number, []),
             _manifest_records_by_source_row(manifest).get(source_row_number),
             _action_review_tasks_by_source_row(
-                app.config["EXECUTION_SERVICE"].get_api_changes_review(run_id).get(
-                    "changes", []
-                )
+                api_changes
             ).get(source_row_number, []),
             target_override=(
                 court_target_resolution.get("override")

@@ -63,7 +63,9 @@
         <td><details><summary>Cleaned values</summary><pre>{{ action.evidence.cleaned | tojson(indent=2) }}</pre></details><details><summary>Raw source values</summary><pre>{{ action.evidence.raw | tojson(indent=2) }}</pre></details>{% if action.evidence.address_verification %}<details><summary>Address verification</summary><pre>{{ action.evidence.address_verification | tojson(indent=2) }}</pre></details>{% endif %}{% if action.evidence.request_body_normalisations %}<details><summary>Request-only normalisation</summary><pre>{{ action.evidence.request_body_normalisations | tojson(indent=2) }}</pre></details>{% endif %}{% if action.evidence.migration_assumptions %}<details><summary>Migration assumptions</summary><pre>{{ action.evidence.migration_assumptions | tojson(indent=2) }}</pre></details>{% endif %}</td>
         <td><strong>{{ action.execution.status }}</strong>{% if action.execution.reason %}<br>{{ action.execution.reason }}{% endif %}{% if action.execution.last_response_status %}<br>HTTP {{ action.execution.last_response_status }}{% endif %}</td>
         <td>
-          {% if writes_enabled %}
+          {% if action.no_execution_required %}
+          <strong>No execution required.</strong><br><span class="muted">Every submitted item was explicitly omitted, so existing live FaCT data is preserved.</span>
+          {% elif writes_enabled %}
           <form method="post" action="{{ url_for('api_execute_action', run_id=archive.manifest.run_id, court_slug=operational_court_slug, action_id=action.action_id) }}" onsubmit="return confirm('Run this FaCT API action? It will be preflighted again before a write.');">
             <input type="hidden" name="source_row_number" value="{{ submission.source.source_row_number }}">
             <button type="submit" {% if action.execution.status == 'succeeded' or active_execution_job %}disabled{% endif %}>Run this FaCT API action</button>

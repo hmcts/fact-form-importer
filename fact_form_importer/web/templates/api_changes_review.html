@@ -67,15 +67,21 @@
       {% if change.source_selection_required and not change.selected_source_row_number %}<strong>Source row selection pending</strong><br>{% endif %}
       {% for hold in change.pending_value_holds %}<a href="{{ url_for('llm_actions_review', run_id=archive.manifest.run_id, status=hold.decision, q=hold.review_id) }}">{% if hold.decision == 'denied' %}LLM value was denied; reconsider to release this action{% else %}LLM value approval pending{% endif %}</a><br>{% endfor %}
       {% if change.comparison.merge_conflicts %}<strong>Resolution required before approval or execution.</strong>
+      {% elif change.no_execution_required %}<strong>No execution required</strong><br><span class="muted">Every submitted item was explicitly omitted; live FaCT data is preserved.</span>
       {% elif change.comparison.is_no_change %}<strong>No change</strong>
-      {% elif change.target_approved %}<strong>FaCT changes approved</strong>
+      {% elif change.target_approved %}<strong>{% if change.target_approval_method == 'policy' %}FaCT changes automatically approved{% else %}FaCT changes approved{% endif %}</strong>{% if change.target_approval_policy_version %}<br><span class="muted">{{ change.target_approval_policy_version }}{% if change.target_approval_rationale %}: {{ change.target_approval_rationale }}{% endif %}</span>{% endif %}
       {% elif change.comparison.has_existing_data %}
       <form method="post" action="{{ url_for('approve_api_change', run_id=archive.manifest.run_id, change_id=change.change_id) }}"><input type="hidden" name="page" value="{{ page }}"><input type="hidden" name="hold" value="{{ hold or '' }}"><input type="hidden" name="view" value="{{ view }}"><button type="submit">Approve and continue</button></form>
       {% else %}<span class="muted">Target is empty; no existing-data approval required.</span>{% endif %}
     </td>
     {% else %}
+    {% if change.no_execution_required %}
+    <td colspan="3"><strong>No live comparison is needed.</strong> Every submitted item was explicitly omitted, so existing live FaCT data is preserved.</td>
+    <td><strong>No execution required</strong></td>
+    {% else %}
     <td colspan="3"><span class="muted">Live target not checked.</span></td>
     <td><form method="post" action="{{ url_for('refresh_api_change', run_id=archive.manifest.run_id, action_id=change.action.action_id) }}"><input type="hidden" name="court_slug" value="{{ change.court_slug }}"><input type="hidden" name="page" value="{{ page }}"><input type="hidden" name="hold" value="{{ hold or '' }}"><input type="hidden" name="view" value="{{ view }}"><button type="submit" class="secondary">Retry this section</button></form></td>
+    {% endif %}
     {% endif %}
   </tr>
   {% else %}<tr><td colspan="6">No section changes match this filter.</td></tr>{% endfor %}</tbody>

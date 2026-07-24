@@ -89,6 +89,10 @@ Its refresh control is a retry for interrupted scans or a deliberate recheck
 after live FaCT data changes. It never writes to FaCT. High-confidence model
 values may already be policy-approved, but live-data replacement remains a
 separate decision because a complete section diff has no LLM confidence score.
+The narrow `explicit-professional-information-v1` policy is an exception: it
+automatically approves a fresh, unambiguous professional-information comparison
+when every effective difference is an explicit submitted interview-room value.
+Inferred room-count defaults and all other live-data changes remain manual.
 Reviewers may record every currently approvable Step 2 decision in one atomic
 operation with `Approve all approvable changes`. This applies across every page,
 excludes unchecked, empty, unchanged, already approved, and ambiguous matches,
@@ -428,9 +432,11 @@ with `00:00`. It can recover one complete `HH:MM` value followed by recognised
 noise such as `?` or a duration suffix and records `TIME_FORMAT_RECOVERED` with
 the original and repaired values. It does not infer ranges or repair ambiguous
 values such as `09-4.30:09-4.30`. An explicit `No counter service available`
-status becomes `counterService=false` without invented hours; a contradictory
-assistance selection remains for review. The original spreadsheet text remains
-available in `submissions_raw.json`.
+status remains truthful in cleaned evidence without invented hours; a
+contradictory assistance selection remains for review. FaCT requires every
+effective opening-hours request to contain a period, so an empty effective
+counter-service request is blocked locally before any write. The original
+spreadsheet text remains available in `submissions_raw.json`.
 
 `ingest_summary.json` contains counts for ingested submissions, skipped empty
 rows, failed rows, warning rows, and mapping warnings. Use it as the first check
@@ -564,11 +570,15 @@ Collection entries match by business type. Unmatched live entries are
 preserved, new types are added, and ambiguous duplicate types are held.
 
 For professional information, the form supplies only interview-room values.
-The approved migration policy sets `videoHearings`, `commonPlatform`, and
-`accessScheme` to `false` in the generated FaCT request when professional
-information is present. It never changes the source submission; each action
-records this as a visible `migration_assumptions` item in the readiness report
-and review UI.
+The request-only fallbacks for `videoHearings`, `commonPlatform`, and
+`accessScheme` are `false` when an empty FaCT section must be completed, but
+they are not treated as submitted answers. A populated live value therefore
+wins over those fallbacks. The action records the fallback fields and a visible
+`migration_assumptions` item without changing the source submission. A fresh,
+unambiguous comparison is automatically approved only when its remaining
+effective differences are explicit `interviewRooms`, `interviewRoomCount`, or
+`interviewPhoneNumber` values. A fallback room count such as `1` remains
+manually reviewable.
 
 ### API-required values not collected by the form
 
@@ -634,11 +644,22 @@ lookup and normal address validation.
 Invalid optional contact emails are omitted from the request while the raw
 value and warning remain auditable. If no useful channel or explanation remains,
 that empty proposed contact item is omitted so live merge data is preserved.
-Counter-service metadata may be sent without hours; unusable counter periods
-are omitted and existing live periods survive the merge. Ordinary court-opening
-types still need a usable period, except `No counter service available`. A new
+Counter-service metadata may be planned without submitted hours because existing
+live periods can complete the merged request. The final effective request must
+contain at least one period; otherwise execution blocks locally without calling
+FaCT. Unusable submitted periods are omitted and existing live periods survive
+the merge. The `No counter service available` pseudo opening-hours type is not a
+publishable court-opening period and is omitted from that collection. A new
 `run` gives the clearest immutable plan, while the current-run overlay reconciles
 these changes for unsucceeded actions only.
+
+When a reviewer explicitly omits every stable submitted item in an address,
+contact or court-opening-hours collection, merge semantics preserve the entire
+live FaCT collection. The section is therefore completed as a no-op: it does not
+require value or live-data approval, a court lookup, or an API write. The review
+pages label it `No execution required` and do not offer an individual run
+control. An empty collection without explicit item-by-item omission evidence
+remains blocked; a blank form section never means “delete everything.”
 
 Execution state is written separately to
 `out/execution-state/<run-id>.json`, never back into the archived action plan.
@@ -651,6 +672,9 @@ are overlaid field by field. Collections update matching typed entries and
 create new types while preserving every unmatched live entry. No surplus
 DELETE operations are generated. A failed or unknown multi-operation update
 re-reads FaCT and records the partial state for attention.
+Professional-information approvals record whether they were manual or applied
+by `explicit-professional-information-v1`; policy approval never starts a FaCT
+write.
 Action status is one of `planned`, `awaiting_approval`, `ready`, `blocked`,
 `running`, `succeeded`, `failed`, or `unknown`. A court is `completed` only
 once every planned action has succeeded. `blocked` means no write was attempted for that action because

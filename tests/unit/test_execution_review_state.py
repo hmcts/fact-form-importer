@@ -81,6 +81,10 @@ def test_singleton_merge_preserves_unsubmitted_nested_professional_fields():
                 "videoHearings": False,
             }
         },
+        "fallback_fields": [
+            "professionalInformation.accessScheme",
+            "professionalInformation.videoHearings",
+        ],
     }
     comparison = build_target_comparison(
         "court",
@@ -104,7 +108,63 @@ def test_singleton_merge_preserves_unsubmitted_nested_professional_fields():
     assert professional["interviewRoomCount"] == 7
     assert professional["interviewRoomCountConsistent"] is False
     assert professional["interviewPhoneNumber"] is None
+    assert professional["accessScheme"] is True
+    assert professional["videoHearings"] is True
+    assert comparison.submitted["professionalInformation"] == {
+        "interviewRoomCount": 7,
+        "interviewRooms": True,
+    }
     assert comparison.operations[0]["body"]["professionalInformation"] == professional
+
+
+def test_professional_fallbacks_complete_an_empty_target_and_support_legacy_actions():
+    action = {
+        "action_id": "court-professional-information",
+        "resource": "professional_information",
+        "method": "POST",
+        "path": "/courts/id/v1/professional-information",
+        "body": {
+            "professionalInformation": {
+                "accessScheme": False,
+                "commonPlatform": False,
+                "interviewRoomCount": 4,
+                "interviewRooms": True,
+                "videoHearings": False,
+            }
+        },
+        "migration_assumptions": [
+            "Migration policy: the form does not collect videoHearings, "
+            "commonPlatform, or accessScheme, so this request defaults each field to false."
+        ],
+    }
+
+    empty = build_target_comparison("court", action, {})
+    populated = build_target_comparison(
+        "court",
+        action,
+        {
+            "professionalInformation": {
+                "accessScheme": True,
+                "commonPlatform": True,
+                "interviewRooms": True,
+                "videoHearings": True,
+            }
+        },
+    )
+
+    assert empty.proposed["professionalInformation"]["accessScheme"] is False
+    assert empty.proposed["professionalInformation"]["videoHearings"] is False
+    assert populated.proposed["professionalInformation"] == {
+        "accessScheme": True,
+        "commonPlatform": True,
+        "interviewRoomCount": 4,
+        "interviewRooms": True,
+        "videoHearings": True,
+    }
+    assert populated.submitted["professionalInformation"] == {
+        "interviewRoomCount": 4,
+        "interviewRooms": True,
+    }
 
 
 def test_counter_service_merge_preserves_live_hours_when_submission_omits_them():
@@ -355,6 +415,38 @@ def test_bulk_target_approval_is_atomic_validated_and_idempotent(tmp_path):
     assert approved.target_approvals[valid.change_id].approved_at == repeated.target_approvals[
         valid.change_id
     ].approved_at
+
+
+def test_target_approval_records_policy_provenance(
+    tmp_path,
+):
+    store = ExecutionReviewStore(tmp_path)
+    comparison = build_target_comparison(
+        "court",
+        {
+            "action_id": "court-professional",
+            "resource": "professional_information",
+            "method": "POST",
+            "path": "/courts/id/v1/professional-information",
+            "body": {"professionalInformation": {"interviewRoomCount": 3}},
+        },
+        {"professionalInformation": {"interviewRoomCount": 2}},
+    )
+    store.save_comparison("run", comparison)
+
+    ledger, added = store.approve_targets(
+        "run",
+        {comparison.change_id},
+        approval_method="policy",
+        policy_version="policy-v1",
+        rationale="Safe direct overlay",
+    )
+
+    approval = ledger.target_approvals[comparison.change_id]
+    assert added == 1
+    assert approval.approval_method == "policy"
+    assert approval.policy_version == "policy-v1"
+    assert approval.rationale == "Safe direct overlay"
 
 
 def test_collection_merge_collapses_exact_and_complementary_contacts():

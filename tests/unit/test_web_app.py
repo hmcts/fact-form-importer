@@ -829,8 +829,11 @@ def test_missing_court_target_can_be_validated_without_writing_and_collision_is_
     assert execution_client.writes == []
 
 
-def test_duplicate_item_resolution_unactionable_closure_and_business_downloads(tmp_path):
+def test_duplicate_item_resolution_unactionable_closure_and_business_downloads(
+    tmp_path, monkeypatch
+):
     output_root, run_id = _archive(tmp_path)
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
     archive_path = output_root / "final" / run_id
     readiness_path = archive_path / "api_readiness_report.json"
     readiness = json.loads(readiness_path.read_text())
@@ -918,6 +921,14 @@ def test_duplicate_item_resolution_unactionable_closure_and_business_downloads(t
     assert {
         item_id: value.decision for item_id, value in resolutions.items()
     } == {"source-item-1": "omit", "source-item-2": "omit"}
+    no_op_review = client.get(f"/runs/{run_id}/api-changes?view=all")
+    assert b"No execution required" in no_op_review.data
+    court_page = client.get(f"/runs/{run_id}/courts/example-court")
+    assert b"No execution required" in court_page.data
+    assert b"Run this FaCT API action" not in court_page.data
+    record_page = client.get(f"/runs/{run_id}/records/2")
+    assert b"No execution required" in record_page.data
+    assert b"Run this FaCT API action" not in record_page.data
     assert execution_client.writes == []
     assert closed.status_code == 302
     assert service.get_execution_review(run_id).court_dispositions["3"].rationale == (

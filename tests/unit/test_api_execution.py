@@ -5,7 +5,11 @@ import pytest
 
 from fact_form_importer.config import AppConfig
 from fact_form_importer.execution.fact_api import ApiResponse, FactApiExecutionClient
-from fact_form_importer.execution.models import ActionExecutionState, CourtExecutionState
+from fact_form_importer.execution.models import (
+    ActionExecutionState,
+    CourtExecutionState,
+    ExecutionLedger,
+)
 from fact_form_importer.execution.report import (
     EXECUTION_SUMMARY_VERSION,
     _error_theme,
@@ -311,6 +315,277 @@ def test_approve_all_target_changes_records_review_only_and_is_idempotent(tmp_pa
     assert repeated_added == 0
     assert len(ledger.target_approvals) == 1
     assert repeated.target_approvals.keys() == ledger.target_approvals.keys()
+    assert client.writes == []
+
+
+def test_explicit_professional_information_change_is_policy_approved_and_preserves_live_data(
+    tmp_path,
+):
+    action = {
+        "action_id": "example-court-professional",
+        "resource": "professional_information",
+        "method": "POST",
+        "path": "/courts/court-id/v1/professional-information",
+        "readiness": "ready",
+        "body": {
+            "professionalInformation": {
+                "accessScheme": False,
+                "commonPlatform": False,
+                "interviewRoomCount": 8,
+                "interviewRooms": True,
+                "videoHearings": False,
+            }
+        },
+        "fallback_fields": [
+            "professionalInformation.accessScheme",
+            "professionalInformation.commonPlatform",
+            "professionalInformation.videoHearings",
+        ],
+        "migration_assumptions": [
+            "Migration policy: the form does not collect videoHearings, "
+            "commonPlatform, or accessScheme, so this request defaults each field to false."
+        ],
+    }
+    current = {
+        "codes": {"familyCourtCode": 131},
+        "professionalInformation": {
+            "accessScheme": True,
+            "commonPlatform": True,
+            "interviewRoomCount": None,
+            "interviewRoomCountConsistent": False,
+            "interviewRooms": True,
+            "videoHearings": True,
+        },
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    client = FakeFactApiClient(target=ApiResponse(200, current))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    comparison = service.refresh_target_comparison(
+        run_id,
+        "example-court",
+        "example-court-professional",
+    )
+    review = service.get_execution_review(run_id)
+    approval = review.target_approvals[comparison.change_id]
+
+    assert comparison.proposed["professionalInformation"]["accessScheme"] is True
+    assert comparison.proposed["professionalInformation"]["commonPlatform"] is True
+    assert comparison.proposed["professionalInformation"]["videoHearings"] is True
+    assert comparison.proposed["professionalInformation"]["interviewRoomCount"] == 8
+    assert comparison.proposed["codes"] == {"familyCourtCode": 131}
+    assert approval.approval_method == "policy"
+    assert approval.policy_version == "explicit-professional-information-v1"
+    assert client.writes == []
+
+
+def test_inferred_professional_information_default_remains_manually_reviewable(
+    tmp_path,
+):
+    action = {
+        "action_id": "example-court-professional",
+        "resource": "professional_information",
+        "method": "POST",
+        "path": "/courts/court-id/v1/professional-information",
+        "readiness": "ready",
+        "body": {
+            "professionalInformation": {
+                "accessScheme": False,
+                "commonPlatform": False,
+                "interviewRoomCount": 1,
+                "interviewRooms": True,
+                "videoHearings": False,
+            }
+        },
+        "fallback_fields": [
+            "professionalInformation.accessScheme",
+            "professionalInformation.commonPlatform",
+            "professionalInformation.videoHearings",
+        ],
+        "migration_assumptions": [
+            "Migration policy: the form does not collect videoHearings, "
+            "commonPlatform, or accessScheme, so this request defaults each field to false.",
+            "Review-required migration default: interview rooms are marked available "
+            "but the source has no usable room count, so this FaCT request uses 1.",
+        ],
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    client = FakeFactApiClient(
+        target=ApiResponse(
+            200,
+            {
+                "professionalInformation": {
+                    "accessScheme": True,
+                    "commonPlatform": True,
+                    "interviewRoomCount": None,
+                    "interviewRooms": True,
+                    "videoHearings": True,
+                }
+            },
+        )
+    )
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+
+    comparison = service.refresh_target_comparison(
+        run_id,
+        "example-court",
+        "example-court-professional",
+    )
+
+    assert comparison.change_id not in service.get_execution_review(
+        run_id
+    ).target_approvals
+    assert client.writes == []
+
+
+def test_counter_service_without_effective_hours_is_blocked_before_write(
+    tmp_path, monkeypatch
+):
+    action = {
+        "action_id": "example-court-1",
+        "resource": "counter_service_opening_hours",
+        "method": "PUT",
+        "path": "/courts/court-id/v1/opening-hours/counter-service",
+        "readiness": "ready",
+        "body": {
+            "courtId": "court-id",
+            "counterService": True,
+            "assistWithForms": True,
+            "assistWithDocuments": False,
+            "assistWithSupport": False,
+            "appointmentNeeded": False,
+        },
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    client = FakeFactApiClient(target=ApiResponse(204))
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+
+    ledger = service.execute_action(run_id, "example-court", "example-court-1")
+    state = ledger.courts["example-court"].actions["example-court-1"]
+
+    assert state.status == "blocked"
+    assert "openingTimesDetails must contain at least one valid opening period" in (
+        state.reason or ""
+    )
+    assert client.writes == []
+
+
+def test_explicitly_omitted_collection_is_a_successful_noop_without_api_calls(
+    tmp_path, monkeypatch
+):
+    action = {
+        "action_id": "example-court-1",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/court-id/v1/contact-details",
+        "readiness": "ready",
+        "body": {
+            "courtContactDescriptionId": "type-1",
+            "email": "first@example.test",
+        },
+        "proposed_items": [
+            {
+                "courtContactDescriptionId": "type-1",
+                "email": "first@example.test",
+            }
+        ],
+        "proposed_item_ids": ["contact-1"],
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    client = FakeFactApiClient()
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    service.review_store.resolve_collection_item(
+        run_id,
+        CollectionItemResolution(
+            item_id="contact-1",
+            action_id="example-court-1",
+            resource="contact_detail",
+            decision="omit",
+            rationale="Reviewer chose to preserve the existing section",
+        ),
+    )
+    monkeypatch.setenv("FACT_DATA_API_WRITES_ENABLED", "true")
+
+    ledger = service.execute_action(run_id, "example-court", "example-court-1")
+    state = ledger.courts["example-court"].actions["example-court-1"]
+
+    assert state.status == "succeeded"
+    assert ledger.courts["example-court"].status == "completed"
+    assert "no write was required" in (state.reason or "")
+    assert client.lookup_slugs == []
+    assert client.get_paths == []
+    assert client.writes == []
+
+
+def test_reconciliation_completes_an_old_explicit_empty_section_as_a_noop(tmp_path):
+    action = {
+        "action_id": "example-court-1",
+        "resource": "contact_detail",
+        "method": "POST",
+        "path": "/courts/court-id/v1/contact-details",
+        "readiness": "ready",
+        "body": {
+            "courtContactDescriptionId": "type-1",
+            "email": "first@example.test",
+        },
+        "proposed_items": [
+            {
+                "courtContactDescriptionId": "type-1",
+                "email": "first@example.test",
+            }
+        ],
+        "proposed_item_ids": ["contact-1"],
+    }
+    run_id = _archive(tmp_path, actions=[action])
+    client = FakeFactApiClient()
+    service = ApiExecutionService(tmp_path / "out", AppConfig(), client)
+    service.review_store.resolve_collection_item(
+        run_id,
+        CollectionItemResolution(
+            item_id="contact-1",
+            action_id="example-court-1",
+            resource="contact_detail",
+            decision="omit",
+            rationale="Reviewer chose to preserve the existing section",
+        ),
+    )
+    service.store.save(
+        ExecutionLedger(
+            run_id=run_id,
+            courts={
+                "example-court": CourtExecutionState(
+                    court_slug="example-court",
+                    status="attention_required",
+                    actions={
+                        "example-court-1": ActionExecutionState(
+                            action_id="example-court-1",
+                            status="blocked",
+                            reason="Action body cannot be sent to FaCT: empty section",
+                        )
+                    },
+                )
+            },
+        )
+    )
+
+    service._reconcile_deterministic_plan_repairs(
+        run_id,
+        {
+            "records": [
+                {
+                    "court_slug": "example-court",
+                    "actions": [action],
+                }
+            ]
+        },
+    )
+    state = service.store.load(run_id).courts["example-court"]
+
+    assert state.status == "completed"
+    assert state.actions["example-court-1"].status == "succeeded"
+    assert state.actions["example-court-1"].attempts[-1].operation == "preflight"
+    assert client.lookup_slugs == []
     assert client.writes == []
 
 
@@ -1888,6 +2163,14 @@ def test_derived_plan_reconciliation_resets_only_deterministically_repaired_bloc
                     "for the FaCT API"
                 ),
             ),
+            "rejected": ActionExecutionState(
+                action_id="rejected",
+                status="failed",
+                reason=(
+                    "FaCT API rejected the write request (HTTP 400): "
+                    "openingTimesDetails: Opening hours require at least one entry."
+                ),
+            ),
             "unrelated": ActionExecutionState(
                 action_id="unrelated",
                 status="blocked",
@@ -1910,6 +2193,7 @@ def test_derived_plan_reconciliation_resets_only_deterministically_repaired_bloc
                 "court_slug": "example-court",
                 "actions": [
                     {"action_id": "counter", "readiness": "ready"},
+                    {"action_id": "rejected", "readiness": "ready"},
                     {"action_id": "unrelated", "readiness": "ready"},
                     {"action_id": "uncertain", "readiness": "ready"},
                 ],
@@ -1921,6 +2205,7 @@ def test_derived_plan_reconciliation_resets_only_deterministically_repaired_bloc
     actions = service.store.load("run").courts["example-court"].actions
 
     assert actions["counter"].status == "planned"
+    assert actions["rejected"].status == "planned"
     assert "obsolete" not in actions
     assert actions["unrelated"].status == "blocked"
     assert actions["uncertain"].status == "unknown"

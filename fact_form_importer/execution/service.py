@@ -45,6 +45,7 @@ from fact_form_importer.execution.review_state import (
     CourtTargetOverride,
     ExecutionReviewLedger,
     ExecutionReviewStore,
+    PROFESSIONAL_INFORMATION_LIVE_PRESERVATION_POLICY,
     TargetComparison,
     build_target_comparison,
     canonical_hash,
@@ -277,7 +278,12 @@ class ApiExecutionService:
                     f"Target section comparison returned HTTP {response.status_code}"
                 )
             comparison = build_target_comparison(court_slug, effective_action, response.body)
-            self.review_store.save_comparison(run_id, comparison)
+            review = self.review_store.save_comparison(run_id, comparison)
+            self._approve_safe_target_comparisons(
+                run_id,
+                [(action, comparison)],
+                review=review,
+            )
             self._save_execution_summary(run_id)
             return comparison
         except httpx.HTTPStatusError as exc:
@@ -325,7 +331,21 @@ class ApiExecutionService:
             if close:
                 client.close()
         if comparisons:
-            self.review_store.save_comparisons(run_id, comparisons)
+            review = self.review_store.save_comparisons(run_id, comparisons)
+            actions_by_id = {
+                str(action.get("action_id") or ""): action
+                for record in report.get("records", [])
+                for action in record.get("actions", [])
+            }
+            self._approve_safe_target_comparisons(
+                run_id,
+                [
+                    (actions_by_id[comparison.action_id], comparison)
+                    for comparison in comparisons
+                    if comparison.action_id in actions_by_id
+                ],
+                review=review,
+            )
         self._save_execution_summary(run_id)
         if failures:
             raise ValueError(
@@ -368,6 +388,101 @@ class ApiExecutionService:
         ledger = self.review_store.approve_target(run_id, change_id)
         self._save_execution_summary(run_id)
         return ledger
+
+    def reconcile_safe_target_approvals(
+        self,
+        run_id: str,
+        *,
+        report: dict[str, Any] | None = None,
+    ) -> int:
+        """Rebuild safe professional diffs and apply the idempotent approval policy."""
+
+        readiness = report or self._readiness_report(run_id)
+        review = self.review_store.load(run_id)
+        execution = self.store.load(run_id)
+        candidates: list[tuple[dict[str, Any], TargetComparison]] = []
+        rebuilt: list[TargetComparison] = []
+        for record in readiness.get("records", []):
+            court_slug = str(record.get("court_slug") or "")
+            court_state = execution.courts.get(court_slug)
+            for action in record.get("actions", []):
+                if action.get("resource") != "professional_information":
+                    continue
+                action_state = (
+                    court_state.actions.get(str(action.get("action_id") or ""))
+                    if court_state
+                    else None
+                )
+                if action_state and action_state.status in {
+                    "running",
+                    "succeeded",
+                    "unknown",
+                }:
+                    continue
+                change_id = target_change_id(
+                    court_slug, str(action.get("action_id") or "")
+                )
+                existing = review.comparisons.get(change_id)
+                if existing is None:
+                    continue
+                comparison = build_target_comparison(
+                    court_slug,
+                    action,
+                    existing.current,
+                )
+                rebuilt.append(comparison)
+                candidates.append((action, comparison))
+        if rebuilt:
+            comparisons_changed = any(
+                (previous := review.comparisons.get(comparison.change_id)) is None
+                or previous.current_hash != comparison.current_hash
+                or previous.proposed_hash != comparison.proposed_hash
+                or previous.submitted != comparison.submitted
+                for comparison in rebuilt
+            )
+            review = self.review_store.save_comparisons(run_id, rebuilt)
+        else:
+            comparisons_changed = False
+        _, added = self._approve_safe_target_comparisons(
+            run_id,
+            candidates,
+            review=review,
+        )
+        if added or comparisons_changed:
+            self._save_execution_summary(run_id, report=readiness)
+        return added
+
+    def _approve_safe_target_comparisons(
+        self,
+        run_id: str,
+        candidates: list[tuple[dict[str, Any], TargetComparison]],
+        *,
+        review: ExecutionReviewLedger | None = None,
+    ) -> tuple[ExecutionReviewLedger, int]:
+        review = review or self.review_store.load(run_id)
+        eligible = {
+            comparison.change_id
+            for action, comparison in candidates
+            if _safe_professional_information_policy_applies(action, comparison)
+            and not (
+                (approval := review.target_approvals.get(comparison.change_id))
+                and approval.current_hash == comparison.current_hash
+                and approval.proposed_hash == comparison.proposed_hash
+            )
+        }
+        if not eligible:
+            return review, 0
+        return self.review_store.approve_targets(
+            run_id,
+            eligible,
+            approval_method="policy",
+            policy_version=PROFESSIONAL_INFORMATION_LIVE_PRESERVATION_POLICY,
+            rationale=(
+                "Automatically approved because the effective change contains only "
+                "explicit interview-room values; uncollected live professional "
+                "information is preserved."
+            ),
+        )
 
     def approve_all_target_changes(
         self, run_id: str
@@ -596,6 +711,7 @@ class ApiExecutionService:
 
     def get_api_changes_review(self, run_id: str) -> dict[str, Any]:
         report = self._readiness_report(run_id)
+        self.reconcile_safe_target_approvals(run_id, report=report)
         review = self.review_store.load(run_id)
         execution = self.store.load(run_id)
         approval_ledger = self.approval_store.load(run_id)
@@ -704,8 +820,20 @@ class ApiExecutionService:
                             and approval.current_hash == comparison.current_hash
                             and approval.proposed_hash == comparison.proposed_hash
                         ),
+                        "target_approval_method": (
+                            approval.approval_method if approval else None
+                        ),
+                        "target_approval_policy_version": (
+                            approval.policy_version if approval else None
+                        ),
+                        "target_approval_rationale": (
+                            approval.rationale if approval else None
+                        ),
                         "pending_value_holds": pending_value_holds,
                         "collection_items": collection_items,
+                        "no_execution_required": _all_proposed_collection_items_omitted(
+                            action, review.collection_item_resolutions
+                        ),
                         "type_options": type_options_by_resource.get(
                             str(action.get("resource") or ""), []
                         ),
@@ -1556,6 +1684,7 @@ class ApiExecutionService:
         """Reset only safe, unsucceeded blockers repaired by a derived plan."""
 
         ledger = self.store.load(run_id)
+        review_state = self.review_store.load(run_id)
         changed = False
         invalidated: set[str] = set()
         records_by_slug = {
@@ -1571,19 +1700,44 @@ class ApiExecutionService:
                 for action in record.get("actions", [])
             }
             for action_id, state in list(court.actions.items()):
-                if state.status not in {"blocked", "awaiting_approval", "planned", "ready"}:
+                if state.status not in {
+                    "blocked",
+                    "failed",
+                    "awaiting_approval",
+                    "planned",
+                    "ready",
+                }:
                     continue
                 action = actions.get(action_id)
                 if action is None:
-                    if state.status == "blocked" and _is_deterministic_repair_reason(
-                        state.reason
-                    ):
+                    if state.status in {
+                        "blocked",
+                        "failed",
+                    } and _is_deterministic_repair_reason(state.reason):
                         court.actions.pop(action_id, None)
                         invalidated.add(action_id)
                         changed = True
                     continue
+                if _all_proposed_collection_items_omitted(
+                    action, review_state.collection_item_resolutions
+                ):
+                    if state.status != "succeeded":
+                        self._set_action(
+                            ledger,
+                            court_slug,
+                            action,
+                            "succeeded",
+                            "preflight",
+                            None,
+                            (
+                                "Every submitted item was explicitly omitted; existing "
+                                "FaCT data is preserved and no write was required"
+                            ),
+                        )
+                        changed = True
+                    continue
                 if (
-                    state.status == "blocked"
+                    state.status in {"blocked", "failed"}
                     and action.get("readiness") == "ready"
                     and _is_deterministic_repair_reason(state.reason)
                 ):
@@ -1805,6 +1959,38 @@ class ApiExecutionService:
     ) -> None:
         actions = list(actions)
         court_slug = str(record["court_slug"])
+        review_state = self.review_store.load(run_id)
+        executable_actions: list[dict[str, Any]] = []
+        for action in actions:
+            state = self._action_state(
+                ledger, court_slug, str(action.get("action_id") or "")
+            )
+            if state.status == "succeeded":
+                continue
+            if _all_proposed_collection_items_omitted(
+                action, review_state.collection_item_resolutions
+            ):
+                self._set_action(
+                    ledger,
+                    court_slug,
+                    action,
+                    "succeeded",
+                    "preflight",
+                    None,
+                    (
+                        "Every submitted item was explicitly omitted; existing FaCT "
+                        "data is preserved and no write was required"
+                    ),
+                )
+                continue
+            executable_actions.append(action)
+        if not executable_actions:
+            self._update_court_status(
+                self._court_state(ledger, court_slug),
+                self._active_actions(run_id, record),
+            )
+            return
+        actions = executable_actions
         try:
             court = client.lookup_court(court_slug)
         except (httpx.HTTPError, ValueError) as exc:
@@ -1857,7 +2043,7 @@ class ApiExecutionService:
             if state.status == "succeeded":
                 continue
             if action.get("source_selection_required"):
-                selected = self.review_store.load(run_id).source_selections.get(court_slug)
+                selected = review_state.source_selections.get(court_slug)
                 if selected is None:
                     self._set_action(
                         ledger,
@@ -1992,6 +2178,11 @@ class ApiExecutionService:
                     court_slug, effective_action, target.body
                 )
                 review_state = self.review_store.save_comparison(run_id, comparison)
+                review_state, _ = self._approve_safe_target_comparisons(
+                    run_id,
+                    [(action, comparison)],
+                    review=review_state,
+                )
             else:
                 comparison = None
                 review_state = self.review_store.load(run_id)
@@ -2118,7 +2309,9 @@ class ApiExecutionService:
                             str(action.get("resource") or ""), body
                         )
                         body_reason = validate_fact_api_action_body(
-                            str(action.get("resource") or ""), body
+                            str(action.get("resource") or ""),
+                            body,
+                            require_opening_periods=True,
                         )
                         if body_reason:
                             self._set_action(
@@ -2864,6 +3057,40 @@ def _component_differences(current: Any, proposed: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _safe_professional_information_policy_applies(
+    action: dict[str, Any],
+    comparison: TargetComparison,
+) -> bool:
+    """Approve only explicit interview-room overlays on populated live data."""
+
+    if (
+        action.get("resource") != "professional_information"
+        or action.get("readiness") != "ready"
+        or not comparison.has_existing_data
+        or comparison.is_no_change
+        or comparison.merge_conflicts
+        or action.get("clear_fields")
+    ):
+        return False
+    if any(
+        str(assumption).startswith("Review-required migration default:")
+        for assumption in action.get("migration_assumptions", [])
+    ):
+        return False
+    allowed = {
+        "professionalInformation.interviewRooms",
+        "professionalInformation.interviewRoomCount",
+        "professionalInformation.interviewPhoneNumber",
+    }
+    differences = _component_differences(
+        comparison.current,
+        comparison.proposed,
+    )
+    return bool(differences) and all(
+        str(difference["field"]) in allowed for difference in differences
+    )
+
+
 def _preflight_path(action_path: str) -> str:
     """Collection endpoints are safe to GET before deciding whether to create."""
 
@@ -3335,10 +3562,39 @@ def _is_deterministic_repair_reason(reason: str | None) -> bool:
         for marker in (
             "openingTimesDetails must contain at least one valid opening period",
             "openingTimesDetails requires each opening time to be before its closing time",
+            "Opening hours require at least one entry",
             "email does not match the FaCT API email format",
             "accessibleToiletDescription contains characters rejected by the FaCT API",
             "addressLine1 contains characters rejected by the FaCT API",
         )
+    )
+
+
+def _all_proposed_collection_items_omitted(
+    action: dict[str, Any],
+    resolutions: dict[str, CollectionItemResolution],
+) -> bool:
+    """Return true only when every archived collection item was explicitly omitted."""
+
+    if action.get("resource") not in {
+        "address",
+        "contact_detail",
+        "court_opening_hours",
+    }:
+        return False
+    item_ids = action.get("proposed_item_ids")
+    proposed_items = action.get("proposed_items")
+    if (
+        not isinstance(item_ids, list)
+        or not isinstance(proposed_items, list)
+        or not item_ids
+        or len(item_ids) != len(proposed_items)
+    ):
+        return False
+    return all(
+        (resolution := resolutions.get(str(item_id))) is not None
+        and resolution.decision == "omit"
+        for item_id in item_ids
     )
 
 
@@ -3408,7 +3664,9 @@ def _comparison_operation_validation_reason(
         if resource != "professional_information":
             body["courtId"] = court_id
         body = normalise_fact_api_action_body(resource, body)
-        reason = validate_fact_api_action_body(resource, body)
+        reason = validate_fact_api_action_body(
+            resource, body, require_opening_periods=True
+        )
         if reason:
             return reason
     return None
