@@ -26,7 +26,7 @@ from fact_form_importer.validators.os_addresses import AddressVerificationBatch
 from fact_form_importer.validators.vocabularies import Vocabularies
 
 IMPORTABLE_STATUSES = {"processed", "processed_with_warnings"}
-API_MANIFEST_VERSION = "2.6"
+API_MANIFEST_VERSION = "2.7"
 _MIGRATION_DEFAULT_LIFT_DOOR_WIDTH_CM = 1
 _MIGRATION_DEFAULT_LIFT_DOOR_LIMIT_KG = 1
 _MIGRATION_DEFAULT_INTERVIEW_ROOM_COUNT = 1
@@ -232,6 +232,11 @@ def _build_record(
         extra_llm_review_ids: list[str] | None = None,
     ) -> None:
         nonlocal action_number
+        explicit_clear_fields = _explicit_clear_fields(
+            resource,
+            llm_review_items,
+            source_fields or [],
+        )
         # FaCT validates the request object before its service layer applies the
         # court UUID from the path, so all entity request bodies must carry it.
         # Professional information uses a DTO rather than an entity and does
@@ -240,7 +245,11 @@ def _build_record(
             body = {"courtId": court_id or "{court_id}", **body}
         original_body = dict(body)
         body = normalise_fact_api_action_body(resource, body)
-        if _invalid_email_only_contact_item(resource, original_body, body):
+        if _empty_contact_item_without_clear(
+            resource,
+            body,
+            explicit_clear_fields,
+        ):
             return
         if not body:
             return
@@ -283,7 +292,7 @@ def _build_record(
                 ],
                 proposed_item_source_fields=[source_fields or []],
                 proposed_item_clear_fields=[
-                    _explicit_clear_fields(resource, llm_review_items, source_fields or [])
+                    explicit_clear_fields
                 ],
                 address_verifications=[address_verification] if address_verification else [],
             )
@@ -491,7 +500,11 @@ def _explicit_clear_fields(
     if any(
         item.get("outcome") == "accepted"
         and item.get("operation") == "clear"
-        and item.get("field") in source_fields
+        and any(
+            str(item.get("field") or "") == source_field
+            or str(item.get("field") or "").startswith(f"{source_field}.")
+            for source_field in source_fields
+        )
         and str(item.get("field") or "").endswith(".explanation")
         for item in review_items
     ):
@@ -1187,15 +1200,16 @@ def _body_normalisations(
     return changes
 
 
-def _invalid_email_only_contact_item(
-    resource: str, original: dict[str, Any], cleaned: dict[str, Any]
+def _empty_contact_item_without_clear(
+    resource: str,
+    body: dict[str, Any],
+    explicit_clear_fields: list[str],
 ) -> bool:
     if resource != "contact_detail":
         return False
-    email = original.get("email")
-    if not isinstance(email, str) or _FACT_API_EMAIL_PATTERN.fullmatch(email):
-        return False
-    return not any(cleaned.get(field) for field in ("phoneNumber", "email", "explanation"))
+    return not explicit_clear_fields and not any(
+        body.get(field) for field in ("phoneNumber", "email", "explanation")
+    )
 
 
 def _address_validation_errors(body: dict[str, Any]) -> list[str]:

@@ -644,6 +644,11 @@ lookup and normal address validation.
 Invalid optional contact emails are omitted from the request while the raw
 value and warning remain auditable. If no useful channel or explanation remains,
 that empty proposed contact item is omitted so live merge data is preserved.
+The same rule applies when the form supplies only a contact-description
+heading: a type such as `County court appointments` is not published unless the
+item also contains a usable phone number, email address, or explanation. An
+explicit approved explanation clear remains a meaningful exception because it
+intentionally removes an existing optional value.
 Counter-service metadata may be planned without submitted hours because existing
 live periods can complete the merged request. The final effective request must
 contain at least one period; otherwise execution blocks locally without calling

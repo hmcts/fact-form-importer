@@ -331,6 +331,44 @@ def test_invalid_optional_contact_email_is_omitted_or_drops_empty_item():
     assert len(manifest.records[0].actions) == 1
 
 
+def test_contact_description_without_publishable_content_is_omitted_but_clear_is_kept():
+    type_only = CourtSubmission(
+        source=SourceMetadata(source_row_number=2),
+        court_slug="type-only-court",
+        status="processed",
+        contacts=[ContactDetail(index=1, description="Enquiries")],
+    )
+    explicit_clear = CourtSubmission(
+        source=SourceMetadata(source_row_number=3),
+        court_slug="clear-court",
+        status="processed",
+        contacts=[ContactDetail(index=1, description="Enquiries")],
+    )
+
+    manifest = build_fact_api_import_manifest(
+        [type_only, explicit_clear],
+        "run-1",
+        _vocabularies(),
+        lambda slug: CourtReference(f"{slug}-id", slug),
+        llm_review_items=[
+            {
+                "source_row_number": 3,
+                "field": "contacts[1].explanation",
+                "outcome": "accepted",
+                "operation": "clear",
+            }
+        ],
+    ).manifest
+
+    assert [record.court_slug for record in manifest.records] == ["clear-court"]
+    action = manifest.records[0].actions[0]
+    assert action.body == {
+        "courtId": "clear-court-id",
+        "courtContactDescriptionId": "contact-id",
+    }
+    assert action.proposed_item_clear_fields == [["explanation"]]
+
+
 def test_request_only_public_punctuation_repairs_are_audited():
     assert normalise_fact_api_action_body(
         "accessibility_options", {"accessibleToiletDescription": "N/A"}
@@ -988,7 +1026,8 @@ def test_manifest_omits_invalid_optional_phones_without_losing_source_evidence()
         "interviewPhoneNumber"
         not in actions["professional_information"].body["professionalInformation"]
     )
-    assert "phoneNumber" not in actions["contact_detail"].body
+    assert "contact_detail" not in actions
+    assert submission.contacts[0].phone == "not a phone"
 
 
 def test_manifest_omits_closed_zero_length_opening_periods():
